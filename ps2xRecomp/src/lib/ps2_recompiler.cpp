@@ -28,6 +28,41 @@ namespace ps2recomp
 {
     namespace
     {
+        std::unordered_map<uint32_t, RuntimeRelocationKind> loadRuntimeRelocationSites(const std::string &path)
+        {
+            std::ifstream file(path);
+            if (!file.is_open())
+            {
+                throw std::runtime_error("Could not open runtime relocation list: " + path);
+            }
+            std::unordered_map<uint32_t, RuntimeRelocationKind> sites;
+            std::string line;
+            std::getline(file, line);
+            while (std::getline(file, line))
+            {
+                if (line.empty())
+                {
+                    continue;
+                }
+                std::stringstream ss(line);
+                std::string address;
+                std::string kind;
+                std::getline(ss, address, ',');
+                std::getline(ss, kind, ',');
+                RuntimeRelocationKind parsed;
+                if (kind == "j26")
+                    parsed = RuntimeRelocationKind::Jump26;
+                else if (kind == "hi16")
+                    parsed = RuntimeRelocationKind::Hi16;
+                else if (kind == "lo16")
+                    parsed = RuntimeRelocationKind::Lo16;
+                else
+                    throw std::runtime_error("Unsupported runtime relocation kind '" + kind + "' in " + path);
+                sites[static_cast<uint32_t>(std::stoul(address, nullptr, 0))] = parsed;
+            }
+            return sites;
+        }
+
         uint32_t decodeAbsoluteJumpTarget(uint32_t address, uint32_t target)
         {
             return ((address + 4) & 0xF0000000u) | (target << 2);
@@ -1022,6 +1057,10 @@ namespace ps2recomp
             m_codeGenerator->setRelocationCallNames(relocationCallNames);
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
+            if (!m_config.runtimeRelocationsPath.empty())
+            {
+                m_codeGenerator->setRuntimeRelocationSites(loadRuntimeRelocationSites(m_config.runtimeRelocationsPath));
+            }
             m_codeGenerator->setEmitInstructionComments(true);
 
             fs::create_directories(m_config.outputPath);
@@ -2198,7 +2237,7 @@ namespace ps2recomp
         {
             return true;
         }
-        return ps2_runtime_calls::isStubName(function.name);
+        return m_config.autoStubByName && ps2_runtime_calls::isStubName(function.name);
     }
 
     bool PS2Recompiler::IsCorrectnessCriticalFunctionName(const std::string &name)

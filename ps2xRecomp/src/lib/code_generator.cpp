@@ -225,12 +225,65 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateInstruction(const Instruction &inst)
     {
-        return InstructionTranslator(*this).translate(inst, {});
+        return translateInstruction(inst, MemoryAccessHint{});
     }
 
     std::string CodeGenerator::translateInstruction(const Instruction &inst, const MemoryAccessHint &memoryHint)
     {
-        return InstructionTranslator(*this).translate(inst, memoryHint);
+        const auto site = m_runtimeRelocationSites.find(inst.address);
+        if (site == m_runtimeRelocationSites.end() || site->second == RuntimeRelocationKind::Jump26)
+        {
+            return InstructionTranslator(*this).translate(inst, memoryHint);
+        }
+
+        constexpr uint32_t kUnsignedSentinel = 0x5EC0DE01u;
+        constexpr uint32_t kSignedSentinel = 0x5EC0DE02u;
+        Instruction symbolic = inst;
+        symbolic.immediate = kUnsignedSentinel;
+        symbolic.simmediate = kSignedSentinel;
+        std::string code = InstructionTranslator(*this).translate(symbolic, {});
+
+        const std::string word = fmt::format("FAST_READ32(0x{:X}u)", inst.address);
+        const std::string unsignedExpr = fmt::format("((uint32_t)({} & 0xFFFFu))", word);
+        const std::string signedExpr = fmt::format("((uint32_t)(int32_t)(int16_t)({} & 0xFFFFu))", word);
+        size_t replaced = 0;
+        auto substitute = [&](uint32_t sentinel, const std::string &expr)
+        {
+            for (const std::string &token : {fmt::format("{}", sentinel),
+                                              fmt::format("{}", static_cast<int32_t>(sentinel)),
+                                              fmt::format("0x{:X}", sentinel),
+                                              fmt::format("0x{:x}", sentinel),
+                                              fmt::format("0X{:X}", sentinel)})
+            {
+                size_t pos = 0;
+                while ((pos = code.find(token, pos)) != std::string::npos)
+                {
+                    code.replace(pos, token.size(), expr);
+                    pos += expr.size();
+                    ++replaced;
+                }
+            }
+        };
+        substitute(kUnsignedSentinel, unsignedExpr);
+        substitute(kSignedSentinel, signedExpr);
+
+        if (replaced == 0 || code.find("5EC0DE") != std::string::npos || code.find("1589698") != std::string::npos)
+        {
+            throw std::runtime_error(fmt::format(
+                "runtime relocation site 0x{:X} ({}) could not be made relocatable", inst.address, inst.disassembly));
+        }
+        return "/* runtime-relocated */ " + code;
+    }
+
+    void CodeGenerator::setRuntimeRelocationSites(const std::unordered_map<uint32_t, RuntimeRelocationKind> &sites)
+    {
+        m_runtimeRelocationSites = sites;
+    }
+
+    bool CodeGenerator::isRuntimeRelocationSite(uint32_t address, RuntimeRelocationKind kind) const
+    {
+        const auto it = m_runtimeRelocationSites.find(address);
+        return it != m_runtimeRelocationSites.end() && it->second == kind;
     }
 
     std::string CodeGenerator::translateSpecialInstruction(const Instruction &inst)

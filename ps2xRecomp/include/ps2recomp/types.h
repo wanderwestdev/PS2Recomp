@@ -172,6 +172,13 @@ namespace ps2recomp
         std::string calleeName;
     };
 
+    enum class RuntimeRelocationKind : uint8_t
+    {
+        Jump26,
+        Hi16,
+        Lo16,
+    };
+
     // Recompiler configuration
     struct RecompilerConfig
     {
@@ -190,6 +197,8 @@ namespace ps2recomp
         std::vector<std::string> entryPointHints;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
+        bool autoStubByName = true;
+        std::string runtimeRelocationsPath;
     };
 
 } // namespace ps2recomp

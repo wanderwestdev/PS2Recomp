@@ -322,6 +322,29 @@ namespace ps2recomp
 
     void ControlFlowEmitter::emitStaticJump(StaticBranchKind kind)
     {
+        if (m_gen.isRuntimeRelocationSite(m_branchInst.address, RuntimeRelocationKind::Jump26))
+        {
+            m_ss << "    {\n";
+            m_ss << fmt::format("        const uint32_t jumpTarget = ((FAST_READ32(0x{:X}u) & 0x03FFFFFFu) << 2) | 0x{:X}u;\n",
+                                m_branchInst.address, (m_branchInst.address + 4u) & 0xF0000000u);
+            if (kind == StaticBranchKind::Call)
+            {
+                m_ss << fmt::format("        SET_GPR_U32(ctx, 31, 0x{:X}u);\n", fallthroughPc());
+            }
+            emitDelaySlot("        ");
+            m_ss << "        ctx->pc = jumpTarget;\n";
+            if (kind == StaticBranchKind::Call)
+            {
+                emitExternalRegisterCallDispatch("jumpTarget", "        ");
+            }
+            else
+            {
+                emitExternalRegisterJumpDispatch("jumpTarget", RegisterBranchKind::Jump, 0u, "        ");
+            }
+            m_ss << "    }\n";
+            return;
+        }
+
         if (kind == StaticBranchKind::Call)
         {
             m_ss << fmt::format("    SET_GPR_U32(ctx, 31, 0x{:X}u);\n", fallthroughPc());
