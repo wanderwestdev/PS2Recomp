@@ -101,6 +101,8 @@ private:
     {
         std::FILE *stream = nullptr;
         uint64_t size = 0u;
+        bool cdImage = false;
+        uint64_t cdImageOffset = 0u;
     };
     mutable std::mutex m_hostFileMutex;
     std::unordered_map<uint64_t, HostFile> m_hostFiles;

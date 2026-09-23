@@ -142,7 +142,7 @@ if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
     ps2x_stage_ffmpeg_runtime_dlls(ps2xStudio)
 endif()
 
-include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/../ps2xRuntime/cmake/ReleaseMode.cmake")
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(imgui_lib)

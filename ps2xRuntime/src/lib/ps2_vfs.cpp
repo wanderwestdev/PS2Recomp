@@ -1,4 +1,5 @@
 #include "runtime/ps2_vfs.h"
+#include "runtime/ps2_cd_image.h"
 
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_rom_device.h"
@@ -59,6 +60,50 @@ namespace
 
     private:
         FILE *m_file = nullptr;
+    };
+
+    class CdImageOpenFile final : public IPS2OpenFile
+    {
+    public:
+        CdImageOpenFile(uint32_t lba, uint64_t size) : m_base(static_cast<uint64_t>(lba) * PS2CdImage::kSectorSize), m_size(size) {}
+
+        int64_t read(void *destination, size_t size) override
+        {
+            if (!destination && size != 0u)
+                return -1;
+            const uint64_t available = m_position < m_size ? m_size - m_position : 0u;
+            const size_t count = static_cast<size_t>(std::min<uint64_t>(size, available));
+            if (count != 0u && !PS2CdImage::instance().read(m_base + m_position, destination, count))
+                return -1;
+            m_position += count;
+            return static_cast<int64_t>(count);
+        }
+
+        int64_t write(const void *, size_t) override
+        {
+            return -1;
+        }
+
+        int64_t seek(int64_t offset, int whence) override
+        {
+            int64_t base = 0;
+            if (whence == SEEK_CUR)
+                base = static_cast<int64_t>(m_position);
+            else if (whence == SEEK_END)
+                base = static_cast<int64_t>(m_size);
+            else if (whence != SEEK_SET)
+                return -1;
+            const int64_t position = base + offset;
+            if (position < 0)
+                return -1;
+            m_position = static_cast<uint64_t>(position);
+            return position;
+        }
+
+    private:
+        uint64_t m_base = 0u;
+        uint64_t m_size = 0u;
+        uint64_t m_position = 0u;
     };
 
     class MemoryOpenFile final : public IPS2OpenFile
@@ -171,6 +216,14 @@ int32_t PS2Vfs::open(std::string_view path, uint32_t flags, const PS2VfsMounts &
             return -1;
         file = std::make_unique<MemoryOpenFile>(std::move(bytes));
     }
+    else if (PS2CdImage::Entry entry{}; parsed.device == ps2x::iop::Ps2PathDevice::Cdrom &&
+                                        PS2CdImage::instance().ensureOpenFromIoPaths() &&
+                                        PS2CdImage::instance().find(parsed.path, entry) && !entry.directory)
+    {
+        if ((flags & PS2_FIO_O_RDWR) != PS2_FIO_O_RDONLY || (flags & (PS2_FIO_O_CREAT | PS2_FIO_O_TRUNC)) != 0u)
+            return -1;
+        file = std::make_unique<CdImageOpenFile>(entry.lba, entry.size);
+    }
     else
     {
         std::filesystem::path hostPath;
@@ -242,6 +295,16 @@ bool PS2Vfs::stat(std::string_view path, const PS2VfsMounts &mounts, const PS2Ro
     {
         if (!rom.fileSize(parsed.path, result.size))
             return false;
+        result.readOnly = true;
+        return true;
+    }
+
+    if (PS2CdImage::Entry entry{}; parsed.device == ps2x::iop::Ps2PathDevice::Cdrom &&
+                                   PS2CdImage::instance().ensureOpenFromIoPaths() &&
+                                   PS2CdImage::instance().find(parsed.path, entry))
+    {
+        result.directory = entry.directory;
+        result.size = entry.directory ? 0u : entry.size;
         result.readOnly = true;
         return true;
     }

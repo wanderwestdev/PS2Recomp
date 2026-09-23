@@ -16,8 +16,8 @@ add_library(ps2_test_function_table OBJECT
 )
 
 target_include_directories(ps2_test_function_table PRIVATE
-    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
-    ${CMAKE_SOURCE_DIR}/ps2xIOP/include
+    ${CMAKE_CURRENT_LIST_DIR}/../ps2xRuntime/include
+    ${CMAKE_CURRENT_LIST_DIR}/../ps2xIOP/include
 )
 
 add_library(ps2_test_lib STATIC
@@ -41,10 +41,10 @@ add_library(ps2_test_lib STATIC
 
 target_include_directories(ps2_test_lib PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/ps2xRecomp/include
-    ${CMAKE_SOURCE_DIR}/ps2xAnalyzer/include
-    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
-    ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib
+    ${CMAKE_CURRENT_LIST_DIR}/../ps2xRecomp/include
+    ${CMAKE_CURRENT_LIST_DIR}/../ps2xAnalyzer/include
+    ${CMAKE_CURRENT_LIST_DIR}/../ps2xRuntime/include
+    ${CMAKE_CURRENT_LIST_DIR}/../ps2xRuntime/src/lib
 )
 
 target_link_libraries(ps2_test_lib PRIVATE
@@ -72,9 +72,9 @@ endif()
 
 target_include_directories(ps2x_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/ps2xRecomp/include
-    ${CMAKE_SOURCE_DIR}/ps2xAnalyzer/include
-    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    ${CMAKE_CURRENT_LIST_DIR}/../ps2xRecomp/include
+    ${CMAKE_CURRENT_LIST_DIR}/../ps2xAnalyzer/include
+    ${CMAKE_CURRENT_LIST_DIR}/../ps2xRuntime/include
 )
 
 target_link_libraries(ps2x_tests PRIVATE
@@ -97,7 +97,7 @@ if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
     ps2x_stage_ffmpeg_runtime_dlls(ps2x_tests)
 endif()
 
-include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/../ps2xRuntime/cmake/ReleaseMode.cmake")
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_test_lib)

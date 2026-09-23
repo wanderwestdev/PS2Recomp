@@ -1,3 +1,4 @@
+#include "runtime/ps2_cd_image.h"
 #include <algorithm>
 #include <cctype>
 
@@ -329,6 +330,17 @@ namespace
         {
             g_lastCdError = -1;
             return false;
+        }
+
+        if (PS2CdImage::Entry imageEntry{}; PS2CdImage::instance().ensureOpenFromIoPaths() &&
+                                            PS2CdImage::instance().find(ps2Path, imageEntry) && !imageEntry.directory)
+        {
+            entryOut = CdFileEntry{};
+            entryOut.baseLbn = imageEntry.lba;
+            entryOut.sizeBytes = static_cast<uint32_t>(imageEntry.size);
+            entryOut.sectors = static_cast<uint32_t>((imageEntry.size + kCdSectorSize - 1u) / kCdSectorSize);
+            g_lastCdError = 0;
+            return true;
         }
 
         auto existing = g_cdFilesByKey.find(key);
