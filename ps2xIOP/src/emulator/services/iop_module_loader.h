@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -42,6 +43,8 @@ namespace ps2x::iop::detail
     {
     public:
         [[nodiscard]] static bool readWholeHostFile(IopHost &host, std::string_view guestPath, std::vector<uint8_t> &bytes);
+        using MemoryReader = std::function<bool(uint32_t, void *, size_t)>;
+        [[nodiscard]] static bool readElf(const MemoryReader &reader, uint32_t address, std::vector<uint8_t> &bytes);
         [[nodiscard]] static bool readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes);
         [[nodiscard]] static IopImageLoadResult load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor);
     };

@@ -655,7 +655,10 @@ namespace ps2x::iop::detail
         ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
         {
             std::vector<uint8_t> image;
-            if (!IopModuleLoader::readElfFromGuest(host, guestAddress, image))
+            const bool fromIopRam = IopModuleLoader::readElf([this](uint32_t address, void *destination, size_t size)
+                                                             { return memory.readRam(address, destination, size); },
+                                                             guestAddress, image);
+            if (!fromIopRam && !IopModuleLoader::readElfFromGuest(host, guestAddress, image))
                 return {true, -1, -1};
             std::ostringstream tag;
             tag << "buffer@0x" << std::hex << guestAddress;
