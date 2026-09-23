@@ -140,12 +140,141 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_PXOR(a, b) _mm_xor_si128((__m128i)(a), (__m128i)(b))
 #define PS2_PNOR(a, b) _mm_xor_si128(_mm_or_si128((__m128i)(a), (__m128i)(b)), _mm_set1_epi32(0xFFFFFFFF))
 
+inline __m128 ps2VuClampVector(__m128 value)
+{
+    const __m128i bits = _mm_castps_si128(value);
+    const __m128i exponentMask = _mm_set1_epi32(0x7F800000);
+    const __m128i special = _mm_cmpeq_epi32(_mm_and_si128(bits, exponentMask), exponentMask);
+    const __m128i saturated = _mm_or_si128(_mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u))), _mm_set1_epi32(0x7F7FFFFF));
+    return _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(special, saturated), _mm_andnot_si128(special, bits)));
+}
+
+inline float ps2FpuClamp(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7F800000u) == 0x7F800000u)
+    {
+        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+        std::memcpy(&value, &bits, sizeof(value));
+    }
+    return value;
+}
+
+inline float ps2SignedFloatMax(uint32_t signSource)
+{
+    const uint32_t bits = (signSource & 0x80000000u) | 0x7F7FFFFFu;
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+inline uint32_t ps2FloatBits(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+inline bool ps2FloatIsZero(float value)
+{
+    return (ps2FloatBits(value) & 0x7F800000u) == 0u;
+}
+
+constexpr uint32_t PS2_FCR31_I = 0x00020000u;
+constexpr uint32_t PS2_FCR31_D = 0x00010000u;
+constexpr uint32_t PS2_FCR31_SI = 0x00000040u;
+constexpr uint32_t PS2_FCR31_SD = 0x00000020u;
+
+inline float ps2FpuDivide(uint32_t &fcr31, float dividend, float divisor)
+{
+    if (ps2FloatIsZero(divisor))
+    {
+        if (ps2FloatIsZero(dividend))
+            fcr31 |= PS2_FCR31_I | PS2_FCR31_SI;
+        else
+            fcr31 |= PS2_FCR31_D | PS2_FCR31_SD;
+        return ps2SignedFloatMax(ps2FloatBits(dividend) ^ ps2FloatBits(divisor));
+    }
+    return ps2FpuClamp(dividend / divisor);
+}
+
+inline float ps2FpuSqrt(uint32_t &fcr31, float value)
+{
+    if ((ps2FloatBits(value) & 0x80000000u) != 0u && !ps2FloatIsZero(value))
+        fcr31 |= PS2_FCR31_I | PS2_FCR31_SI;
+    return ps2FpuClamp(std::sqrt(std::fabs(value)));
+}
+
+inline float ps2FpuRsqrt(uint32_t &fcr31, float numerator, float value)
+{
+    if (ps2FloatIsZero(value))
+    {
+        fcr31 |= PS2_FCR31_D | PS2_FCR31_SD;
+        return ps2SignedFloatMax(ps2FloatBits(numerator) ^ ps2FloatBits(value));
+    }
+    if ((ps2FloatBits(value) & 0x80000000u) != 0u)
+        fcr31 |= PS2_FCR31_I | PS2_FCR31_SI;
+    return ps2FpuClamp(numerator / std::sqrt(std::fabs(value)));
+}
+
+inline int32_t ps2FpuConvertToWord(float value)
+{
+    const uint32_t bits = ps2FloatBits(value);
+    if ((bits & 0x7F800000u) >= 0x4F000000u)
+        return (bits & 0x80000000u) ? INT32_MIN : INT32_MAX;
+    return static_cast<int32_t>(value);
+}
+
+constexpr uint16_t PS2_VU_STATUS_I = 0x0010u;
+constexpr uint16_t PS2_VU_STATUS_D = 0x0020u;
+constexpr uint16_t PS2_VU_STATUS_IS = 0x0400u;
+constexpr uint16_t PS2_VU_STATUS_DS = 0x0800u;
+
+inline float ps2VuDivide(uint16_t &status, float dividend, float divisor)
+{
+    status &= static_cast<uint16_t>(~(PS2_VU_STATUS_I | PS2_VU_STATUS_D));
+    if (ps2FloatIsZero(divisor))
+    {
+        if (ps2FloatIsZero(dividend))
+            status |= PS2_VU_STATUS_I | PS2_VU_STATUS_IS;
+        else
+            status |= PS2_VU_STATUS_D | PS2_VU_STATUS_DS;
+        return ps2SignedFloatMax(ps2FloatBits(dividend) ^ ps2FloatBits(divisor));
+    }
+    return ps2FpuClamp(dividend / divisor);
+}
+
+inline float ps2VuSqrt(uint16_t &status, float value)
+{
+    status &= static_cast<uint16_t>(~(PS2_VU_STATUS_I | PS2_VU_STATUS_D));
+    if ((ps2FloatBits(value) & 0x80000000u) != 0u && !ps2FloatIsZero(value))
+        status |= PS2_VU_STATUS_I | PS2_VU_STATUS_IS;
+    return ps2FpuClamp(std::sqrt(std::fabs(value)));
+}
+
+inline float ps2VuRsqrt(uint16_t &status, float numerator, float value)
+{
+    status &= static_cast<uint16_t>(~(PS2_VU_STATUS_I | PS2_VU_STATUS_D));
+    if (ps2FloatIsZero(value))
+    {
+        if (ps2FloatIsZero(numerator))
+            status |= PS2_VU_STATUS_I | PS2_VU_STATUS_IS;
+        else
+            status |= PS2_VU_STATUS_D | PS2_VU_STATUS_DS;
+        return ps2SignedFloatMax(ps2FloatBits(numerator) ^ ps2FloatBits(value));
+    }
+    if ((ps2FloatBits(value) & 0x80000000u) != 0u)
+        status |= PS2_VU_STATUS_I | PS2_VU_STATUS_IS;
+    return ps2FpuClamp(numerator / std::sqrt(std::fabs(value)));
+}
+
 // PS2 VU (Vector Unit) operations
-#define PS2_VADD(a, b) _mm_add_ps((__m128)(a), (__m128)(b))
-#define PS2_VSUB(a, b) _mm_sub_ps((__m128)(a), (__m128)(b))
-#define PS2_VMUL(a, b) _mm_mul_ps((__m128)(a), (__m128)(b))
+#define PS2_VADD(a, b) ps2VuClampVector(_mm_add_ps((__m128)(a), (__m128)(b)))
+#define PS2_VSUB(a, b) ps2VuClampVector(_mm_sub_ps((__m128)(a), (__m128)(b)))
+#define PS2_VMUL(a, b) ps2VuClampVector(_mm_mul_ps((__m128)(a), (__m128)(b)))
 #define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
-#define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
+#define PS2_VMULQ(a, q) ps2VuClampVector(_mm_mul_ps((__m128)(a), _mm_set1_ps(q)))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
 
 // Memory access helpers - Hybrid Fast/Slow Path
@@ -605,11 +734,11 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
-#define FPU_SQRT_S(a) sqrtf((float)(a))
+#define FPU_ADD_S(a, b) ps2FpuClamp((float)(a) + (float)(b))
+#define FPU_SUB_S(a, b) ps2FpuClamp((float)(a) - (float)(b))
+#define FPU_MUL_S(a, b) ps2FpuClamp((float)(a) * (float)(b))
+#define FPU_DIV_S(a, b) ps2FpuClamp((float)(a) / (float)(b))
+#define FPU_SQRT_S(a) ps2FpuClamp(std::sqrt(std::fabs((float)(a))))
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
 #define FPU_NEG_S(a) (-(float)(a))
@@ -623,7 +752,7 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+#define FPU_CVT_W_S(a) ps2FpuConvertToWord((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
