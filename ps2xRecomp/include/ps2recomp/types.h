@@ -198,6 +198,7 @@ namespace ps2recomp
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
         bool autoStubByName = true;
+        bool directTailCalls = true;
         std::string runtimeRelocationsPath;
     };
 

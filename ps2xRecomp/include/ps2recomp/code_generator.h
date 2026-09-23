@@ -54,6 +54,8 @@ namespace ps2recomp
         void setRelocationCallNames(const std::unordered_map<uint32_t, std::string> &callNames);
         void setConfiguredJumpTables(const std::vector<JumpTable> &jumpTables);
         void setRuntimeRelocationSites(const std::unordered_map<uint32_t, RuntimeRelocationKind> &sites);
+        void setDirectTailCalls(bool enabled);
+        bool directTailCalls() const;
         bool isRuntimeRelocationSite(uint32_t address, RuntimeRelocationKind kind) const;
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
         void setEmitInstructionComments(bool emitInstructionComments);
@@ -69,6 +71,7 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::string> m_relocationCallNames;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_configJumpTableTargetsByAddress;
         std::unordered_map<uint32_t, RuntimeRelocationKind> m_runtimeRelocationSites;
+        bool m_directTailCalls = true;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;

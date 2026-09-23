@@ -280,6 +280,16 @@ namespace ps2recomp
         m_runtimeRelocationSites = sites;
     }
 
+    void CodeGenerator::setDirectTailCalls(bool enabled)
+    {
+        m_directTailCalls = enabled;
+    }
+
+    bool CodeGenerator::directTailCalls() const
+    {
+        return m_directTailCalls;
+    }
+
     bool CodeGenerator::isRuntimeRelocationSite(uint32_t address, RuntimeRelocationKind kind) const
     {
         const auto it = m_runtimeRelocationSites.find(address);

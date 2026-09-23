@@ -1057,6 +1057,7 @@ namespace ps2recomp
             m_codeGenerator->setRelocationCallNames(relocationCallNames);
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
+            m_codeGenerator->setDirectTailCalls(m_config.directTailCalls);
             if (!m_config.runtimeRelocationsPath.empty())
             {
                 m_codeGenerator->setRuntimeRelocationSites(loadRuntimeRelocationSites(m_config.runtimeRelocationsPath));
