@@ -358,6 +358,9 @@ public:
     void bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram);
 
     [[nodiscard]] EeKernelSnapshot snapshot() const;
+    void setVBlankPeriodMicroseconds(uint32_t microseconds) noexcept;
+    [[nodiscard]] std::chrono::microseconds vblankPeriod() const noexcept;
+    [[nodiscard]] uint64_t vblankPeriodCycles() const noexcept;
     void publishSnapshot();
 
 private:
@@ -412,6 +415,7 @@ private:
     int m_nextSemaphoreId = 1;
     int m_nextEventFlagId = 1;
     int m_nextAlarmId = 1;
+    std::atomic<uint32_t> m_vblankPeriodMicroseconds{16683u};
     int m_nextIntcHandlerId = 1;
     int m_nextDmacHandlerId = 1;
     int m_intcHeadOrder = 0;

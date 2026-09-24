@@ -146,8 +146,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
-                  std::chrono::steady_clock::now() + kVBlankPeriod,
+    scheduleEvent(m_eeCycle + vblankPeriodCycles(),
+                  std::chrono::steady_clock::now() + vblankPeriod(),
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
 }
@@ -1304,6 +1304,21 @@ void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
     }
 }
 
+void EeScheduler::setVBlankPeriodMicroseconds(uint32_t microseconds) noexcept
+{
+    m_vblankPeriodMicroseconds.store(microseconds, std::memory_order_relaxed);
+}
+
+std::chrono::microseconds EeScheduler::vblankPeriod() const noexcept
+{
+    return std::chrono::microseconds(m_vblankPeriodMicroseconds.load(std::memory_order_relaxed));
+}
+
+uint64_t EeScheduler::vblankPeriodCycles() const noexcept
+{
+    return microsecondsToEeCycles(m_vblankPeriodMicroseconds.load(std::memory_order_relaxed));
+}
+
 uint64_t EeScheduler::currentVSyncTick() const noexcept
 {
     return m_vsyncTick;
@@ -1850,8 +1865,8 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                scheduleEvent(scheduled.deadlineCycle + vblankPeriodCycles(),
+                              scheduled.hostDeadline + vblankPeriod(),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);

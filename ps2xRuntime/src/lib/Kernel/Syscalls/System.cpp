@@ -1,4 +1,5 @@
 #include "Common.h"
+#include "runtime/ee_scheduler.h"
 #include "System.h"
 
 namespace ps2_syscalls
@@ -17,6 +18,10 @@ namespace ps2_syscalls
                 ((static_cast<uint64_t>(frameMode) & 0x1ull) << 1);
 
             gs.smode2 = smode2;
+            if (videoMode == 2 || videoMode == 3)
+            {
+                runtime->eeScheduler().setVBlankPeriodMicroseconds(videoMode == 3 ? 20000u : 16683u);
+            }
 
             // Keep CRT1 enabled after the BIOS syscall selects a display mode.
             if ((gs.pmode & 0x3ull) == 0ull)
