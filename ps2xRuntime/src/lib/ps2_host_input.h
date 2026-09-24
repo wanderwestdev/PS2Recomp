@@ -8,6 +8,6 @@ namespace ps2_host_input
 {
     constexpr uint32_t kPadPorts = 2u;
 
-    void sample();
+    void sample(uint64_t vsyncTick);
     [[nodiscard]] ps2x::iop::PadInputState padState(uint32_t port);
 }

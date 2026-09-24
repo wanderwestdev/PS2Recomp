@@ -2376,7 +2376,7 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
-        ps2_host_input::sample();
+        ps2_host_input::sample(m_memory.gs().vsyncTick.load());
 
         if (WindowShouldClose())
         {

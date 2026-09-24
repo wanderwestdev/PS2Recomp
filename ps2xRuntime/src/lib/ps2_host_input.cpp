@@ -68,6 +68,7 @@ namespace ps2_host_input
         {
             double start = 0.0;
             double end = 0.0;
+            bool fields = false;
             uint16_t buttons = 0u;
         };
 
@@ -106,14 +107,20 @@ namespace ps2_host_input
         std::optional<ScriptStep> parseStep(std::string_view text)
         {
             constexpr double kDefaultHoldSeconds = 1.0;
+            constexpr double kDefaultHoldFields = 10.0;
             const std::vector<std::string_view> fields = split(text, ':');
             if (fields.size() < 2u || fields.size() > 3u)
                 return std::nullopt;
             try
             {
                 ScriptStep step;
-                step.start = std::stod(std::string(fields[0]));
-                step.end = step.start + (fields.size() == 3u ? std::stod(std::string(fields[2])) : kDefaultHoldSeconds);
+                std::string_view start = fields[0];
+                step.fields = !start.empty() && start.back() == 'v';
+                if (step.fields)
+                    start.remove_suffix(1u);
+                step.start = std::stod(std::string(start));
+                const double defaultHold = step.fields ? kDefaultHoldFields : kDefaultHoldSeconds;
+                step.end = step.start + (fields.size() == 3u ? std::stod(std::string(fields[2])) : defaultHold);
                 for (std::string_view name : split(fields[1], '+'))
                 {
                     const auto found = std::find_if(kButtonNames.begin(), kButtonNames.end(), [&](const auto &entry)
@@ -147,7 +154,7 @@ namespace ps2_host_input
             return script;
         }
 
-        uint16_t scriptedButtons()
+        uint16_t scriptedButtons(uint64_t vsyncTick)
         {
             static const std::vector<ScriptStep> script = loadScript();
             static const auto origin = std::chrono::steady_clock::now();
@@ -157,7 +164,8 @@ namespace ps2_host_input
             uint16_t buttons = 0u;
             for (const ScriptStep &step : script)
             {
-                if (now >= step.start && now < step.end)
+                const double clock = step.fields ? static_cast<double>(vsyncTick) : now;
+                if (clock >= step.start && clock < step.end)
                     buttons |= step.buttons;
             }
             return buttons;
@@ -186,7 +194,7 @@ namespace ps2_host_input
             return low ? 0x00u : 0xFFu;
         }
 
-        PadInputState readPort(uint32_t port)
+        PadInputState readPort(uint32_t port, uint64_t vsyncTick)
         {
             PadInputState state;
             const int gamepad = static_cast<int>(port);
@@ -205,7 +213,7 @@ namespace ps2_host_input
                     state.buttons |= binding.button;
             }
             if (keyboard)
-                state.buttons |= scriptedButtons();
+                state.buttons |= scriptedButtons(vsyncTick);
 
             if (gamepadAvailable)
             {
@@ -232,11 +240,11 @@ namespace ps2_host_input
         }
     }
 
-    void sample()
+    void sample(uint64_t vsyncTick)
     {
         std::array<PadInputState, kPadPorts> state{};
         for (uint32_t port = 0; port < kPadPorts; ++port)
-            state[port] = readPort(port);
+            state[port] = readPort(port, vsyncTick);
         std::lock_guard<std::mutex> lock(g_mutex);
         g_state = state;
     }
