@@ -299,7 +299,7 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+        uint32_t candidate = alignUp(HeapBase, alignment);
         for (;;)
         {
             bool overlap = false;
@@ -309,7 +309,6 @@ namespace ps2x::iop::detail
                 {
                     candidate = alignUp(block.address + block.size, alignment);
                     overlap = true;
-                    break;
                 }
             }
             if (!overlap)

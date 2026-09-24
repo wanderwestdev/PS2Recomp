@@ -393,6 +393,13 @@ namespace GSMem
     {
         return 0;
     }
+
+    u32 BlockByteAddress32(bool depth, u32 bp, u32 bw, u32 x, u32 y)
+    {
+        const u32 pixel = depth ? PixelStorageTraits<Z32>::Address(PageTableZ32, bp, bw, x, y)
+                                : PixelStorageTraits<C32>::Address(PageTableC32, bp, bw, x, y);
+        return ((pixel & ~63u) * 4u) & static_cast<u32>(MEMORY_SIZE - 1u);
+    }
 }
 
 

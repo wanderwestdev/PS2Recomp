@@ -71,6 +71,7 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::string> m_relocationCallNames;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_configJumpTableTargetsByAddress;
         std::unordered_map<uint32_t, RuntimeRelocationKind> m_runtimeRelocationSites;
+        std::unordered_set<uint32_t> m_runtimeRelocatedValueSites;
         bool m_directTailCalls = true;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         const std::vector<Section>& m_sections;

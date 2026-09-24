@@ -17,6 +17,11 @@
 
 using namespace GSInternal;
 
+namespace GSMem
+{
+    u32 BlockByteAddress32(bool depth, u32 bp, u32 bw, u32 x, u32 y);
+}
+
 namespace
 {
     float fabsQ(float q)
@@ -1269,6 +1274,55 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     }
     else
     {
+        const uint32_t fpsm = ctx.frame.psm;
+        const uint32_t zpsm = ctx.zbuf.psm;
+        const PixelWriteMask mask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
+        const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+        const bool preserveDestinationAlpha = mask.writeRgb && !mask.writeAlpha && fpsm == GS_PSM_CT32;
+        const bool destinationAlphaTestNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u;
+        const bool framebufferRead = destinationAlphaTestNeedsRead ||
+                                     (mask.writesFramebuffer() && (ctx.frame.fbmsk != 0 || state.prim.abe || preserveDestinationAlpha));
+        const bool writesDepth = mask.writeDepth && !ctx.zbuf.zmask;
+        const bool pixelIndependent = fpsm == GS_PSM_CT32 && !framebufferRead && ztestMethod != 2u && ztestMethod != 3u &&
+                                      (!writesDepth || zpsm == GS_PSM_Z32) && m_vram != nullptr && m_vramSize >= GSMem::MEMORY_SIZE;
+        if (pixelIndependent)
+        {
+            if (!mask.writesAnything() || ztestMethod == 0u)
+            {
+                return;
+            }
+            WritePixel(state, drawX0, drawY0, z1, r, g, b, a, v1.fog);
+            const u32 fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+            const u32 zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+            const u32 fbw = std::max<u32>(ctx.frame.fbw, 1u);
+            const bool writesColor = mask.writesFramebuffer();
+            const u32 color = writesColor ? ReadVramUnlocked(fpsm, fbp, fbw, drawX0, drawY0) : 0u;
+            const u32 depth = writesDepth ? ReadVramUnlocked(zpsm, zbp, fbw, drawX0, drawY0) : 0u;
+            auto fill = [&](bool isDepth, u32 base, u32 psm, u32 value)
+            {
+                for (int by = drawY0 & ~7; by <= drawY1; by += 8)
+                {
+                    for (int bx = drawX0 & ~7; bx <= drawX1; bx += 8)
+                    {
+                        if (bx >= drawX0 && by >= drawY0 && bx + 7 <= drawX1 && by + 7 <= drawY1)
+                        {
+                            uint32_t *block = reinterpret_cast<uint32_t *>(m_vram + GSMem::BlockByteAddress32(isDepth, base, fbw, static_cast<u32>(bx), static_cast<u32>(by)));
+                            std::fill(block, block + 64, value);
+                            continue;
+                        }
+                        for (int y = std::max(by, drawY0); y <= std::min(by + 7, drawY1); ++y)
+                            for (int x = std::max(bx, drawX0); x <= std::min(bx + 7, drawX1); ++x)
+                                WriteVramUnlocked(psm, base, fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y), value);
+                    }
+                }
+            };
+            if (writesColor)
+                fill(false, fbp, fpsm, color);
+            if (writesDepth)
+                fill(true, zbp, zpsm, depth);
+            return;
+        }
+
         for (int y = drawY0; y <= drawY1; ++y)
             for (int x = drawX0; x <= drawX1; ++x)
                 WritePixel(state, x, y, z1, r, g, b, a, v1.fog);

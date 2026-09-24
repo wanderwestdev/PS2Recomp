@@ -1,4 +1,5 @@
 #include "ps2recomp/code_generator.h"
+#include "ps2recomp/gif_dma_kick_analyzer.h"
 #include "ps2recomp/control_flow_analyzer.h"
 #include "ps2recomp/Emitters/function_emitter.h"
 #include "ps2recomp/Emitters/function_table_emitter.h"
@@ -278,6 +279,15 @@ namespace ps2recomp
     void CodeGenerator::setRuntimeRelocationSites(const std::unordered_map<uint32_t, RuntimeRelocationKind> &sites)
     {
         m_runtimeRelocationSites = sites;
+        m_runtimeRelocatedValueSites.clear();
+        for (const auto &[address, kind] : sites)
+        {
+            if (kind != RuntimeRelocationKind::Jump26)
+            {
+                m_runtimeRelocatedValueSites.insert(address);
+            }
+        }
+        setRuntimeRelocatedInstructions(&m_runtimeRelocatedValueSites);
     }
 
     void CodeGenerator::setDirectTailCalls(bool enabled)

@@ -48,6 +48,7 @@ namespace ps2recomp
     bool isDirectMemoryAccess(const Instruction &inst);
     MemoryAccessHint resolveMemoryAccessHint(const Instruction &inst, const ConstantRegisterState &constants);
     void updateConstantRegisters(const Instruction &inst, ConstantRegisterState &constants);
+    void setRuntimeRelocatedInstructions(const std::unordered_set<uint32_t> *addresses);
 
     GifDmaKickPlan tryBuildGifDmaKickPlan(const std::vector<Instruction> &instructions,
                                           size_t startIndex,

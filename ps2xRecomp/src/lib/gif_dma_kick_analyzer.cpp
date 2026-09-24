@@ -175,10 +175,27 @@ namespace ps2recomp
         return hint;
     }
 
+    namespace
+    {
+        const std::unordered_set<uint32_t> *g_runtimeRelocatedInstructions = nullptr;
+    }
+
+    void setRuntimeRelocatedInstructions(const std::unordered_set<uint32_t> *addresses)
+    {
+        g_runtimeRelocatedInstructions = addresses;
+    }
+
     void updateConstantRegisters(const Instruction &inst, ConstantRegisterState &constants)
     {
         uint32_t lhs = 0u;
         uint32_t rhs = 0u;
+
+        if (g_runtimeRelocatedInstructions && g_runtimeRelocatedInstructions->contains(inst.address) &&
+            (inst.opcode == OPCODE_LUI || inst.opcode == OPCODE_ADDIU || inst.opcode == OPCODE_ORI))
+        {
+            constants.invalidate(inst.rt);
+            return;
+        }
 
         switch (inst.opcode)
         {
