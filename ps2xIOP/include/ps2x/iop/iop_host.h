@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ps2x/iop/iop_pad.h"
 #include "ps2x/iop/iop_types.h"
 
 #include <array>
@@ -128,6 +129,20 @@ namespace ps2x::iop
             (void)packet;
             (void)packetSize;
             return false;
+        }
+
+        virtual bool readPad(uint32_t port, PadInputState &state)
+        {
+            (void)port;
+            state = {};
+            return false;
+        }
+
+        virtual void padVibration(uint32_t port, uint8_t smallMotor, uint8_t largeMotor)
+        {
+            (void)port;
+            (void)smallMotor;
+            (void)largeMotor;
         }
 
         virtual void log(LogLevel level, std::string_view message) = 0;

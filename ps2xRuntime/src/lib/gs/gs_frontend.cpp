@@ -6,9 +6,118 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <string>
+
+namespace
+{
+    struct GsTraceConfig
+    {
+        uint64_t firstTick = 0;
+        uint64_t endTick = 0;
+        uint64_t lastTick = UINT64_MAX;
+        std::FILE *file = nullptr;
+        std::string vramPath;
+    };
+
+    GsTraceConfig &gsTrace()
+    {
+        static GsTraceConfig config = []
+        {
+            GsTraceConfig result;
+            const char *value = std::getenv("PS2X_GS_TRACE");
+            unsigned long long first = 0;
+            unsigned long long count = 0;
+            char path[512]{};
+            if (value && std::sscanf(value, "%llu:%llu:%511[^\n]", &first, &count, path) == 3)
+            {
+                result.firstTick = first;
+                result.endTick = first + count;
+                result.file = std::fopen(path, "w");
+                result.vramPath = std::string(path) + ".vram";
+            }
+            return result;
+        }();
+        return config;
+    }
+
+    std::FILE *gsTraceFile(const GSRegisters *regs, const uint8_t *vram = nullptr, uint32_t vramSize = 0u)
+    {
+        GsTraceConfig &config = gsTrace();
+        if (!config.file || !regs)
+            return nullptr;
+        const uint64_t tick = regs->vsyncTick.load(std::memory_order_acquire);
+        if (tick < config.firstTick)
+            return nullptr;
+        if (tick >= config.endTick)
+        {
+            std::fclose(config.file);
+            config.file = nullptr;
+            return nullptr;
+        }
+        if (tick != config.lastTick)
+        {
+            if (config.lastTick == UINT64_MAX && vram && vramSize)
+            {
+                if (std::FILE *dump = std::fopen(config.vramPath.c_str(), "wb"))
+                {
+                    std::fwrite(vram, 1, vramSize, dump);
+                    std::fclose(dump);
+                }
+            }
+            config.lastTick = tick;
+            std::fprintf(config.file,
+                         "V tick=%llu pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx bgcolor=%llx\n",
+                         static_cast<unsigned long long>(tick),
+                         static_cast<unsigned long long>(regs->pmode),
+                         static_cast<unsigned long long>(regs->smode2),
+                         static_cast<unsigned long long>(regs->dispfb1),
+                         static_cast<unsigned long long>(regs->display1),
+                         static_cast<unsigned long long>(regs->dispfb2),
+                         static_cast<unsigned long long>(regs->display2),
+                         static_cast<unsigned long long>(regs->bgcolor));
+        }
+        return config.file;
+    }
+
+    void traceDraw(std::FILE *file, const GSPrimitiveBatch &batch)
+    {
+        const GSDrawState &st = batch.state;
+        const GSContext &c = st.context;
+        const GSPrimReg &p = st.prim;
+        std::fprintf(file,
+                     "D prim=%u iip=%d tme=%d fge=%d abe=%d aa1=%d fst=%d ctxt=%d fix=%d"
+                     " frame=%x/%u/%02x/%08x zbuf=%x/%02x/%d"
+                     " tex0=%x/%u/%02x/%ux%u/tcc%u/tfx%u/cbp%x/cpsm%02x/csm%u/csa%u/cld%u"
+                     " tex1=%llx clamp=%llx alpha=%llx test=%llx fba=%llx scissor=%u-%u,%u-%u ofs=%u,%u"
+                     " texa=%u/%d/%u pabe=%d dthe=%llx colclamp=%llx",
+                     static_cast<unsigned>(p.type), p.iip, p.tme, p.fge, p.abe, p.aa1, p.fst, p.ctxt, p.fix,
+                     c.frame.fbp, c.frame.fbw, c.frame.psm, c.frame.fbmsk, c.zbuf.zbp, c.zbuf.psm, c.zbuf.zmask,
+                     c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, 1u << c.tex0.tw, 1u << c.tex0.th, c.tex0.tcc, c.tex0.tfx,
+                     c.tex0.cbp, c.tex0.cpsm, c.tex0.csm, c.tex0.csa, c.tex0.cld,
+                     static_cast<unsigned long long>(c.tex1), static_cast<unsigned long long>(c.clamp),
+                     static_cast<unsigned long long>(c.alpha), static_cast<unsigned long long>(c.test),
+                     static_cast<unsigned long long>(c.fba), c.scissor.x0, c.scissor.x1, c.scissor.y0, c.scissor.y1,
+                     c.xyoffset.ofx, c.xyoffset.ofy, st.texa.ta0, st.texa.aem, st.texa.ta1, st.pabe,
+                     static_cast<unsigned long long>(st.dthe), static_cast<unsigned long long>(st.colclamp));
+        for (uint32_t i = 0; i < batch.vertexCount; ++i)
+        {
+            const GSVertex &v = batch.vertices[i];
+            std::fprintf(file, " | %.2f,%.2f z=%.0f rgba=%02x%02x%02x%02x uv=%.2f,%.2f st=%g,%g q=%g",
+                         v.x, v.y, v.z, v.r, v.g, v.b, v.a, v.u / 16.0, v.v / 16.0, v.s, v.t, v.q);
+        }
+        std::fputc('\n', file);
+    }
+
+    void traceTransfer(std::FILE *file, const GSBitBltBuf &b, const GSTrxPos &pos, const GSTrxReg &reg, uint32_t dir)
+    {
+        std::fprintf(file, "T dir=%u src=%x/%u/%02x dst=%x/%u/%02x ss=%u,%u ds=%u,%u size=%ux%u\n",
+                     dir, b.sbp, b.sbw, b.spsm, b.dbp, b.dbw, b.dpsm, pos.ssax, pos.ssay, pos.dsax, pos.dsay, reg.rrw, reg.rrh);
+    }
+}
 
 namespace
 {
@@ -1383,6 +1492,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        if (std::FILE *trace = gsTraceFile(m_privRegs))
+            traceTransfer(trace, m_bitbltbuf, m_trxpos, m_trxreg, m_trxdir);
 
         if (m_backend)
         {
@@ -1577,6 +1688,20 @@ void GS::vertexKick(bool drawing)
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
         m_backend->Submit(batch);
+        if (std::FILE *trace = gsTraceFile(m_privRegs, m_localMemoryStorage, m_localMemorySize))
+        {
+            traceDraw(trace, batch);
+            static uint32_t tracedDraws = 0u;
+            static const long dumpDraw = std::getenv("PS2X_GS_TRACE_DUMP_DRAW") ? std::atol(std::getenv("PS2X_GS_TRACE_DUMP_DRAW")) : -1;
+            if (static_cast<long>(tracedDraws++) == dumpDraw)
+            {
+                if (std::FILE *raw = std::fopen((gsTrace().vramPath + ".draw").c_str(), "wb"))
+                {
+                    std::fwrite(m_localMemoryStorage, 1, m_localMemorySize, raw);
+                    std::fclose(raw);
+                }
+            }
+        }
         recordDrawDebugEventUnlocked(needed);
     }
 
@@ -1609,6 +1734,13 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
+    if (std::FILE *trace = gsTraceFile(m_privRegs))
+    {
+        std::fprintf(trace, "I %u ", sizeBytes);
+        for (uint32_t i = 0; i < sizeBytes; ++i)
+            std::fprintf(trace, "%02x", data[i]);
+        std::fputc(0x0A, trace);
+    }
     if (m_backend)
         m_backend->UploadImage(data, sizeBytes);
 }

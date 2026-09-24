@@ -10,6 +10,8 @@
 
 namespace ps2x::iop::detail
 {
+    class IopSio2;
+
     class IopMemory
     {
     public:
@@ -68,6 +70,7 @@ namespace ps2x::iop::detail
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+        void attachSio2(IopSio2 *sio2) noexcept { m_sio2 = sio2; }
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
@@ -87,5 +90,6 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        IopSio2 *m_sio2 = nullptr;
     };
 }

@@ -19,7 +19,17 @@ Generic HLE services remain available when no loaded IRX provides an endpoint:
 | DBCMAN | `0x80001300` | Recognized module load |
 
 These services are dormant before module load and after reset or the final
-module stop. Unknown modules fail to load; unknown RPC SIDs remain unhandled.
+module stop.
+
+## Emulated hardware
+
+SIO2 (`0x1F808200`–`0x1F808283`, IRQ 17, DMA channels 11/12 through
+`dmacman` `dmac_request`/`dmac_transfer`) is emulated so physical SIO2MAN,
+PADMAN/DBCMAN/DS1O_D-style drivers run unmodified. Ports 0 and 1 hold a
+`VirtualDualShock2` (digital, analog and pressure modes, configuration
+commands `0x40`–`0x4F`, vibration map). Host input comes from
+`IopHost::readPad`; motor changes are reported through
+`IopHost::padVibration`. Ports 2 and 3 (memory cards) answer "no device". Unknown modules fail to load; unknown RPC SIDs remain unhandled.
 Games previously using TSNDDRV, CRI DTX, CLFILE, SOUND or SDRDRV profiles now
 require their IRX modules and support for the imports and hardware they use.
 

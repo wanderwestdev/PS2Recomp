@@ -1379,7 +1379,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
                 continue;
 
-            double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            const double z = v0.z + (v1.z - v0.z) * static_cast<double>(w1) + (v2.z - v0.z) * static_cast<double>(w2);
 
             uint8_t r, g, b, a;
             if (state.prim.iip)
@@ -1442,7 +1442,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             }
 
             const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-            WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+            WritePixel(state, x, y, static_cast<u32>(std::clamp(z + 0.5, 0.0, 4294967295.0)), r, g, b, a, fog);
         }
     }
 }

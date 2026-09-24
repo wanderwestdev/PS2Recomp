@@ -12,6 +12,7 @@
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
+#include "ps2_host_input.h"
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <iostream>
@@ -2445,6 +2446,7 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+        ps2_host_input::sample();
 
         if (WindowShouldClose())
         {

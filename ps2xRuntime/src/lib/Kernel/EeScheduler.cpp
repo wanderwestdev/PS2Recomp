@@ -149,7 +149,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     scheduleEvent(m_eeCycle + vblankPeriodCycles(),
                   std::chrono::steady_clock::now() + vblankPeriod(),
                   EeEvent{EeEventType::VBlankStart, 0, 0});
-    publishSnapshot();
+    publishSnapshotNow();
 }
 
 void EeScheduler::run()
@@ -172,7 +172,7 @@ void EeScheduler::run()
             {
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
-                publishSnapshot();
+                publishSnapshotNow();
                 waitForEvent();
                 continue;
             }
@@ -218,7 +218,7 @@ void EeScheduler::run()
         if (m_debugPublishCountdown == 0u)
         {
             copyMainContextToRuntime();
-            publishSnapshot();
+            publishSnapshotNow();
             m_debugPublishCountdown = kDebugPublishDispatchInterval - 1u;
         }
         else
@@ -250,7 +250,7 @@ void EeScheduler::run()
             m_currentThreadId = 0;
             copyMainContextToRuntime();
             publishIdleDebugContext();
-            publishSnapshot();
+            publishSnapshotNow();
             continue;
         }
 
@@ -309,7 +309,7 @@ void EeScheduler::run()
         {
             m_guestExecuting.store(false, std::memory_order_release);
             m_running.store(false, std::memory_order_release);
-            publishSnapshot();
+            publishSnapshotNow();
             throw;
         }
 
@@ -328,7 +328,7 @@ void EeScheduler::run()
     m_guestExecuting.store(false, std::memory_order_release);
     m_running.store(false, std::memory_order_release);
     copyMainContextToRuntime();
-    publishSnapshot();
+    publishSnapshotNow();
 }
 
 void EeScheduler::requestStop()
@@ -1499,6 +1499,12 @@ EeKernelSnapshot EeScheduler::snapshot() const
 
 void EeScheduler::publishSnapshot()
 {
+    m_snapshotDirty = true;
+}
+
+void EeScheduler::publishSnapshotNow()
+{
+    m_snapshotDirty = false;
     EeKernelSnapshot next{};
     next.sequence = ++m_snapshotSequence;
     next.eeCycle = m_eeCycle;

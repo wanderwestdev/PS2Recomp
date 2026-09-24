@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 
 namespace ps2x::iop
@@ -43,6 +44,14 @@ namespace ps2x::iop::detail
     class IopRpcBridge
     {
     public:
+        struct DmaCallback
+        {
+            uint32_t function = 0;
+            uint32_t argument = 0;
+            uint32_t gp = 0;
+            uint32_t bytes = 0;
+        };
+
         IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept;
 
         void reset();
@@ -54,8 +63,11 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
+        [[nodiscard]] std::optional<DmaCallback> takeDmaCallback() noexcept;
 
     private:
+        [[nodiscard]] uint32_t setDma(uint32_t descriptorAddress, uint32_t descriptorCount, uint32_t &bytes);
+
         struct RpcServer
         {
             uint32_t sid = 0;
@@ -73,6 +85,7 @@ namespace ps2x::iop::detail
         IopKernel &m_kernel;
         std::unordered_map<uint32_t, RpcServer> m_servers;
         uint32_t m_nextDmaId = 1u;
+        std::optional<DmaCallback> m_dmaCallback;
         bool m_sifInitialized = false;
     };
 }

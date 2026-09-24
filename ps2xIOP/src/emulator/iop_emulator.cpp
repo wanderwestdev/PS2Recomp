@@ -1,5 +1,6 @@
 #include "iop_emulator.h"
 #include "imports/iop_cdvd.h"
+#include "devices/iop_sio2.h"
 #include "core/iop_cpu.h"
 #include "imports/iop_heaplib.h"
 #include "imports/iop_imports.h"
@@ -37,6 +38,9 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackSize = 0x2000u;
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
+        constexpr uint64_t kSifDmaBaseCycles = 64u;
+        constexpr uint64_t kSifDmaBytesPerCycle = 4u;
+        constexpr uint64_t kIopBatchCycles = 128u;
 
         uint32_t physicalAddress(uint32_t address)
         {
@@ -106,6 +110,7 @@ namespace ps2x::iop::detail
               intrman(memory),
               timrman(),
               ioman(memory),
+              sio2(host, memory),
               cpuCore(memory),
               imports(memory),
               loadcore(memory, imports)
@@ -124,6 +129,8 @@ namespace ps2x::iop::detail
             intrman.reset();
             timrman.reset();
             ioman.reset();
+            sio2.reset();
+            memory.attachSio2(&sio2);
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
@@ -318,9 +325,15 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "sifman"))
             {
-                return rpc.dispatchSifManImport(call.ordinal, cpu)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
+                if (!rpc.dispatchSifManImport(call.ordinal, cpu))
+                    return ImportDisposition::Missing;
+                if (const auto callback = rpc.takeDmaCallback())
+                {
+                    pendingGuestCallbacks.emplace(
+                        totalCycles + kSifDmaBaseCycles + callback->bytes / kSifDmaBytesPerCycle,
+                        ScheduledGuestCallback{callback->function, callback->gp, callback->argument});
+                }
+                return ImportDisposition::Handled;
             }
             if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
                 return ImportDisposition::Handled;
@@ -328,7 +341,19 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "dmacman"))
             {
-                setV0(0);
+                switch (call.ordinal)
+                {
+                case 28:
+                    setV0(sio2.dmaRequest(a0, cpu.gpr[5], cpu.gpr[6], cpu.gpr[7], memory.read32(cpu.gpr[29] + 16u)) ? 1u : 0u);
+                    break;
+                case 32:
+                    (void)sio2.dmaTransfer(a0);
+                    setV0(0);
+                    break;
+                default:
+                    setV0(0);
+                    break;
+                }
                 return ImportDisposition::Handled;
             }
             if (iequals(call.library, "stdio") && stdio.dispatchImport(call.ordinal, cpu))
@@ -694,6 +719,7 @@ namespace ps2x::iop::detail
         IopIntrman intrman;
         IopTimrman timrman;
         IopIoman ioman;
+        IopSio2 sio2;
         IopCpuCore cpuCore;
         IopImportRegistry imports;
         IopLoadcore loadcore;
@@ -746,9 +772,13 @@ namespace ps2x::iop::detail
     {
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
         const uint64_t iopCycles = total / 8u;
+        if (iopCycles < kIopBatchCycles)
+        {
+            m_impl->eeCycleCarry = total;
+            return;
+        }
         m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        m_impl->runCycles(iopCycles);
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)

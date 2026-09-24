@@ -1,5 +1,6 @@
 #include "ps2_iop_host.h"
 
+#include "ps2_host_input.h"
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "Kernel/Stubs/SIF.h"
@@ -562,6 +563,12 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
                                          commandId,
                                          packet,
                                          packetSize);
+}
+
+bool PS2IopHostAdapter::readPad(uint32_t port, ps2x::iop::PadInputState &state)
+{
+    state = ps2_host_input::padState(port);
+    return state.connected;
 }
 
 void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)

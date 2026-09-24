@@ -362,6 +362,7 @@ public:
     [[nodiscard]] std::chrono::microseconds vblankPeriod() const noexcept;
     [[nodiscard]] uint64_t vblankPeriodCycles() const noexcept;
     void publishSnapshot();
+    void publishSnapshotNow();
 
 private:
     struct ScheduledEvent
@@ -457,4 +458,5 @@ private:
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
     uint64_t m_snapshotSequence = 0;
+    bool m_snapshotDirty = true;
 };
