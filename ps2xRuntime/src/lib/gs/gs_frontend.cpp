@@ -1,5 +1,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_recording.h"
+#include "runtime/gs/gs_threaded_backend.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -213,7 +215,7 @@ namespace
 
 
 GS::GS()
-    : m_backend(std::make_unique<GSCpuBackend>())
+    : m_backend(GSThreadedBackend::MakeDefault())
 {
     reset();
 }
@@ -224,7 +226,9 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
     if (!m_backend)
-        m_backend = std::make_unique<GSCpuBackend>();
+        m_backend = GSThreadedBackend::MakeDefault();
+    if (!dynamic_cast<GSRecordingBackend *>(m_backend.get()))
+        m_backend = GSRecordingBackend::WrapFromEnvironment(std::move(m_backend), privRegs);
     m_backend->Initialize(vram, vramSize);
     reset();
 }
@@ -738,7 +742,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         return;
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
+    {
+        m_backend->Flush();
         return;
+    }
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
@@ -795,7 +802,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                 for (uint32_t r = 0; r < nreg; ++r)
                 {
                     if (offset + 16 > sizeBytes)
+                    {
+                        m_backend->Flush();
                         return;
+                    }
                     uint64_t lo = loadLE64(data + offset);
                     uint64_t hi = loadLE64(data + offset + 8);
                     offset += 16;
@@ -810,7 +820,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                 for (uint32_t r = 0; r < nreg; ++r)
                 {
                     if (offset + 8 > sizeBytes)
+                    {
+                        m_backend->Flush();
                         return;
+                    }
                     writeRegisterUnlocked(regs[r], loadLE64(data + offset));
                     offset += 8;
                 }
@@ -827,6 +840,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             offset += imageBytes;
         }
     }
+    m_backend->Flush();
 }
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
@@ -862,6 +876,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
         return true; });
 
+    m_backend->Flush();
     if (!processed)
         return false;
 
@@ -878,6 +893,8 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+    if (m_backend)
+        m_backend->Flush();
 }
 
 void GS::uploadImageNativeUnlocked(uint64_t bitbltbuf,
@@ -1558,6 +1575,11 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_SIGNAL:
     {
+        if (m_backend)
+        {
+            m_backend->Flush();
+            m_backend->Sync(GSSyncReason::Finish);
+        }
         if (m_privRegs)
         {
             uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
@@ -1582,6 +1604,11 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_LABEL:
     {
+        if (m_backend)
+        {
+            m_backend->Flush();
+            m_backend->Sync(GSSyncReason::Finish);
+        }
         if (m_privRegs)
         {
             uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
@@ -1672,6 +1699,11 @@ void GS::vertexKick(bool drawing)
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
         m_backend->Submit(batch);
+        if (gsTrace().file && gsTrace().lastTick == UINT64_MAX)
+        {
+            m_backend->Flush();
+            m_backend->Sync(GSSyncReason::DebugReadback);
+        }
         if (std::FILE *trace = gsTraceFile(m_privRegs, m_localMemoryStorage, m_localMemorySize))
         {
             traceDraw(trace, batch);
@@ -1679,6 +1711,8 @@ void GS::vertexKick(bool drawing)
             static const long dumpDraw = std::getenv("PS2X_GS_TRACE_DUMP_DRAW") ? std::atol(std::getenv("PS2X_GS_TRACE_DUMP_DRAW")) : -1;
             if (static_cast<long>(tracedDraws++) == dumpDraw)
             {
+                m_backend->Flush();
+                m_backend->Sync(GSSyncReason::DebugReadback);
                 if (std::FILE *raw = std::fopen((gsTrace().vramPath + ".draw").c_str(), "wb"))
                 {
                     std::fwrite(m_localMemoryStorage, 1, m_localMemorySize, raw);
@@ -1751,7 +1785,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 {
     if (!backend)
-        backend = std::make_unique<GSCpuBackend>();
+        backend = GSThreadedBackend::MakeDefault();
 
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);

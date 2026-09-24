@@ -1,16 +1,23 @@
 #pragma once
 
 #include "runtime/gs/gs_backend.h"
-#include "runtime/gs/gs_texture_page_cache.h"
+#include "runtime/gs/gs_backend_state.h"
+#include "runtime/gs/gs_swizzle.h"
+#include "runtime/gs/gs_cpu_raster.h"
 
 #include <array>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <vector>
 
-class GSCpuBackend final : public GSRasterBackend
+class GSBandPool;
+
+class GSCpuBackend final : public GSRasterBackend, public GSBackendStateAccess
 {
 public:
     GSCpuBackend();
+    ~GSCpuBackend() override;
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
@@ -33,6 +40,9 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    bool ExportState(GSBackendState &out) override;
+    bool ImportState(const GSBackendState &state) override;
+
 private:
     void ResetUnlocked();
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
@@ -42,6 +52,14 @@ private:
 
     void DrawPrimitive(const GSPrimitiveBatch &batch);
     void DrawSprite(const GSPrimitiveBatch &batch);
+    bool DrawSpriteFast(const GSPrimitiveBatch &batch);
+    bool DrawTriangleFast(const GSPrimitiveBatch &batch);
+    bool PrepareCacheForTexturedDraw();
+    void FinishTexturedDraw(uint32_t lastTexelByte);
+    uint32_t LastBandTexel() const;
+    bool BandsAllowed(const GSRaster::PixelSetup &px, int x0, int y0, int x1, int y1) const;
+    unsigned PlanBands(int y0, int y1, int columns, bool allowed);
+    void RunBands(int y0, int y1, unsigned bands, const std::function<void(int, int, unsigned)> &work);
     void DrawTriangle(const GSPrimitiveBatch &batch);
     void DrawLine(const GSPrimitiveBatch &batch);
     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
@@ -52,18 +70,21 @@ private:
     void PerformLocalToHostTransfer();
     PresentationFrame PresentFromLocalMemory(const GSPresentationRequest &request);
 
-    using WriteVramFunc = void (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
-    using ReadVramFunc = uint32_t (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t);
-
-    static constexpr size_t kPsmHandlerCount = 1u << 6u;
     mutable std::mutex m_mutex;
     uint8_t *m_vram = nullptr;
     uint32_t m_vramSize = 0;
-    std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
-    std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
-    GSMem::TexturePageCache m_texturePageCache;
+    uint64_t m_clutVersion = 0u;
+    GSSwizzle::TextureCache m_textureCache;
+    GSRaster::PixelSetup m_pixelSetup;
+    GSRaster::TextureSampler m_sampler;
+    std::vector<GSRaster::AxisSample> m_columnSamples;
+    std::vector<GSRaster::AxisSample> m_rowSamples;
+    std::vector<GSRaster::PixelColumn> m_pixelColumns;
+    std::vector<float> m_edgeColumns;
+    std::vector<uint32_t> m_bandLastTexel;
+    std::unique_ptr<GSBandPool> m_bandPool;
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};

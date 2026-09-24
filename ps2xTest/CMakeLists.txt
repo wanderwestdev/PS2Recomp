@@ -10,6 +10,29 @@ if(BUILD_TESTING)
     add_subdirectory(gs_cache)
 endif()
 
+add_library(ps2_gs_reference STATIC
+    gs_reference/gs_reference_backend.cpp
+    gs_reference/gs_golden.cpp
+)
+
+target_include_directories(ps2_gs_reference PUBLIC
+    ${CMAKE_CURRENT_LIST_DIR}/gs_reference
+    ${CMAKE_CURRENT_LIST_DIR}/../ps2xRuntime/include
+)
+
+target_link_libraries(ps2_gs_reference PUBLIC ps2_runtime)
+
+if(MSVC)
+    set_source_files_properties(gs_reference/gs_reference_backend.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+endif()
+
+add_executable(gs_replay tools/gs_replay.cpp)
+target_link_libraries(gs_replay PRIVATE ps2_gs_reference)
+if(MSVC)
+    target_compile_options(gs_replay PRIVATE /Zi)
+    target_link_options(gs_replay PRIVATE /DEBUG)
+endif()
+
 # Static library with test logic (no main), used by ps2xStudio
 add_library(ps2_test_function_table OBJECT
     src/test_function_table.cpp
@@ -37,6 +60,7 @@ add_library(ps2_test_lib STATIC
     src/ps2_sif_dma_tests.cpp
     src/ps2_recompiler_tests.cpp
     src/ps2_runtime_expansion_tests.cpp
+    src/gs_golden_tests.cpp
 )
 
 target_include_directories(ps2_test_lib PRIVATE
@@ -48,6 +72,7 @@ target_include_directories(ps2_test_lib PRIVATE
 )
 
 target_link_libraries(ps2_test_lib PRIVATE
+    ps2_gs_reference
     ps2_recomp_lib
     ps2_analyzer_lib
     ps2_runtime
@@ -102,4 +127,6 @@ include("${CMAKE_CURRENT_LIST_DIR}/../ps2xRuntime/cmake/ReleaseMode.cmake")
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_test_lib)
     EnableFastReleaseMode(ps2x_tests)
+    EnableFastReleaseMode(ps2_gs_reference)
+    EnableFastReleaseMode(gs_replay)
 endif()

@@ -1,4 +1,6 @@
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_band_pool.h"
+#include "gs_cpu_backend_internal.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -22,287 +24,14 @@ namespace GSMem
     u32 BlockByteAddress32(bool depth, u32 bp, u32 bw, u32 x, u32 y);
 }
 
+using namespace GSCpuInternal;
+
 namespace
 {
-    float fabsQ(float q)
-    {
-        return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
-    }
-
-    u16 Rgba8888ToRgba5551(u32 c)
-    {
-        uint32_t r = ((c >> 0) & 0xFF) >> 3;
-        uint32_t g = ((c >> 8) & 0xFF) >> 3;
-        uint32_t b = ((c >> 16) & 0xFF) >> 3;
-        uint32_t a = ((c >> 24) & 0xFF) >> 7;
-
-        return (r | (g << 5) | (b << 10) | (a << 15));
-    }
-
-    u32 Rgba5551ToRgba8888(u16 c)
-    {
-        u32 r = ((c >> 0) & 0x1F) << 3;
-        u32 g = ((c >> 5) & 0x1F) << 3;
-        u32 b = ((c >> 10) & 0x1F) << 3;
-        u32 a = ((c >> 15) & 0x01) << 7;
-
-        return (r | (g << 8) | (b << 16) | (a << 24));
-    }
-
-    u32 pack32(u8 r, u8 g, u8 b, u8 a)
-    {
-        return static_cast<u32>(r) | (g << 8) | (b << 16) | (a << 24);
-    }
-
-    uint32_t applyTexa(const GSTexaReg &texa, uint8_t psm, uint32_t texel)
-    {
-        if (psm == GS_PSM_CT32)
-            return texel;
-
-        const uint8_t r = static_cast<uint8_t>(texel & 0xFFu);
-        const uint8_t g = static_cast<uint8_t>((texel >> 8) & 0xFFu);
-        const uint8_t b = static_cast<uint8_t>((texel >> 16) & 0xFFu);
-        const bool rgbZero = r == 0u && g == 0u && b == 0u;
-        uint8_t a = static_cast<uint8_t>((texel >> 24) & 0xFFu);
-
-        switch (psm)
-        {
-        case GS_PSM_CT24:
-            a = (texa.aem && rgbZero) ? 0u : texa.ta0;
-            break;
-        case GS_PSM_CT16:
-        case GS_PSM_CT16S:
-            if ((a & 0x80u) != 0u)
-                a = texa.ta1;
-            else
-                a = (texa.aem && rgbZero) ? 0u : texa.ta0;
-            break;
-        default:
-            break;
-        }
-
-        return (texel & 0x00FFFFFFu) | (static_cast<uint32_t>(a) << 24);
-    }
-
-    uint32_t addrPSMCT16Family(uint32_t basePtr, uint32_t width, uint8_t psm, uint32_t x, uint32_t y)
-    {
-        switch (psm)
-        {
-        case GS_PSM_CT16:
-            return GSPSMCT16::addrPSMCT16(basePtr, width, x, y);
-        case GS_PSM_CT16S:
-            return GSPSMCT16::addrPSMCT16S(basePtr, width, x, y);
-        case GS_PSM_Z16:
-            return GSPSMCT16::addrPSMZ16(basePtr, width, x, y);
-        case GS_PSM_Z16S:
-            return GSPSMCT16::addrPSMZ16S(basePtr, width, x, y);
-        default:
-            return 0u;
-        }
-    }
-
     std::atomic<uint32_t> s_debugPrimitiveCount{0};
     std::atomic<uint32_t> s_debugPixelCount{0};
     std::atomic<uint32_t> s_debugContext1PrimitiveCount{0};
     std::atomic<uint32_t> s_debugFbp150PixelCount{0};
-
-    int wrapTextureCoordinate(int coordinate,
-                              int textureSize,
-                              uint8_t mode,
-                              uint16_t regionMin,
-                              uint16_t regionMax)
-    {
-        switch (mode & 0x3u)
-        {
-        case 0: // REPEAT
-            return static_cast<int>(static_cast<uint32_t>(coordinate) & static_cast<uint32_t>(textureSize - 1));
-        case 1: // CLAMP
-            return clampInt(coordinate, 0, textureSize - 1);
-        case 2: // REGION_CLAMP
-            return std::min(std::max(coordinate, static_cast<int>(regionMin)), static_cast<int>(regionMax));
-        case 3: // REGION_REPEAT
-            return static_cast<int>((static_cast<uint32_t>(coordinate) & static_cast<uint32_t>(regionMin)) | static_cast<uint32_t>(regionMax));
-        default:
-            return coordinate;
-        }
-    }
-
-    bool passesAlphaTest(uint64_t testReg, uint8_t alpha)
-    {
-        if ((testReg & 0x1u) == 0u)
-            return true;
-
-        const uint8_t atst = static_cast<uint8_t>((testReg >> 1) & 0x7u);
-        const uint8_t aref = static_cast<uint8_t>((testReg >> 4) & 0xFFu);
-
-        switch (atst)
-        {
-        case 0:
-            return false;
-        case 1:
-            return true;
-        case 2:
-            return alpha < aref;
-        case 3:
-            return alpha <= aref;
-        case 4:
-            return alpha == aref;
-        case 5:
-            return alpha >= aref;
-        case 6:
-            return alpha > aref;
-        case 7:
-            return alpha != aref;
-        default:
-            return true;
-        }
-    }
-
-    struct PixelWriteMask
-    {
-        bool writeRgb = true;
-        bool writeAlpha = true;
-        bool writeDepth = true;
-
-        bool writesFramebuffer() const
-        {
-            return writeRgb || writeAlpha;
-        }
-
-        bool writesAnything() const
-        {
-            return writesFramebuffer() || writeDepth;
-        }
-    };
-
-    PixelWriteMask classifyAlphaTest(uint64_t testReg, uint8_t alpha, uint8_t framePsm)
-    {
-        const bool pass = passesAlphaTest(testReg, alpha);
-        if (pass)
-            return {};
-
-        // TEST.AFAIL controls what happens when the alpha comparison fails.
-        switch (static_cast<uint8_t>((testReg >> 12) & 0x3u))
-        {
-        case 1: // FB_ONLY
-            return {true, true, false};
-        case 2: // ZB_ONLY
-            return {false, false, true};
-        case 3: // RGB_ONLY
-            // RGB_ONLY is only distinct for RGBA32. The GS treats it as
-            // FB_ONLY for RGB24 and RGBA16 framebuffers.
-            if (framePsm == GS_PSM_CT32)
-                return {true, false, false};
-            return {true, true, false};
-        case 0: // KEEP
-        default:
-            return {false, false, false};
-        }
-    }
-
-    bool passesDestinationAlphaTest(uint64_t testReg, uint8_t framePsm, uint32_t rawFramebufferPixel)
-    {
-        const bool date = ((testReg >> 14) & 0x1u) != 0u;
-        if (!date)
-            return true;
-
-        const bool datm = ((testReg >> 15) & 0x1u) != 0u;
-        switch (framePsm)
-        {
-        case GS_PSM_CT32:
-            return (((rawFramebufferPixel >> 31) & 0x1u) != 0u) == datm;
-        case GS_PSM_CT16:
-        case GS_PSM_CT16S:
-            return (((rawFramebufferPixel >> 15) & 0x1u) != 0u) == datm;
-        case GS_PSM_CT24:
-            // RGB24 has no destination alpha, so DATE always passes.
-            return true;
-        default:
-            return true;
-        }
-    }
-
-    struct TextureCombineResult
-    {
-        uint8_t r;
-        uint8_t g;
-        uint8_t b;
-        uint8_t a;
-    };
-
-    TextureCombineResult combineTexture(const GSTex0Reg &tex,
-                                        uint8_t vr,
-                                        uint8_t vg,
-                                        uint8_t vb,
-                                        uint8_t va,
-                                        uint8_t tr,
-                                        uint8_t tg,
-                                        uint8_t tb,
-                                        uint8_t ta)
-    {
-        const bool textureHasAlpha = tex.tcc != 0u;
-        TextureCombineResult out{tr, tg, tb, textureHasAlpha ? ta : va};
-
-        switch (tex.tfx)
-        {
-        case 0: // MODULATE
-            out.r = clampU8((tr * vr) >> 7);
-            out.g = clampU8((tg * vg) >> 7);
-            out.b = clampU8((tb * vb) >> 7);
-            out.a = textureHasAlpha ? clampU8((ta * va) >> 7) : va;
-            break;
-        case 1: // DECAL
-            out.r = tr;
-            out.g = tg;
-            out.b = tb;
-            out.a = textureHasAlpha ? ta : va;
-            break;
-        case 2: // HIGHLIGHT
-            out.r = clampU8(((tr * vr) >> 7) + va);
-            out.g = clampU8(((tg * vg) >> 7) + va);
-            out.b = clampU8(((tb * vb) >> 7) + va);
-            out.a = textureHasAlpha ? clampU8(ta + va) : va;
-            break;
-        case 3: // HIGHLIGHT2
-            out.r = clampU8(((tr * vr) >> 7) + va);
-            out.g = clampU8(((tg * vg) >> 7) + va);
-            out.b = clampU8(((tb * vb) >> 7) + va);
-            out.a = textureHasAlpha ? ta : va;
-            break;
-        default:
-            out.r = tr;
-            out.g = tg;
-            out.b = tb;
-            out.a = textureHasAlpha ? ta : va;
-            break;
-        }
-
-        return out;
-    }
-
-    uint32_t swizzleClutIndexCSM1(uint32_t index)
-    {
-        // CSM1 swaps address bits 3 and 4. Preserve the remaining bits:
-        // 16-bit CLUTs expose a ninth address bit through CSA[4].
-        return (index & ~0x18u) | ((index & 0x08u) << 1u) | ((index & 0x10u) >> 1u);
-    }
-
-    bool isFourBitIndexedPsm(uint8_t psm)
-    {
-        return psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
-    }
-
-    bool isEightBitIndexedPsm(uint8_t psm)
-    {
-        return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
-    }
-
-    uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
-    {
-        const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
-        const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
-    }
 }
 
 namespace
@@ -390,74 +119,11 @@ namespace
 
 GSCpuBackend::GSCpuBackend()
 {
-    using namespace GSMem;
-    static std::once_flag lookupTablesOnce;
-    std::call_once(lookupTablesOnce, []()
-                   { InitLookupTables(); });
-    for (size_t i = 0; i < kPsmHandlerCount; ++i)
-    {
-        switch (i)
-        {
-        case GS_PSM_CT32:
-            m_readVramFuncs[i] = ReadCT32;
-            m_writeVramFuncs[i] = WriteCT32;
-            break;
-        case GS_PSM_CT24:
-            m_readVramFuncs[i] = ReadCT24;
-            m_writeVramFuncs[i] = WriteCT24;
-            break;
-        case GS_PSM_CT16:
-            m_readVramFuncs[i] = ReadCT16;
-            m_writeVramFuncs[i] = WriteCT16;
-            break;
-        case GS_PSM_CT16S:
-            m_readVramFuncs[i] = ReadCT16S;
-            m_writeVramFuncs[i] = WriteCT16S;
-            break;
-        case GS_PSM_T8:
-            m_readVramFuncs[i] = ReadP8;
-            m_writeVramFuncs[i] = WriteP8;
-            break;
-        case GS_PSM_T8H:
-            m_readVramFuncs[i] = ReadP8H;
-            m_writeVramFuncs[i] = WriteP8H;
-            break;
-        case GS_PSM_T4:
-            m_readVramFuncs[i] = ReadP4;
-            m_writeVramFuncs[i] = WriteP4;
-            break;
-        case GS_PSM_T4HH:
-            m_readVramFuncs[i] = ReadP4HH;
-            m_writeVramFuncs[i] = WriteP4HH;
-            break;
-        case GS_PSM_T4HL:
-            m_readVramFuncs[i] = ReadP4HL;
-            m_writeVramFuncs[i] = WriteP4HL;
-            break;
-        case GS_PSM_Z32:
-            m_readVramFuncs[i] = ReadZ32;
-            m_writeVramFuncs[i] = WriteZ32;
-            break;
-        case GS_PSM_Z24:
-            m_readVramFuncs[i] = ReadZ24;
-            m_writeVramFuncs[i] = WriteZ24;
-            break;
-        case GS_PSM_Z16:
-            m_readVramFuncs[i] = ReadZ16;
-            m_writeVramFuncs[i] = WriteZ16;
-            break;
-        case GS_PSM_Z16S:
-            m_readVramFuncs[i] = ReadZ16S;
-            m_writeVramFuncs[i] = WriteZ16S;
-            break;
-        default:
-            m_readVramFuncs[i] = ReadNull;
-            m_writeVramFuncs[i] = WriteNull;
-            break;
-        }
-    }
+    GSSwizzle::GetFormat(0u);
     Reset();
 }
+
+GSCpuBackend::~GSCpuBackend() = default;
 
 void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 {
@@ -479,8 +145,9 @@ void GSCpuBackend::Reset()
 void GSCpuBackend::ResetUnlocked()
 {
     m_clut.fill(0u);
+    ++m_clutVersion;
     m_clutCbp.fill(0u);
-    m_texturePageCache.Invalidate();
+    m_textureCache.Invalidate();
     m_transfer = {};
     m_transfer.direction = 3u;
     m_transferState = {};
@@ -542,6 +209,7 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
     if (!sixteenBit && !thirtyTwoBit)
         return;
 
+    ++m_clutVersion;
     const uint32_t entryCount = fourBit ? 16u : 256u;
     const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
     const uint32_t destinationBase = (static_cast<uint32_t>(tex0.csa) & csaMask) << 4u;
@@ -590,7 +258,7 @@ void GSCpuBackend::Flush()
 void GSCpuBackend::TextureFlush()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    m_texturePageCache.Invalidate();
+    m_textureCache.Invalidate();
 }
 
 void GSCpuBackend::Sync(GSSyncReason)
@@ -608,15 +276,22 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
 {
     if (!m_vram)
         return 0u;
-    return m_readVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y);
+    const GSSwizzle::Format &format = GSSwizzle::GetFormat(psm);
+    if (format.kind == GSSwizzle::Kind::Invalid)
+        return 0u;
+    const GSSwizzle::Location loc = GSSwizzle::Locate(format, base, bw, x, y);
+    return GSSwizzle::LoadAt(format, m_vram + loc.byte, loc.shift);
 }
 
 uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
 {
     if (!m_vram)
         return 0u;
-
-    return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
+    const GSSwizzle::Format &format = GSSwizzle::GetFormat(psm);
+    if (format.kind == GSSwizzle::Kind::Invalid)
+        return 0u;
+    const GSSwizzle::Location loc = GSSwizzle::Locate(format, base, bw, x, y);
+    return GSSwizzle::LoadAt(format, m_textureCache.Resolve(m_vram, loc.byte), loc.shift);
 }
 
 void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
@@ -629,7 +304,12 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
 {
     if (!m_vram)
         return;
-    m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
+    const GSSwizzle::Format &format = GSSwizzle::GetFormat(psm);
+    if (format.kind == GSSwizzle::Kind::Invalid)
+        return;
+    const GSSwizzle::Location loc = GSSwizzle::Locate(format, base, bw, x, y);
+    m_textureCache.BeforeWrite(m_vram, loc.byte);
+    GSSwizzle::StoreAt(format, m_vram + loc.byte, loc.shift, value);
 }
 
 void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
@@ -652,6 +332,33 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
                                          ? m_localToHostBuffer.size() - m_localToHostReadPos
                                          : 0u;
     return result;
+}
+
+bool GSCpuBackend::ExportState(GSBackendState &out)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    out.clut = m_clut;
+    out.clutCbp = m_clutCbp;
+    m_textureCache.Export(m_vram, out.cachePageBase, out.cacheBytes.data());
+    out.transfer = m_transfer;
+    out.transferState = m_transferState;
+    out.localToHost = m_localToHostBuffer;
+    out.localToHostReadPos = m_localToHostReadPos;
+    return true;
+}
+
+bool GSCpuBackend::ImportState(const GSBackendState &state)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_clut = state.clut;
+    ++m_clutVersion;
+    m_clutCbp = state.clutCbp;
+    m_textureCache.Import(state.cachePageBase, state.cacheBytes.data());
+    m_transfer = state.transfer;
+    m_transferState = state.transferState;
+    m_localToHostBuffer = state.localToHost;
+    m_localToHostReadPos = static_cast<size_t>(state.localToHostReadPos);
+    return true;
 }
 
 void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
@@ -767,12 +474,14 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     switch (state.prim.type)
     {
     case GS_PRIM_SPRITE:
-        DrawSprite(batch);
+        if (!DrawSpriteFast(batch))
+            DrawSprite(batch);
         break;
     case GS_PRIM_TRIANGLE:
     case GS_PRIM_TRISTRIP:
     case GS_PRIM_TRIFAN:
-        DrawTriangle(batch);
+        if (!DrawTriangleFast(batch))
+            DrawTriangle(batch);
         break;
     case GS_PRIM_LINE:
     case GS_PRIM_LINESTRIP:
@@ -1247,7 +956,9 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
                     {
                         if (bx >= drawX0 && by >= drawY0 && bx + 7 <= drawX1 && by + 7 <= drawY1)
                         {
-                            uint32_t *block = reinterpret_cast<uint32_t *>(m_vram + GSMem::BlockByteAddress32(isDepth, base, fbw, static_cast<u32>(bx), static_cast<u32>(by)));
+                            const u32 blockAddress = GSMem::BlockByteAddress32(isDepth, base, fbw, static_cast<u32>(bx), static_cast<u32>(by));
+                            m_textureCache.BeforeWrite(m_vram, blockAddress);
+                            uint32_t *block = reinterpret_cast<uint32_t *>(m_vram + blockAddress);
                             std::fill(block, block + 64, value);
                             continue;
                         }
