@@ -111,6 +111,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
+    m_gsInterruptLatched = 0u;
     m_eeCycle = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
@@ -394,7 +395,7 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     m_eeCycle += elapsed;
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
     m_runtime.advanceIopEeCycles(elapsed);
-    if (m_pendingEeTimerInterrupts != 0u)
+    if (m_pendingEeTimerInterrupts != 0u || pendingGsInterruptEvents() != m_gsInterruptLatched)
     {
         m_checkpointPending.store(true, std::memory_order_release);
     }
@@ -1287,6 +1288,24 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
 }
 
+uint32_t EeScheduler::pendingGsInterruptEvents() const noexcept
+{
+    const GSRegisters &gs = m_runtime.memory().gs();
+    const uint64_t csr = gs.csr.load(std::memory_order_acquire);
+    return static_cast<uint32_t>(csr & ~(gs.imr >> 8u) & 0x1Fu);
+}
+
+void EeScheduler::dispatchGsInterrupt()
+{
+    const uint32_t pending = pendingGsInterruptEvents();
+    const uint32_t raised = pending & ~m_gsInterruptLatched;
+    m_gsInterruptLatched = pending;
+    if (raised != 0u)
+    {
+        dispatchIrq(false, 0u);
+    }
+}
+
 void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
 {
     assertExecutor();
@@ -1774,6 +1793,7 @@ void EeScheduler::processPendingEvents()
             dispatchIrq(false, 9u + timer);
         }
     }
+    dispatchGsInterrupt();
     std::deque<EeEvent> pending;
     {
         std::lock_guard lock(m_eventMutex);
@@ -1890,6 +1910,7 @@ void EeScheduler::processEvent(const EeEvent &event)
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+        m_runtime.memory().gs().csr.fetch_or(0x8ull, std::memory_order_acq_rel);
         if ((m_vsyncTick & 1u) != 0u)
         {
             m_runtime.memory().gs().csr.fetch_or(0x2000ull, std::memory_order_acq_rel);

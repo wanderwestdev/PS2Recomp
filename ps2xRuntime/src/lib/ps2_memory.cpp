@@ -100,14 +100,14 @@ namespace
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
-    // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
-    // write-one-to-clear; everything else is a plain merge. Uses compare_exchange
+    // dword) of the GS CSR register. Bits 0..4 of the low dword (SIGNAL/FINISH/
+    // HSINT/VSINT/EDWINT) are write-one-to-clear; everything else is a plain merge. Uses compare_exchange
     // so the whole read-modify-write is a single atomic step -- this register is
     // also touched by the vsync worker (FIELD bit) and the GIF (SIGNAL/FINISH) on
     // other threads, so a load-then-store here would race with them.
     inline void writeCsrHalf(std::atomic<uint64_t> &csr, uint32_t off, uint32_t value)
     {
-        constexpr uint32_t kW1cMask = 0x3u;
+        constexpr uint32_t kW1cMask = 0x1Fu;
         uint64_t expected = csr.load();
         uint64_t desired;
         do
@@ -127,11 +127,11 @@ namespace
         } while (!csr.compare_exchange_weak(expected, desired));
     }
 
-    // Same as writeCsrHalf but for a full 64-bit CSR write (bits 0..1 are still
+    // Same as writeCsrHalf but for a full 64-bit CSR write (bits 0..4 are still
     // write-one-to-clear against the current value).
     inline void writeCsrFull(std::atomic<uint64_t> &csr, uint64_t value)
     {
-        constexpr uint64_t kW1cMask = 0x3ull;
+        constexpr uint64_t kW1cMask = 0x1Full;
         uint64_t expected = csr.load();
         uint64_t desired;
         do

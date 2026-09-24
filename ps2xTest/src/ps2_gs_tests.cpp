@@ -422,17 +422,23 @@ void register_ps2_gs_tests()
             constexpr uint32_t kGsCsr = 0x12001000u;
             constexpr uint32_t kGsImr = 0x12001010u;
 
-            const uint64_t csrPattern = 0xA1B2C3D4E5F60718ull;
+            const uint64_t csrPattern = 0xA1B2C3D4E5F60700ull;
             mem.write64(kGsCsr, csrPattern);
             t.Equals(mem.read64(kGsCsr), csrPattern, "64-bit CSR read should match prior 64-bit write");
             t.Equals(mem.read32(kGsCsr), static_cast<uint32_t>(csrPattern & 0xFFFFFFFFull), "CSR low dword read should match");
             t.Equals(mem.read32(kGsCsr + 4u), static_cast<uint32_t>(csrPattern >> 32), "CSR high dword read should match");
 
-            mem.write32(kGsCsr, 0x11223344u);
-            t.Equals(mem.read64(kGsCsr), 0xA1B2C3D411223344ull, "32-bit low write should preserve CSR high dword");
+            mem.write32(kGsCsr, 0x11223340u);
+            t.Equals(mem.read64(kGsCsr), 0xA1B2C3D411223340ull, "32-bit low write should preserve CSR high dword");
 
             mem.write32(kGsCsr + 4u, 0x55667788u);
-            t.Equals(mem.read64(kGsCsr), 0x5566778811223344ull, "32-bit high write should preserve CSR low dword");
+            t.Equals(mem.read64(kGsCsr), 0x5566778811223340ull, "32-bit high write should preserve CSR low dword");
+
+            mem.gs().csr.fetch_or(0x1Full);
+            mem.write32(kGsCsr, 0x0000000Cu);
+            t.Equals(mem.read32(kGsCsr) & 0x1Fu, 0x13u, "writing 1 to HSINT/VSINT should clear only those event bits");
+            mem.write64(kGsCsr, 0x13ull);
+            t.Equals(mem.read32(kGsCsr) & 0x1Fu, 0u, "writing 1 to SIGNAL/FINISH/EDWINT should clear them");
 
             const uint64_t imrPattern = 0x0123456789ABCDEFull;
             mem.write64(kGsImr, imrPattern);
@@ -1172,7 +1178,7 @@ void register_ps2_gs_tests()
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GSRegisters regs{};
-            regs.pmode = 1ull;
+            regs.pmode = 0xFF21ull;
             regs.dispfb1 =
                 150ull |
                 (10ull << 9) |
@@ -1184,69 +1190,7 @@ void register_ps2_gs_tests()
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
 
-            constexpr uint32_t kDisplayPixel = 0x00332211u;
-            constexpr uint32_t kSourcePixel = 0x00665544u;
-            constexpr uint32_t kUpdatedSourcePixel = 0x00998877u;
-            writeReferenceFramePSMCT32Pixel(vram, 150u, 10u, 0u, 0u, kDisplayPixel);
-            std::memcpy(vram.data() + 0u, &kSourcePixel, sizeof(kSourcePixel));
-
-            constexpr uint64_t kFrame2 =
-                150ull |
-                (10ull << 16) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
-            constexpr uint64_t kZbuf2 = (1ull << 32);
-            constexpr uint64_t kScissor2 =
-                (0ull << 0) |
-                (639ull << 16) |
-                (0ull << 32) |
-                (479ull << 48);
-            constexpr uint64_t kXYOffset2 =
-                (static_cast<uint64_t>(1728u << 4) << 0) |
-                (static_cast<uint64_t>(1808u << 4) << 32);
-            constexpr uint64_t kAlpha2 = 0x6000000064ull;
-            constexpr uint64_t kTest2 = 0x30000ull;
-            constexpr uint64_t kTex0_2 =
-                (0ull << 0) |
-                (10ull << 14) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
-                (10ull << 26) |
-                (9ull << 30) |
-                (1ull << 34);
-            constexpr uint64_t kPrimCopy =
-                static_cast<uint64_t>(GS_PRIM_SPRITE) |
-                (1ull << 4) |
-                (1ull << 6) |
-                (1ull << 8) |
-                (1ull << 9);
-            constexpr uint64_t kXyz0 =
-                (static_cast<uint64_t>(1728u << 4) << 0) |
-                (static_cast<uint64_t>(1808u << 4) << 16) |
-                (256ull << 32);
-            constexpr uint64_t kXyz1 =
-                (static_cast<uint64_t>(2368u << 4) << 0) |
-                (static_cast<uint64_t>(2288u << 4) << 16) |
-                (256ull << 32);
-            constexpr uint64_t kUv0 =
-                (8ull << 0) |
-                (8ull << 16);
-            constexpr uint64_t kUv1 =
-                ((8ull + (640ull * 16ull)) << 0) |
-                ((8ull + (480ull * 16ull)) << 16);
-
-            gs.writeRegister(GS_REG_FRAME_2, kFrame2);
-            gs.writeRegister(GS_REG_ZBUF_2, kZbuf2);
-            gs.writeRegister(GS_REG_SCISSOR_2, kScissor2);
-            gs.writeRegister(GS_REG_XYOFFSET_2, kXYOffset2);
-            gs.writeRegister(GS_REG_ALPHA_2, kAlpha2);
-            gs.writeRegister(GS_REG_TEST_2, kTest2);
-            gs.writeRegister(GS_REG_TEX0_2, kTex0_2);
-            gs.writeRegister(GS_REG_PRIM, kPrimCopy);
-            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
-            gs.writeRegister(GS_REG_UV, kUv0);
-            gs.writeRegister(GS_REG_XYZ2, kXyz0);
-            gs.writeRegister(GS_REG_UV, kUv1);
-            gs.writeRegister(GS_REG_XYZ2, kXyz1);
-
+            writeReferenceFramePSMCT32Pixel(vram, 150u, 10u, 0u, 0u, 0x80665544u);
             gs.latchHostPresentationFrame();
 
             std::vector<uint8_t> latchedFrame;
@@ -1254,7 +1198,7 @@ void register_ps2_gs_tests()
             uint32_t latchedHeight = 0u;
             uint32_t displayFbp = 0u;
             uint32_t sourceFbp = 0u;
-            bool usedPreferred = false;
+            bool usedPreferred = true;
             t.IsTrue(gs.copyLatchedHostPresentationFrame(latchedFrame,
                                                          latchedWidth,
                                                          latchedHeight,
@@ -1262,26 +1206,17 @@ void register_ps2_gs_tests()
                                                          &sourceFbp,
                                                          &usedPreferred),
                      "host presentation latch should produce a readable frame");
-            t.Equals(displayFbp, 150u,
-                     "latched host presentation should remember the selected display page");
-            t.Equals(sourceFbp, 0u,
-                     "latched host presentation should switch to the fullscreen copy source");
-            t.IsTrue(usedPreferred,
-                     "latched host presentation should record when it used the preferred copy source");
-            t.Equals(latchedWidth, 640u,
-                     "latched host presentation should preserve display width");
-            t.Equals(latchedHeight, 448u,
-                     "latched host presentation should preserve display height");
-            t.Equals(static_cast<uint32_t>(latchedFrame[0]), 0x44u,
-                     "latched host presentation should expose the source frame RGB data");
-            t.Equals(static_cast<uint32_t>(latchedFrame[1]), 0x55u,
-                     "latched host presentation should preserve the source frame green channel");
-            t.Equals(static_cast<uint32_t>(latchedFrame[2]), 0x66u,
-                     "latched host presentation should preserve the source frame blue channel");
-            t.Equals(static_cast<uint32_t>(latchedFrame[3]), 0xFFu,
-                     "latched host presentation should normalize framebuffer alpha for host upload");
+            t.Equals(displayFbp, 150u, "latched host presentation should report the DISPFB page");
+            t.Equals(sourceFbp, 150u, "latched host presentation should read the DISPFB page");
+            t.IsFalse(usedPreferred, "latched host presentation should never substitute another buffer");
+            t.Equals(latchedWidth, 640u, "latched host presentation should preserve display width");
+            t.Equals(latchedHeight, 448u, "latched host presentation should preserve display height");
+            t.Equals(static_cast<uint32_t>(latchedFrame[0]), 0x44u, "latched host presentation should expose the red channel");
+            t.Equals(static_cast<uint32_t>(latchedFrame[1]), 0x55u, "latched host presentation should expose the green channel");
+            t.Equals(static_cast<uint32_t>(latchedFrame[2]), 0x66u, "latched host presentation should expose the blue channel");
+            t.Equals(static_cast<uint32_t>(latchedFrame[3]), 0xFFu, "latched host presentation should upload an opaque alpha");
 
-            std::memcpy(vram.data() + 0u, &kUpdatedSourcePixel, sizeof(kUpdatedSourcePixel));
+            writeReferenceFramePSMCT32Pixel(vram, 150u, 10u, 0u, 0u, 0x80998877u);
 
             std::vector<uint8_t> staleFrame;
             uint32_t staleWidth = 0u;
@@ -1299,7 +1234,7 @@ void register_ps2_gs_tests()
             t.IsTrue(gs.copyLatchedHostPresentationFrame(refreshedFrame, refreshedWidth, refreshedHeight),
                      "latched host presentation should refresh after a new latch");
             t.Equals(static_cast<uint32_t>(refreshedFrame[0]), 0x77u,
-                     "relatching should pick up the updated source frame contents");
+                     "relatching should pick up the updated display contents");
         });
 
         tc.Run("latched host presentation frame is returned tightly packed for narrower display widths", [](TestCase &t)
@@ -1356,124 +1291,11 @@ void register_ps2_gs_tests()
                      "latched host presentation should preserve subsequent rows without the internal 640-pixel stride");
         });
 
-        tc.Run("latched host presentation reads preferred CT32 source with GS swizzle", [](TestCase &t)
-        {
-            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
-            GSRegisters regs{};
-            regs.pmode = 1ull;
-            regs.dispfb1 =
-                150ull |
-                (10ull << 9) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 15);
-            regs.display1 =
-                (639ull << 32) |
-                (447ull << 44);
-
-            GS gs;
-            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
-
-            constexpr uint32_t kSourceTbp0 = 64u;
-            constexpr uint32_t kSourcePixelRow1 = 0x00665544u;
-            constexpr uint32_t kDisplayPixelRow1 = 0x00CCBBAAu;
-            const uint32_t swizzledSourceOff = GSPSMCT32::addrPSMCT32(kSourceTbp0, 10u, 0u, 1u);
-            std::memcpy(vram.data() + swizzledSourceOff, &kSourcePixelRow1, sizeof(kSourcePixelRow1));
-            writeReferenceFramePSMCT32Pixel(vram, 150u, 10u, 0u, 1u, kDisplayPixelRow1);
-
-            constexpr uint64_t kFrame2 =
-                150ull |
-                (10ull << 16) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
-            constexpr uint64_t kZbuf2 = (static_cast<uint64_t>(1) << 32);
-            constexpr uint64_t kScissor2 =
-                (0ull << 0) |
-                (639ull << 16) |
-                (0ull << 32) |
-                (479ull << 48);
-            constexpr uint64_t kXYOffset2 =
-                (static_cast<uint64_t>(1728u << 4) << 0) |
-                (static_cast<uint64_t>(1808u << 4) << 32);
-            constexpr uint64_t kAlpha2 = 0x6000000064ull;
-            constexpr uint64_t kTest2 = 0x30000ull;
-            constexpr uint64_t kTex0_2 =
-                (static_cast<uint64_t>(kSourceTbp0) << 0) |
-                (10ull << 14) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
-                (10ull << 26) |
-                (9ull << 30) |
-                (1ull << 34);
-            constexpr uint64_t kPrimCopy =
-                static_cast<uint64_t>(GS_PRIM_SPRITE) |
-                (1ull << 4) |
-                (1ull << 6) |
-                (1ull << 8) |
-                (1ull << 9);
-            constexpr uint64_t kXyz0 =
-                (static_cast<uint64_t>(1728u << 4) << 0) |
-                (static_cast<uint64_t>(1808u << 4) << 16) |
-                (256ull << 32);
-            constexpr uint64_t kXyz1 =
-                (static_cast<uint64_t>(2368u << 4) << 0) |
-                (static_cast<uint64_t>(2288u << 4) << 16) |
-                (256ull << 32);
-            constexpr uint64_t kUv0 =
-                (8ull << 0) |
-                (8ull << 16);
-            constexpr uint64_t kUv1 =
-                ((8ull + (640ull * 16ull)) << 0) |
-                ((8ull + (480ull * 16ull)) << 16);
-
-            gs.writeRegister(GS_REG_FRAME_2, kFrame2);
-            gs.writeRegister(GS_REG_ZBUF_2, kZbuf2);
-            gs.writeRegister(GS_REG_SCISSOR_2, kScissor2);
-            gs.writeRegister(GS_REG_XYOFFSET_2, kXYOffset2);
-            gs.writeRegister(GS_REG_ALPHA_2, kAlpha2);
-            gs.writeRegister(GS_REG_TEST_2, kTest2);
-            gs.writeRegister(GS_REG_TEX0_2, kTex0_2);
-            gs.writeRegister(GS_REG_PRIM, kPrimCopy);
-            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
-            gs.writeRegister(GS_REG_UV, kUv0);
-            gs.writeRegister(GS_REG_XYZ2, kXyz0);
-            gs.writeRegister(GS_REG_UV, kUv1);
-            gs.writeRegister(GS_REG_XYZ2, kXyz1);
-
-            gs.latchHostPresentationFrame();
-
-            std::vector<uint8_t> latchedFrame;
-            uint32_t latchedWidth = 0u;
-            uint32_t latchedHeight = 0u;
-            uint32_t displayFbp = 0u;
-            uint32_t sourceFbp = 0u;
-            bool usedPreferred = false;
-            t.IsTrue(gs.copyLatchedHostPresentationFrame(latchedFrame,
-                                                         latchedWidth,
-                                                         latchedHeight,
-                                                         &displayFbp,
-                                                         &sourceFbp,
-                                                         &usedPreferred),
-                     "preferred-source presentation should produce a host frame");
-            t.IsTrue(usedPreferred,
-                     "preferred-source presentation should use the fullscreen copy source");
-            t.Equals(displayFbp, 150u,
-                     "preferred-source presentation should still target the display page");
-            t.Equals(sourceFbp, kSourceTbp0,
-                     "preferred-source presentation should report the CT32 source frame");
-
-            const size_t row1Off = 640u * 4u;
-            t.Equals(static_cast<uint32_t>(latchedFrame[row1Off + 0u]), 0x44u,
-                     "preferred-source presentation should read row 1 red from the swizzled CT32 source");
-            t.Equals(static_cast<uint32_t>(latchedFrame[row1Off + 1u]), 0x55u,
-                     "preferred-source presentation should read row 1 green from the swizzled CT32 source");
-            t.Equals(static_cast<uint32_t>(latchedFrame[row1Off + 2u]), 0x66u,
-                     "preferred-source presentation should read row 1 blue from the swizzled CT32 source");
-            t.Equals(static_cast<uint32_t>(latchedFrame[row1Off + 3u]), 0xFFu,
-                     "preferred-source presentation should normalize row 1 alpha for the host frame");
-        });
-
         tc.Run("latched host presentation reads direct CT32 display frames with GS swizzle", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GSRegisters regs{};
-            regs.pmode = 0x0001ull;
+            regs.pmode = 0xFF21ull;
             regs.dispfb1 =
                 150ull |
                 (10ull << 9) |
@@ -1599,7 +1421,7 @@ void register_ps2_gs_tests()
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GSRegisters regs{};
-            regs.pmode = 0x0001ull;
+            regs.pmode = 0xFF21ull;
             regs.dispfb1 =
                 150ull |
                 (10ull << 9) |
@@ -1639,7 +1461,7 @@ void register_ps2_gs_tests()
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GSRegisters regs{};
-            regs.pmode = 0x0001ull;
+            regs.pmode = 0xFF21ull;
             regs.dispfb1 =
                 150ull |
                 (10ull << 9) |
@@ -1681,12 +1503,43 @@ void register_ps2_gs_tests()
                      "single-circuit presentation should normalize the last row alpha");
         });
 
-        tc.Run("latched host presentation line-doubles interlaced field output", [](TestCase &t)
+        tc.Run("latched host presentation shows a black display page without substituting other buffers", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GSRegisters regs{};
-            regs.pmode = 0x0001ull;
-            regs.smode2 = 0x0001ull; // interlaced, field mode
+            regs.pmode = 0xFF21ull;
+            regs.dispfb1 =
+                0ull |
+                (10ull << 9) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+            regs.display1 =
+                (639ull << 32) |
+                (447ull << 44);
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            gs.writeRegister(GS_REG_FRAME_1, 150ull | (10ull << 16));
+            writeReferenceFramePSMCT32Pixel(vram, 150u, 10u, 0u, 0u, 0x80FFFFFFu);
+
+            gs.latchHostPresentationFrame();
+
+            std::vector<uint8_t> latchedFrame;
+            uint32_t latchedWidth = 0u;
+            uint32_t latchedHeight = 0u;
+            uint32_t sourceFbp = 1u;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(latchedFrame, latchedWidth, latchedHeight, nullptr, &sourceFbp, nullptr),
+                     "a black display page should still produce a host frame");
+            t.Equals(sourceFbp, 0u, "presentation should keep reading the DISPFB page");
+            t.Equals(static_cast<uint32_t>(latchedFrame[0]) + latchedFrame[1] + latchedFrame[2], 0u,
+                     "presentation should show the black display page as black");
+        });
+
+        tc.Run("latched host presentation weaves interlaced FIELD-mode frames", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 0xFF21ull;
+            regs.smode2 = 0x0001ull;
             regs.dispfb1 =
                 0ull |
                 (10ull << 9) |
@@ -1698,14 +1551,9 @@ void register_ps2_gs_tests()
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
 
-            constexpr uint32_t kLine0 = 0x000000FFu;
-            constexpr uint32_t kLine1 = 0x0000FF00u;
-            constexpr uint32_t kLine2 = 0x00FF0000u;
-            constexpr uint32_t kLine3 = 0x00FFFF00u;
-            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 0u, kLine0);
-            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 1u, kLine1);
-            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 2u, kLine2);
-            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 3u, kLine3);
+            const uint32_t lines[4] = {0x800000FFu, 0x8000FF00u, 0x80FF0000u, 0x80FFFF00u};
+            for (uint32_t y = 0; y < 4u; ++y)
+                writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, y, lines[y]);
 
             gs.latchHostPresentationFrame();
 
@@ -1713,31 +1561,148 @@ void register_ps2_gs_tests()
             uint32_t latchedWidth = 0u;
             uint32_t latchedHeight = 0u;
             t.IsTrue(gs.copyLatchedHostPresentationFrame(latchedFrame, latchedWidth, latchedHeight),
-                     "interlaced field presentation should produce a host frame");
-            t.Equals(latchedWidth, 640u,
-                     "field presentation should preserve display width");
-            t.Equals(latchedHeight, 448u,
-                     "field presentation should preserve display height");
-
-            auto pixelAtRow = [&](uint32_t row) -> uint32_t
+                     "interlaced presentation should produce a host frame");
+            t.Equals(latchedWidth, 640u, "interlaced presentation should preserve display width");
+            t.Equals(latchedHeight, 448u, "FIELD mode reads every other line, so the woven frame keeps all DH+1 lines");
+            for (uint32_t y = 0; y < 4u; ++y)
             {
-                const size_t off = static_cast<size_t>(row) * 640u * 4u;
-                return static_cast<uint32_t>(latchedFrame[off + 0u]) |
-                       (static_cast<uint32_t>(latchedFrame[off + 1u]) << 8) |
-                       (static_cast<uint32_t>(latchedFrame[off + 2u]) << 16);
-            };
+                uint32_t pixel = 0u;
+                std::memcpy(&pixel, latchedFrame.data() + static_cast<size_t>(y) * 640u * 4u, sizeof(pixel));
+                t.Equals(pixel & 0x00FFFFFFu, lines[y] & 0x00FFFFFFu, "woven output row should match the framebuffer line");
+            }
+        });
 
-            const uint32_t row0 = pixelAtRow(0u);
-            const uint32_t row1 = pixelAtRow(1u);
-            const uint32_t row2 = pixelAtRow(2u);
-            const uint32_t row3 = pixelAtRow(3u);
+        tc.Run("latched host presentation halves the buffer height in interlaced FRAME mode", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 0xFF21ull;
+            regs.smode2 = 0x0003ull;
+            regs.dispfb1 =
+                0ull |
+                (10ull << 9) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+            regs.display1 =
+                (639ull << 32) |
+                (447ull << 44);
 
-            t.Equals(row0, row1,
-                     "field presentation should duplicate the active field into the next scanline");
-            t.Equals(row2, row3,
-                     "field presentation should duplicate later field scanlines as well");
-            t.IsTrue(row0 != row2,
-                     "field presentation should still preserve different source content across field rows");
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 223u, 0x80123456u);
+
+            gs.latchHostPresentationFrame();
+
+            std::vector<uint8_t> latchedFrame;
+            uint32_t latchedWidth = 0u;
+            uint32_t latchedHeight = 0u;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(latchedFrame, latchedWidth, latchedHeight),
+                     "FRAME-mode presentation should produce a host frame");
+            t.Equals(latchedHeight, 224u, "FRAME mode reads every line per field, so the buffer holds (DH+1)/2 lines");
+            uint32_t pixel = 0u;
+            std::memcpy(&pixel, latchedFrame.data() + static_cast<size_t>(223u) * 640u * 4u, sizeof(pixel));
+            t.Equals(pixel & 0x00FFFFFFu, 0x123456u, "the last buffer line should be the last output row");
+        });
+
+        tc.Run("latched host presentation applies DBX, DBY and MAGH", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 0xFF21ull;
+            regs.dispfb1 =
+                0ull |
+                (10ull << 9) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 15) |
+                (8ull << 32) |
+                (4ull << 43);
+            regs.display1 =
+                636ull |
+                (50ull << 12) |
+                (3ull << 23) |
+                (2559ull << 32) |
+                (447ull << 44);
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            writeReferencePSMCT32Pixel(vram, 0u, 10u, 8u, 4u, 0x80ABCDEFu);
+            writeReferencePSMCT32Pixel(vram, 0u, 10u, 9u, 4u, 0x80010203u);
+
+            gs.latchHostPresentationFrame();
+
+            std::vector<uint8_t> latchedFrame;
+            uint32_t latchedWidth = 0u;
+            uint32_t latchedHeight = 0u;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(latchedFrame, latchedWidth, latchedHeight),
+                     "offset presentation should produce a host frame");
+            t.Equals(latchedWidth, 640u, "DW+1 = 2560 VCK at MAGH=3 should scan 640 pixels");
+            t.Equals(latchedHeight, 448u, "DH+1 lines should be scanned");
+            uint32_t pixel = 0u;
+            std::memcpy(&pixel, latchedFrame.data(), sizeof(pixel));
+            t.Equals(pixel & 0x00FFFFFFu, 0xABCDEFu, "the first output pixel should come from (DBX, DBY)");
+            std::memcpy(&pixel, latchedFrame.data() + 4u, sizeof(pixel));
+            t.Equals(pixel & 0x00FFFFFFu, 0x010203u, "the second output pixel should come from (DBX + 1, DBY)");
+        });
+
+        tc.Run("latched host presentation blends circuits offset by one line like the PS2 de-flicker filter", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 0x8023ull;
+            regs.smode2 = 0x0001ull;
+            regs.dispfb1 =
+                0ull |
+                (8ull << 9) |
+                (static_cast<uint64_t>(GS_PSM_CT24) << 15);
+            regs.dispfb2 = regs.dispfb1;
+            regs.display1 = 0x1ff9ff02048290ull;
+            regs.display2 = 0x1ff9ff02049290ull;
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            writeReferencePSMCT32Pixel(vram, 0u, 8u, 0u, 0u, 0x000000C8u);
+            writeReferencePSMCT32Pixel(vram, 0u, 8u, 0u, 1u, 0x00C80000u);
+
+            gs.latchHostPresentationFrame();
+
+            std::vector<uint8_t> latchedFrame;
+            uint32_t latchedWidth = 0u;
+            uint32_t latchedHeight = 0u;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(latchedFrame, latchedWidth, latchedHeight),
+                     "dual-circuit de-flicker presentation should produce a host frame");
+            t.Equals(latchedWidth, 512u, "DW+1 = 2560 VCK at MAGH=4 should scan 512 pixels");
+            t.Equals(latchedHeight, 513u, "the output should cover both circuits' display rectangles");
+            t.Equals(static_cast<uint32_t>(latchedFrame[0]), 100u, "row 0 is circuit 1 alone, blended over the black background");
+            const size_t row1 = 512u * 4u;
+            t.Equals(static_cast<uint32_t>(latchedFrame[row1 + 0u]), 100u, "row 1 should blend line 0 from circuit 2");
+            t.Equals(static_cast<uint32_t>(latchedFrame[row1 + 2u]), 100u, "row 1 should blend line 1 from circuit 1");
+        });
+
+        tc.Run("latched host presentation blends a single circuit over BGCOLOR by pixel alpha when MMOD=0", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            regs.pmode = 0x0001ull;
+            regs.bgcolor = 0x0000C8ull;
+            regs.dispfb1 =
+                0ull |
+                (10ull << 9) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 15);
+            regs.display1 =
+                (639ull << 32) |
+                (447ull << 44);
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            writeReferencePSMCT32Pixel(vram, 0u, 10u, 0u, 0u, 0x40C80000u);
+
+            gs.latchHostPresentationFrame();
+
+            std::vector<uint8_t> latchedFrame;
+            uint32_t latchedWidth = 0u;
+            uint32_t latchedHeight = 0u;
+            t.IsTrue(gs.copyLatchedHostPresentationFrame(latchedFrame, latchedWidth, latchedHeight),
+                     "MMOD=0 presentation should produce a host frame");
+            t.Equals(static_cast<uint32_t>(latchedFrame[0]), 100u, "BGCOLOR red should be half covered at alpha 0x40");
+            t.Equals(static_cast<uint32_t>(latchedFrame[2]), 100u, "circuit 1 blue should be half applied at alpha 0x40");
         });
 
         tc.Run("GIF PACKED A+D writes DISPFB1 and DISPLAY1 privileged registers", [](TestCase &t)

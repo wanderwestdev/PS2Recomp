@@ -38,17 +38,13 @@ namespace ps2_stubs
 #define EM_MIPS 8            // MIPS architecture
 #define PT_LOAD 1            // Loadable segment
 
-static constexpr int FB_WIDTH = 640;
-static constexpr int FB_HEIGHT = 512;
-static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
-static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
-static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
+static constexpr float kDisplayAspect = 4.0f / 3.0f;
 #if defined(PLATFORM_VITA)
 static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
 #else
-static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
-static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
+static constexpr int HOST_WINDOW_WIDTH = 640;
+static constexpr int HOST_WINDOW_HEIGHT = 480;
 #endif
 struct ElfHeader
 {
@@ -377,105 +373,41 @@ namespace
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-    static bool s_hasLatchedInitialFrame = false;
-    static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
-    static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
-    static bool s_lastPreferred = false;
     static uint32_t s_lastWidth = 0u;
     static uint32_t s_lastHeight = 0u;
-    static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
-    static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
-    if (needsLatch)
+    if (currentTick == s_lastPresentationTick)
     {
-        rt->gs().latchHostPresentationFrame();
-        s_lastPresentationTick = currentTick;
-        s_hasLatchedInitialFrame = true;
-    }
-    else if (s_hasUploadedFrame)
-    {
-        outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        outWidth = s_lastWidth;
+        outHeight = s_lastHeight;
         return;
     }
+    s_lastPresentationTick = currentTick;
+    rt->gs().latchHostPresentationFrame();
 
-    s_scratch.clear();
     uint32_t width = 0u;
     uint32_t height = 0u;
-    uint32_t displayFbp = 0u;
-    uint32_t sourceFbp = 0u;
-    bool usedPreferredDisplaySource = false;
-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
-                                                   width,
-                                                   height,
-                                                   &displayFbp,
-                                                   &sourceFbp,
-                                                   &usedPreferredDisplaySource))
+    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch, width, height) || width == 0u || height == 0u)
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
-        UpdateTexture(tex, blank.data);
-        UnloadImage(blank);
-        outWidth = FB_WIDTH;
-        outHeight = DEFAULT_DISPLAY_HEIGHT;
-        s_lastWidth = outWidth;
-        s_lastHeight = outHeight;
-        s_hasUploadedFrame = true;
+        outWidth = s_lastWidth = 0u;
+        outHeight = s_lastHeight = 0u;
         return;
     }
 
-    PS2_IF_AGRESSIVE_LOGS({
-        static uint32_t s_uploadDebugCount = 0u;
-        if (s_uploadDebugCount < 128u ||
-            displayFbp != s_lastDisplayFbp ||
-            sourceFbp != s_lastSourceFbp ||
-            usedPreferredDisplaySource != s_lastPreferred ||
-            width != s_lastWidth ||
-            height != s_lastHeight)
-        {
-            std::cout << "[frame:upload] idx=" << s_uploadDebugCount
-                      << " tick=" << currentTick
-                      << " displayFbp=" << displayFbp
-                      << " sourceFbp=" << sourceFbp
-                      << " size=" << width << "x" << height
-                      << " preferred=" << static_cast<uint32_t>(usedPreferredDisplaySource ? 1u : 0u)
-                      << std::endl;
-        }
-        ++s_uploadDebugCount;
-    });
-    s_lastDisplayFbp = displayFbp;
-    s_lastSourceFbp = sourceFbp;
-    s_lastPreferred = usedPreferredDisplaySource;
-    s_lastWidth = width;
-    s_lastHeight = height;
-
-    std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
-    if (!s_scratch.empty() && width != 0u && height != 0u)
+    if (tex.id == 0 || static_cast<uint32_t>(tex.width) != width || static_cast<uint32_t>(tex.height) != height)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
-        const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
-        const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
-        for (uint32_t y = 0; y < copyHeight; ++y)
-        {
-            const size_t srcOffset = static_cast<size_t>(y) * srcRowBytes;
-            const size_t dstOffset = static_cast<size_t>(y) * dstRowBytes;
-            if (srcOffset + copyRowBytes > s_scratch.size() ||
-                dstOffset + copyRowBytes > s_uploadBuffer.size())
-            {
-                break;
-            }
-            std::memcpy(s_uploadBuffer.data() + dstOffset, s_scratch.data() + srcOffset, copyRowBytes);
-        }
+        if (tex.id != 0)
+            UnloadTexture(tex);
+        Image image = GenImageColor(static_cast<int>(width), static_cast<int>(height), BLACK);
+        tex = LoadTextureFromImage(image);
+        UnloadImage(image);
+        SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
     }
-
-    UpdateTexture(tex, s_uploadBuffer.data());
-    outWidth = width;
-    outHeight = height;
-    s_hasUploadedFrame = true;
+    UpdateTexture(tex, s_scratch.data());
+    outWidth = s_lastWidth = width;
+    outHeight = s_lastHeight = height;
 }
 
 PS2Runtime::PS2Runtime()
@@ -2358,10 +2290,7 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-    // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
+    Texture2D frameTex{};
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -2421,26 +2350,27 @@ void PS2Runtime::run()
 
             }
         });
-        uint32_t presentWidth = FB_WIDTH;
-        uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+        uint32_t presentWidth = 0u;
+        uint32_t presentHeight = 0u;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
         BeginDrawing();
         ClearBackground(BLACK);
-        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
-        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        const float screenWidth = static_cast<float>(GetScreenWidth());
-        const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
-        const Rectangle dstRect{
-            (screenWidth - dstWidth) * 0.5f,
-            (screenHeight - dstHeight) * 0.5f,
-            dstWidth,
-            dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        if (frameTex.id != 0 && presentWidth != 0u && presentHeight != 0u)
+        {
+            const float screenWidth = static_cast<float>(GetScreenWidth());
+            const float screenHeight = static_cast<float>(GetScreenHeight());
+            float dstWidth = screenWidth;
+            float dstHeight = screenWidth / kDisplayAspect;
+            if (dstHeight > screenHeight)
+            {
+                dstHeight = screenHeight;
+                dstWidth = screenHeight * kDisplayAspect;
+            }
+            const Rectangle srcRect{0.0f, 0.0f, static_cast<float>(presentWidth), static_cast<float>(presentHeight)};
+            const Rectangle dstRect{(screenWidth - dstWidth) * 0.5f, (screenHeight - dstHeight) * 0.5f, dstWidth, dstHeight};
+            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
@@ -2467,7 +2397,8 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    UnloadTexture(frameTex);
+    if (frameTex.id != 0)
+        UnloadTexture(frameTex);
     CloseWindow();
 
     RUNTIME_LOG("[run] exiting loop");

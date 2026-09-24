@@ -307,10 +307,8 @@ namespace
 
 namespace
 {
-    static constexpr uint32_t kDefaultDisplayWidth = 640u;
-    static constexpr uint32_t kDefaultDisplayHeight = 448u;
-    static constexpr uint32_t kHostFrameWidth = 640u;
-    static constexpr uint32_t kHostFrameHeight = 512u;
+    static constexpr uint32_t kMaxPresentationWidth = 2048u;
+    static constexpr uint32_t kMaxPresentationHeight = 2048u;
 
     uint16_t encodeFramePixelPSMCT16(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
     {
@@ -320,108 +318,66 @@ namespace
                                      ((a >= 0x40u) ? 0x8000u : 0u));
     }
 
-    void decodeDisplaySize(uint64_t display64, uint32_t &outWidth, uint32_t &outHeight)
+    struct CrtcCircuit
     {
-        const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
-        const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
-        const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
+        bool enabled = false;
+        uint32_t fbp = 0u;
+        uint32_t fbw = 1u;
+        uint8_t psm = 0u;
+        uint32_t dbx = 0u;
+        uint32_t dby = 0u;
+        int32_t dx = 0;
+        int32_t dy = 0;
+        int32_t dw = 0;
+        int32_t dh = 0;
+        int32_t hdiv = 1;
+        int32_t vdiv = 1;
 
-        outWidth = (dw + 1u) / (magh + 1u);
-        outHeight = dh + 1u;
-        if (outWidth < 64u || outHeight < 64u)
+        bool covers(int32_t rx, int32_t ry) const
         {
-            outWidth = kDefaultDisplayWidth;
-            outHeight = kDefaultDisplayHeight;
+            return enabled && rx >= dx && rx < dx + dw && ry >= dy && ry < dy + dh;
         }
-        outWidth = std::min<uint32_t>(outWidth, kHostFrameWidth);
-        outHeight = std::min<uint32_t>(outHeight, kHostFrameHeight);
-    }
-
-    GSFrameReg decodeDisplayFrame(uint64_t dispfb64)
-    {
-        GSFrameReg frame{};
-        frame.fbp = static_cast<uint32_t>(dispfb64 & 0x1FFu);
-        frame.fbw = static_cast<uint32_t>((dispfb64 >> 9) & 0x3Fu);
-        frame.psm = static_cast<uint8_t>((dispfb64 >> 15) & 0x1Fu);
-        return frame;
-    }
-
-    struct GSDisplayReadOrigin
-    {
-        uint32_t x = 0u;
-        uint32_t y = 0u;
     };
 
-    GSDisplayReadOrigin decodeDisplayReadOrigin(uint64_t dispfb64)
+    CrtcCircuit decodeCircuit(bool enabled, uint64_t dispfb, uint64_t display, bool halfHeightBuffer)
     {
-        return {
-            static_cast<uint32_t>((dispfb64 >> 32) & 0x7FFu),
-            static_cast<uint32_t>((dispfb64 >> 43) & 0x7FFu)};
+        CrtcCircuit c{};
+        c.fbp = static_cast<uint32_t>(dispfb & 0x1FFu);
+        c.fbw = std::max<uint32_t>(1u, static_cast<uint32_t>((dispfb >> 9) & 0x3Fu));
+        c.psm = static_cast<uint8_t>((dispfb >> 15) & 0x1Fu);
+        c.dbx = static_cast<uint32_t>((dispfb >> 32) & 0x7FFu);
+        c.dby = static_cast<uint32_t>((dispfb >> 43) & 0x7FFu);
+        c.dx = static_cast<int32_t>(display & 0xFFFu);
+        c.dy = static_cast<int32_t>((display >> 12) & 0x7FFu);
+        c.hdiv = static_cast<int32_t>((display >> 23) & 0xFu) + 1;
+        c.vdiv = (static_cast<int32_t>((display >> 27) & 0x3u) + 1) * (halfHeightBuffer ? 2 : 1);
+        c.dw = static_cast<int32_t>((display >> 32) & 0xFFFu) + 1;
+        c.dh = static_cast<int32_t>((display >> 44) & 0x7FFu) + 1;
+        c.enabled = enabled && display != 0u && c.dw >= c.hdiv && c.dh >= c.vdiv;
+        return c;
     }
 
-    bool hasDisplaySetup(uint64_t display64, const GSFrameReg &frame)
+    uint32_t displayPixelToRgba(uint8_t psm, uint32_t raw)
     {
-        const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
-        const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
-        const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
-        return frame.fbw != 0u || dw != 0u || dh != 0u || magh != 0u;
-    }
-
-    struct GSPmodeState
-    {
-        bool enableCrt1 = false;
-        bool enableCrt2 = false;
-        bool mmod = false;
-        bool amod = false;
-        bool slbg = false;
-        uint8_t alp = 0u;
-    };
-
-    GSPmodeState decodePmode(uint64_t pmode64)
-    {
-        return {
-            (pmode64 & 0x1ull) != 0ull,
-            (pmode64 & 0x2ull) != 0ull,
-            ((pmode64 >> 5) & 0x1ull) != 0ull,
-            ((pmode64 >> 6) & 0x1ull) != 0ull,
-            ((pmode64 >> 7) & 0x1ull) != 0ull,
-            static_cast<uint8_t>((pmode64 >> 8) & 0xFFu)};
-    }
-
-    struct GSSmode2State
-    {
-        bool interlaced = false;
-        bool frameMode = true;
-    };
-
-    GSSmode2State decodeSMode2(uint64_t smode2)
-    {
-        return {(smode2 & 0x1ull) != 0ull, ((smode2 >> 1) & 0x1ull) != 0ull};
-    }
-
-    void applyFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, bool oddField)
-    {
-        if (pixels.empty() || width == 0u || height < 2u)
-            return;
-        const std::vector<uint8_t> source = pixels;
-        for (uint32_t y = 0; y < height; ++y)
+        switch (psm & 0x0Fu)
         {
-            uint32_t sourceY = ((y >> 1u) << 1u) + (oddField ? 1u : 0u);
-            if (sourceY >= height)
-                sourceY = height - 1u;
-            std::memcpy(pixels.data() + y * kHostFrameWidth * 4u,
-                        source.data() + sourceY * kHostFrameWidth * 4u,
-                        width * 4u);
+        case GS_PSM_CT32:
+            return raw;
+        case GS_PSM_CT24:
+            return (raw & 0x00FFFFFFu) | 0x80000000u;
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        {
+            const uint32_t r = raw & 31u;
+            const uint32_t g = (raw >> 5u) & 31u;
+            const uint32_t b = (raw >> 10u) & 31u;
+            return ((r << 3u) | (r >> 2u)) |
+                   (((g << 3u) | (g >> 2u)) << 8u) |
+                   (((b << 3u) | (b >> 2u)) << 16u) |
+                   ((raw & 0x8000u) ? 0x80000000u : 0u);
         }
-    }
-
-    void normalizePresentationAlpha(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
-    {
-        for (uint32_t y = 0; y < height; ++y)
-        {
-            uint8_t *row = pixels.data() + y * kHostFrameWidth * 4u;
-            for (uint32_t x = 0; x < width; ++x)
-                row[x * 4u + 3u] = 255u;
+        default:
+            return raw;
         }
     }
 
@@ -429,21 +385,6 @@ namespace
     {
         const int delta = static_cast<int>(src) - static_cast<int>(dst);
         return GSInternal::clampU8(static_cast<int>(dst) + ((delta * static_cast<int>(factor)) / 255));
-    }
-
-    uint32_t countNonBlackPixels(const std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
-    {
-        uint32_t count = 0u;
-        for (uint32_t y = 0; y < height; ++y)
-        {
-            const uint8_t *row = pixels.data() + y * kHostFrameWidth * 4u;
-            for (uint32_t x = 0; x < width; ++x)
-            {
-                if (row[x * 4u] != 0u || row[x * 4u + 1u] != 0u || row[x * 4u + 2u] != 0u)
-                    ++count;
-            }
-        }
-        return count;
     }
 }
 
@@ -1819,88 +1760,8 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
     return false;
 }
 
-bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
-                                       uint32_t width,
-                                       uint32_t height,
-                                       std::vector<uint8_t> &outPixels,
-                                       bool preserveAlpha,
-                                       bool useLocalMemoryLayout,
-                                       bool frameBaseIsPages,
-                                       uint32_t sourceOriginX,
-                                       uint32_t sourceOriginY) const
-{
-    if (!m_vram || m_vramSize == 0u)
-        return false;
-
-    outPixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
-    const uint32_t baseBytes = frameBaseIsPages ? frame.fbp * 8192u : frame.fbp * 256u;
-    const uint32_t basePtr = frameBaseIsPages ? GSInternal::framePageBaseToBlock(frame.fbp) : frame.fbp;
-    const uint32_t fbw = frame.fbw ? frame.fbw : kHostFrameWidth / 64u;
-    const uint32_t bytesPerPixel = (frame.psm == GS_PSM_CT16 || frame.psm == GS_PSM_CT16S) ? 2u : 4u;
-    const uint32_t stride = fbw * 64u * bytesPerPixel;
-
-    for (uint32_t y = 0; y < height; ++y)
-    {
-        uint8_t *dst = outPixels.data() + y * kHostFrameWidth * 4u;
-        for (uint32_t x = 0; x < width; ++x)
-        {
-            const uint32_t sx = sourceOriginX + x;
-            const uint32_t sy = sourceOriginY + y;
-            if (frame.psm == GS_PSM_CT32 || frame.psm == GS_PSM_CT24)
-            {
-                uint32_t color = 0u;
-                if (useLocalMemoryLayout)
-                    color = ReadVramUnlocked(frame.psm, basePtr, fbw, sx, sy);
-                else
-                {
-                    const uint32_t pixelBytes = frame.psm == GS_PSM_CT24 ? 3u : 4u;
-                    const uint64_t offset = static_cast<uint64_t>(baseBytes) + static_cast<uint64_t>(sy) * stride + static_cast<uint64_t>(sx) * pixelBytes;
-                    if (offset + pixelBytes > m_vramSize)
-                        return false;
-                    color = m_vram[offset] | (static_cast<uint32_t>(m_vram[offset + 1u]) << 8u) |
-                            (static_cast<uint32_t>(m_vram[offset + 2u]) << 16u);
-                    if (pixelBytes == 4u)
-                        color |= static_cast<uint32_t>(m_vram[offset + 3u]) << 24u;
-                }
-                dst[x * 4u] = static_cast<uint8_t>(color);
-                dst[x * 4u + 1u] = static_cast<uint8_t>(color >> 8u);
-                dst[x * 4u + 2u] = static_cast<uint8_t>(color >> 16u);
-                dst[x * 4u + 3u] = preserveAlpha && frame.psm != GS_PSM_CT24 ? static_cast<uint8_t>(color >> 24u) : 255u;
-            }
-            else if (frame.psm == GS_PSM_CT16 || frame.psm == GS_PSM_CT16S)
-            {
-                uint16_t color = 0u;
-                if (useLocalMemoryLayout)
-                    color = static_cast<uint16_t>(ReadVramUnlocked(frame.psm, basePtr, fbw, sx, sy));
-                else
-                {
-                    const uint64_t offset = static_cast<uint64_t>(baseBytes) + static_cast<uint64_t>(sy) * stride + static_cast<uint64_t>(sx) * 2u;
-                    if (offset + 2u > m_vramSize)
-                        return false;
-                    std::memcpy(&color, m_vram + offset, sizeof(color));
-                }
-                const uint32_t r = color & 31u;
-                const uint32_t g = (color >> 5u) & 31u;
-                const uint32_t b = (color >> 10u) & 31u;
-                dst[x * 4u] = static_cast<uint8_t>((r << 3u) | (r >> 2u));
-                dst[x * 4u + 1u] = static_cast<uint8_t>((g << 3u) | (g >> 2u));
-                dst[x * 4u + 2u] = static_cast<uint8_t>((b << 3u) | (b >> 2u));
-                dst[x * 4u + 3u] = preserveAlpha ? ((color & 0x8000u) ? 0x80u : 0u) : 255u;
-            }
-            else
-            {
-                outPixels.clear();
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
 PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
 {
-    // Snapshot local memory under the backend lock, then perform the expensive
-    // display conversion without holding the producer-side raster lock.
     thread_local std::vector<uint8_t> snapshot;
     SnapshotVram(snapshot);
     if (snapshot.empty())
@@ -1914,121 +1775,90 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
 PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
 {
     PresentationFrame result{};
-    const GSPmodeState pmode = decodePmode(request.pmode);
-    const GSSmode2State smode2 = decodeSMode2(request.smode2);
-    const bool fieldMode = smode2.interlaced && !smode2.frameMode;
-    const bool oddField = (request.vsyncTick & 1ull) != 0ull;
-    const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
-    const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
-    const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
-    const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
-    uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
-    decodeDisplaySize(request.display1, width1, height1);
-    decodeDisplaySize(request.display2, width2, height2);
-    const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
-    const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
-    if (!valid1 && !valid2)
+    const bool enable1 = (request.pmode & 0x1ull) != 0ull;
+    const bool enable2 = (request.pmode & 0x2ull) != 0ull;
+    const bool mmod = ((request.pmode >> 5) & 0x1ull) != 0ull;
+    const bool slbg = ((request.pmode >> 7) & 0x1ull) != 0ull;
+    const uint32_t alp = static_cast<uint32_t>((request.pmode >> 8) & 0xFFull);
+    const bool halfHeightBuffer = (request.smode2 & 0x3ull) == 0x3ull;
+
+    const CrtcCircuit circuits[2] = {
+        decodeCircuit(enable1, request.dispfb1, request.display1, halfHeightBuffer),
+        decodeCircuit(enable2, request.dispfb2, request.display2, halfHeightBuffer)};
+    const CrtcCircuit &c1 = circuits[0];
+    const CrtcCircuit &c2 = circuits[1];
+    if (!c1.enabled && !c2.enabled)
         return result;
 
-    auto copySource = [&](const GSFrameReg &displayFrame,
-                          const GSDisplayReadOrigin &origin,
-                          uint32_t width,
-                          uint32_t height,
-                          bool allowPreferred,
-                          bool preserveAlpha,
-                          GSFrameReg &selected,
-                          std::vector<uint8_t> &pixels,
-                          bool &usedPreferred) -> bool
+    int32_t x0 = INT32_MAX, y0 = INT32_MAX, x1 = INT32_MIN, y1 = INT32_MIN;
+    int32_t hstep = INT32_MAX, vstep = INT32_MAX;
+    for (const CrtcCircuit &c : circuits)
     {
-        selected = displayFrame;
-        pixels.clear();
-        usedPreferred = false;
-        if (allowPreferred && request.hasPreferredSource && request.preferredDestFbp == displayFrame.fbp &&
-            (request.preferredSource.fbw != 0u || request.preferredSource.fbp != displayFrame.fbp) &&
-            CopyFrameToHostRgba(request.preferredSource, width, height, pixels, preserveAlpha, true, false, 0u, 0u))
-        {
-            selected = request.preferredSource;
-            usedPreferred = true;
-        }
-        if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
-            return false;
+        if (!c.enabled)
+            continue;
+        x0 = std::min(x0, c.dx);
+        y0 = std::min(y0, c.dy);
+        x1 = std::max(x1, c.dx + c.dw);
+        y1 = std::max(y1, c.dy + c.dh);
+        hstep = std::min(hstep, c.hdiv);
+        vstep = std::min(vstep, c.vdiv);
+    }
 
-        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
-        {
-            for (const GSFrameReg &candidate : request.contextFrames)
-            {
-                if (candidate.fbp == selected.fbp && candidate.fbw == selected.fbw && candidate.psm == selected.psm)
-                    continue;
-                std::vector<uint8_t> candidatePixels;
-                if (!CopyFrameToHostRgba(candidate, width, height, candidatePixels, preserveAlpha, true, true, 0u, 0u))
-                    continue;
-                if (countNonBlackPixels(candidatePixels, width, height) == 0u)
-                    continue;
-                selected = candidate;
-                pixels.swap(candidatePixels);
-                break;
-            }
-        }
-        return true;
+    const uint32_t width = std::min<uint32_t>(kMaxPresentationWidth, static_cast<uint32_t>((x1 - x0 + hstep - 1) / hstep));
+    const uint32_t height = std::min<uint32_t>(kMaxPresentationHeight, static_cast<uint32_t>((y1 - y0 + vstep - 1) / vstep));
+    result.width = width;
+    result.height = height;
+    result.pixels.assign(static_cast<size_t>(width) * height * 4u, 0u);
+
+    const uint8_t bgR = static_cast<uint8_t>(request.bgcolor);
+    const uint8_t bgG = static_cast<uint8_t>(request.bgcolor >> 8u);
+    const uint8_t bgB = static_cast<uint8_t>(request.bgcolor >> 16u);
+
+    auto readCircuit = [&](const CrtcCircuit &c, int32_t rx, int32_t ry) -> uint32_t
+    {
+        const uint32_t bx = (static_cast<uint32_t>((rx - c.dx) / c.hdiv) + c.dbx) & 0x7FFu;
+        const uint32_t by = (static_cast<uint32_t>((ry - c.dy) / c.vdiv) + c.dby) & 0x7FFu;
+        return displayPixelToRgba(c.psm, ReadVramUnlocked(c.psm, c.fbp * 32u, c.fbw, bx, by));
     };
 
-    if (valid1 && valid2)
+    for (uint32_t oy = 0; oy < height; ++oy)
     {
-        GSFrameReg selected1{}, selected2{};
-        std::vector<uint8_t> crt1, crt2;
-        bool preferred1 = false, preferred2 = false;
-        if (copySource(displayFrame1, origin1, width1, height1, false, true, selected1, crt1, preferred1) &&
-            copySource(displayFrame2, origin2, width2, height2, false, true, selected2, crt2, preferred2))
+        const int32_t ry = y0 + static_cast<int32_t>(oy) * vstep + vstep / 2;
+        uint8_t *row = result.pixels.data() + static_cast<size_t>(oy) * width * 4u;
+        for (uint32_t ox = 0; ox < width; ++ox)
         {
-            result.width = std::max(width1, width2);
-            result.height = std::max(height1, height2);
-            result.pixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
-            const uint8_t bgR = static_cast<uint8_t>(request.bgcolor);
-            const uint8_t bgG = static_cast<uint8_t>(request.bgcolor >> 8u);
-            const uint8_t bgB = static_cast<uint8_t>(request.bgcolor >> 16u);
-            for (uint32_t y = 0; y < result.height; ++y)
-                for (uint32_t x = 0; x < result.width; ++x)
-                {
-                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
-                    dst[0] = bgR;
-                    dst[1] = bgG;
-                    dst[2] = bgB;
-                    dst[3] = pmode.alp;
-                }
-            if (!pmode.slbg)
-                for (uint32_t y = 0; y < height2; ++y)
-                    std::memcpy(result.pixels.data() + y * kHostFrameWidth * 4u, crt2.data() + y * kHostFrameWidth * 4u, width2 * 4u);
-            for (uint32_t y = 0; y < height1; ++y)
-                for (uint32_t x = 0; x < width1; ++x)
-                {
-                    const uint8_t *src = crt1.data() + (y * kHostFrameWidth + x) * 4u;
-                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
-                    const uint32_t factor = pmode.mmod ? pmode.alp : std::min<uint32_t>(255u, static_cast<uint32_t>(src[3]) * 2u);
-                    dst[0] = blendPresentationChannel(src[0], dst[0], factor);
-                    dst[1] = blendPresentationChannel(src[1], dst[1], factor);
-                    dst[2] = blendPresentationChannel(src[2], dst[2], factor);
-                    dst[3] = pmode.amod ? dst[3] : src[3];
-                }
-            normalizePresentationAlpha(result.pixels, result.width, result.height);
-            if (fieldMode)
-                applyFieldPresentation(result.pixels, result.width, result.height, oddField);
-            result.displayFbp = displayFrame1.fbp;
-            result.sourceFbp = selected1.fbp;
-            return result;
+            const int32_t rx = x0 + static_cast<int32_t>(ox) * hstep + hstep / 2;
+            const bool in1 = c1.covers(rx, ry);
+            const bool in2 = c2.covers(rx, ry);
+            uint8_t *dst = row + ox * 4u;
+            dst[3] = 0xFFu;
+            if (!in1 && !in2)
+                continue;
+
+            uint8_t r = bgR, g = bgG, b = bgB;
+            if (in2 && !slbg)
+            {
+                const uint32_t color = readCircuit(c2, rx, ry);
+                r = static_cast<uint8_t>(color);
+                g = static_cast<uint8_t>(color >> 8u);
+                b = static_cast<uint8_t>(color >> 16u);
+            }
+            if (in1)
+            {
+                const uint32_t color = readCircuit(c1, rx, ry);
+                const uint32_t factor = mmod ? alp : std::min<uint32_t>(255u, (color >> 24u) * 2u);
+                r = blendPresentationChannel(static_cast<uint8_t>(color), r, factor);
+                g = blendPresentationChannel(static_cast<uint8_t>(color >> 8u), g, factor);
+                b = blendPresentationChannel(static_cast<uint8_t>(color >> 16u), b, factor);
+            }
+            dst[0] = r;
+            dst[1] = g;
+            dst[2] = b;
         }
     }
 
-    const GSFrameReg &displayFrame = valid1 ? displayFrame1 : displayFrame2;
-    const GSDisplayReadOrigin &origin = valid1 ? origin1 : origin2;
-    result.width = valid1 ? width1 : width2;
-    result.height = valid1 ? height1 : height2;
-    GSFrameReg selected = displayFrame;
-    if (!copySource(displayFrame, origin, result.width, result.height, true, false, selected, result.pixels, result.usedPreferred))
-        return {};
-    if (fieldMode)
-        applyFieldPresentation(result.pixels, result.width, result.height, oddField);
-    normalizePresentationAlpha(result.pixels, result.width, result.height);
-    result.displayFbp = displayFrame.fbp;
-    result.sourceFbp = selected.fbp;
+    result.displayFbp = c1.enabled ? c1.fbp : c2.fbp;
+    result.sourceFbp = result.displayFbp;
+    result.usedPreferred = false;
     return result;
 }

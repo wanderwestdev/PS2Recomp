@@ -121,8 +121,6 @@ namespace
 
 namespace
 {
-    static constexpr uint32_t kHostFrameWidth = 640u;
-
     GSPrimReg decodePrimRegister(uint64_t value)
     {
         GSPrimReg prim{};
@@ -715,35 +713,21 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     if (outUsedPreferred)
         *outUsedPreferred = m_hostPresentationUsedPreferred;
 
-    const size_t packedRowBytes = static_cast<size_t>(outWidth) * 4u;
-    outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
-    if (outWidth != 0u && outHeight != 0u)
+    const size_t packedBytes = static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 4u;
+    if (packedBytes > m_hostPresentationFrame.size())
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
-        for (uint32_t y = 0; y < outHeight; ++y)
-        {
-            const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
-            const size_t dstOffset = static_cast<size_t>(y) * packedRowBytes;
-            if (srcOffset + packedRowBytes > m_hostPresentationFrame.size() ||
-                dstOffset + packedRowBytes > outPixels.size())
-            {
-                outPixels.clear();
-                outWidth = 0u;
-                outHeight = 0u;
-                if (outDisplayFbp)
-                    *outDisplayFbp = 0u;
-                if (outSourceFbp)
-                    *outSourceFbp = 0u;
-                if (outUsedPreferred)
-                    *outUsedPreferred = false;
-                return false;
-            }
-
-            std::memcpy(outPixels.data() + dstOffset,
-                        m_hostPresentationFrame.data() + srcOffset,
-                        packedRowBytes);
-        }
+        outPixels.clear();
+        outWidth = 0u;
+        outHeight = 0u;
+        if (outDisplayFbp)
+            *outDisplayFbp = 0u;
+        if (outSourceFbp)
+            *outSourceFbp = 0u;
+        if (outUsedPreferred)
+            *outUsedPreferred = false;
+        return false;
     }
+    outPixels.assign(m_hostPresentationFrame.begin(), m_hostPresentationFrame.begin() + static_cast<std::ptrdiff_t>(packedBytes));
     return true;
 }
 

@@ -51,15 +51,6 @@ private:
     void PerformLocalToLocalTransfer();
     void PerformLocalToHostTransfer();
     PresentationFrame PresentFromLocalMemory(const GSPresentationRequest &request);
-    bool CopyFrameToHostRgba(const GSFrameReg &frame,
-                             uint32_t width,
-                             uint32_t height,
-                             std::vector<uint8_t> &outPixels,
-                             bool preserveAlpha,
-                             bool useLocalMemoryLayout,
-                             bool frameBaseIsPages,
-                             uint32_t sourceOriginX,
-                             uint32_t sourceOriginY) const;
 
     using WriteVramFunc = void (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
     using ReadVramFunc = uint32_t (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t);
