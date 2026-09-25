@@ -15,7 +15,10 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <memory>
+#include <string>
 #include <unordered_map>
+#include <vector>
 #include <ps2_log.h>
 
 namespace
@@ -66,6 +69,16 @@ namespace
         VU1InterpreterAccess::CompiledProgram current = nullptr;
         bool enabled = true;
     };
+
+    bool vu1VerifyEnabled()
+    {
+        static const bool enabled = []
+        {
+            const char *value = std::getenv("PS2X_VU1_VERIFY");
+            return value && *value && std::strcmp(value, "0") != 0;
+        }();
+        return enabled;
+    }
 
     Vu1CompiledRegistry &vu1CompiledRegistry()
     {
@@ -223,6 +236,7 @@ void VU1Interpreter::reset()
     m_state.r = 0x3F800000u;
     m_cycle = 0;
     resetScheduler();
+    vu1NormShadow.valid = false;
 }
 
 bool VU1Interpreter::pipelinesPending() const
@@ -806,29 +820,44 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
-    m_activeVuData = vuData;
-    m_activeVuDataSize = dataSize;
-    m_activeGs = &gs;
-    m_activeMemory = memory;
     if (m_unit == Unit::VU1)
+    {
         captureVu1Program(vuCode, codeSize, memory, m_state.pc);
+        if (vu1VerifyEnabled() && lookupCompiledVu1Program(vuCode, codeSize, memory))
+        {
+            VU1InterpreterAccess::runVerified(*this, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+            return;
+        }
+    }
+    VU1InterpreterAccess::runLoop(*this, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, true);
+}
 
-    const int previousRoundingMode = std::fegetround();
-    const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
-    const uint64_t budgetEnd = m_cycle + maxCycles;
+bool VU1InterpreterAccess::runLoop(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
+                                   GS &gs, PS2Memory *memory, uint32_t maxCycles, bool allowCompiled)
+{
+    vu.m_activeVuData = vuData;
+    vu.m_activeVuDataSize = dataSize;
+    vu.m_activeGs = &gs;
+    vu.m_activeMemory = memory;
+
+    const unsigned previousCsr = _mm_getcsr();
+    const bool changeRounding = (previousCsr & 0x6000u) != 0x6000u;
+    if (changeRounding)
+        _mm_setcsr(previousCsr | 0x6000u);
+    const uint64_t budgetEnd = vu.m_cycle + maxCycles;
     bool programEnded = false;
-    const VU1InterpreterAccess::CompiledProgram compiled =
-        m_unit == Unit::VU1 ? lookupCompiledVu1Program(vuCode, codeSize, memory) : nullptr;
+    const CompiledProgram compiled =
+        allowCompiled && vu.m_unit == VU1Interpreter::Unit::VU1 ? lookupCompiledVu1Program(vuCode, codeSize, memory) : nullptr;
     const Vu1RunArgs compiledArgs{vuData, dataSize, &gs, memory, codeSize, budgetEnd};
     bool interpretNextPair = false;
-    while (m_cycle < budgetEnd && !m_stopRequested)
+    while (vu.m_cycle < budgetEnd && !vu.m_stopRequested)
     {
         if (compiled && !interpretNextPair)
         {
-            const VU1InterpreterAccess::StepResult result = compiled(*this, compiledArgs);
-            if (result == VU1InterpreterAccess::StepResult::Budget)
+            const StepResult result = compiled(vu, compiledArgs);
+            if (result == StepResult::Budget)
                 break;
-            if (result == VU1InterpreterAccess::StepResult::Ended)
+            if (result == StepResult::Ended)
             {
                 programEnded = true;
                 break;
@@ -837,23 +866,23 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             continue;
         }
         interpretNextPair = false;
+        vu1NormShadow.valid = false;
 
-        commitReadyPipelines();
-        if (m_state.pc + 8u > codeSize)
+        vu.commitReadyPipelines();
+        if (vu.m_state.pc + 8u > codeSize)
             break;
 
-        const DecodedInstructionPair &decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+        const Decoded &decoded = vu.getDecodedInstructionPairForPc(vuCode, codeSize, memory, vu.m_state.pc);
         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
         {
-            reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+            vu.reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
             break;
         }
 
-        const VU1InterpreterAccess::StepResult step =
-            VU1InterpreterAccess::stepPair(*this, decoded, vuData, dataSize, gs, memory, codeSize, budgetEnd);
-        if (step == VU1InterpreterAccess::StepResult::Budget)
+        const StepResult step = stepPair(vu, decoded, vuData, dataSize, gs, memory, codeSize, budgetEnd);
+        if (step == StepResult::Budget)
             break;
-        if (step == VU1InterpreterAccess::StepResult::Ended)
+        if (step == StepResult::Ended)
         {
             programEnded = true;
             break;
@@ -862,55 +891,208 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
     if (programEnded)
     {
-        flushPipelines();
-        m_state.ebit = false;
-        m_state.haltAfterDelaySlot = false;
-        m_pendingHaltD = false;
-        m_pendingHaltT = false;
+        vu.flushPipelines();
+        vu.m_state.ebit = false;
+        vu.m_state.haltAfterDelaySlot = false;
+        vu.m_pendingHaltD = false;
+        vu.m_pendingHaltT = false;
     }
-    m_state.cycles = m_cycle;
-    if (useVuRounding && previousRoundingMode != -1)
-        std::fesetround(previousRoundingMode);
+    vu.m_state.cycles = vu.m_cycle;
+    if (changeRounding)
+        _mm_setcsr((_mm_getcsr() & ~0x6000u) | (previousCsr & 0x6000u));
+    return programEnded;
+}
+
+VU1State VU1InterpreterAccess::effectiveState(const VU1Interpreter &vu)
+{
+    VU1State state = vu.m_state;
+    for (uint32_t mask = vu.m_vfWriteValid; mask != 0u; mask &= mask - 1u)
+    {
+        const auto &write = vu.m_vfWritePipeline[static_cast<size_t>(std::countr_zero(mask))];
+        for (uint32_t component = 0; component < 4u; ++component)
+        {
+            if ((write.laneMask & laneForComponent(component)) != 0u &&
+                vu.m_vfLatestWrite[write.reg][component] == write.sequence)
+                state.vf[write.reg][component] = write.value[component];
+        }
+    }
+    for (uint32_t mask = vu.m_viWriteValid; mask != 0u; mask &= mask - 1u)
+    {
+        const auto &write = vu.m_viWritePipeline[static_cast<size_t>(std::countr_zero(mask))];
+        if (vu.m_viLatestWrite[write.reg] == write.sequence)
+            state.vi[write.reg] = static_cast<int16_t>(write.value);
+    }
+    for (uint32_t mask = vu.m_accWriteValid; mask != 0u; mask &= mask - 1u)
+    {
+        const auto &write = vu.m_accWritePipeline[static_cast<size_t>(std::countr_zero(mask))];
+        for (uint32_t component = 0; component < 4u; ++component)
+        {
+            if ((write.laneMask & laneForComponent(component)) != 0u &&
+                vu.m_accLatestWrite[component] == write.sequence)
+                state.acc[component] = write.value[component];
+        }
+    }
+    return state;
+}
+
+namespace
+{
+    struct Vu1VerifyStats
+    {
+        uint64_t runs = 0;
+        uint64_t mismatches = 0;
+    };
+
+    template <typename T>
+    bool sameBits(const T &a, const T &b)
+    {
+        return std::memcmp(&a, &b, sizeof(T)) == 0;
+    }
+}
+
+void VU1InterpreterAccess::runVerified(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
+                                       GS &gs, PS2Memory *memory, uint32_t maxCycles)
+{
+    static std::unique_ptr<VU1Interpreter> shadow;
+    static std::vector<uint8_t> shadowData;
+    static Vu1VerifyStats stats;
+    if (!shadow)
+        shadow = std::make_unique<VU1Interpreter>(VU1Interpreter::Unit::VU1);
+    *shadow = vu;
+    shadowData.assign(vuData, vuData + dataSize);
+    const uint32_t startPc = vu.m_state.pc;
+    const uint64_t startCycle = vu.m_cycle;
+
+    Vu1PacketSink realSink;
+    realSink.forward = true;
+    packetSink = &realSink;
+    const bool realEnded = runLoop(vu, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, true);
+    Vu1PacketSink shadowSink;
+    shadowSink.forward = false;
+    packetSink = &shadowSink;
+    const bool shadowEnded = runLoop(*shadow, vuCode, codeSize, shadowData.data(), dataSize, gs, memory, maxCycles, false);
+    packetSink = nullptr;
+
+    std::string diff;
+    const auto note = [&diff](const std::string &text)
+    {
+        if (diff.size() < 1500u)
+            diff += " " + text;
+    };
+    const VU1State a = effectiveState(vu);
+    const VU1State b = effectiveState(*shadow);
+    for (uint32_t reg = 0; reg < 32u; ++reg)
+        if (!sameBits(a.vf[reg], b.vf[reg]))
+            note("vf" + std::to_string(reg));
+    for (uint32_t reg = 0; reg < 16u; ++reg)
+        if (a.vi[reg] != b.vi[reg])
+            note("vi" + std::to_string(reg) + "=" + std::to_string(a.vi[reg]) + "/" + std::to_string(b.vi[reg]));
+    if (!sameBits(a.acc, b.acc))
+        note("acc");
+    if (!sameBits(a.q, b.q))
+        note("q");
+    if (!sameBits(a.p, b.p))
+        note("p");
+    if (!sameBits(a.i, b.i))
+        note("i");
+    if (a.r != b.r)
+        note("r");
+    if (a.pc != b.pc)
+        note("pc");
+    if (a.mac != b.mac)
+        note("mac");
+    if (a.clip != b.clip)
+        note("clip");
+    if (a.status != b.status)
+        note("status");
+    if (a.ebit != b.ebit || a.haltAfterDelaySlot != b.haltAfterDelaySlot || a.stoppedByD != b.stoppedByD ||
+        a.stoppedByT != b.stoppedByT)
+        note("halt");
+    if (a.branchPending != b.branchPending || (a.branchPending && (a.branchTarget != b.branchTarget || a.branchDelay != b.branchDelay)))
+        note("branch");
+    if (realEnded != shadowEnded)
+        note("ended");
+    if (!realEnded && vu.m_cycle != shadow->m_cycle)
+        note("cycle " + std::to_string(vu.m_cycle - startCycle) + "/" + std::to_string(shadow->m_cycle - startCycle));
+    if (!sameBits(vu.m_vfReady, shadow->m_vfReady) || !sameBits(vu.m_viReady, shadow->m_viReady) ||
+        !sameBits(vu.m_accReady, shadow->m_accReady))
+        note("ready");
+    if (vu.m_efuResourceReady != shadow->m_efuResourceReady)
+        note("efuReady");
+    if (vu.m_workingClip != shadow->m_workingClip)
+        note("workingClip");
+    if (vu.m_viBranchBackupValid != shadow->m_viBranchBackupValid ||
+        (vu.m_viBranchBackupValid && (vu.m_viBranchBackupReg != shadow->m_viBranchBackupReg ||
+                                      vu.m_viBranchBackupValue != shadow->m_viBranchBackupValue)))
+        note("branchBackup");
+    if (vu.m_stopRequested != shadow->m_stopRequested)
+        note("stop");
+    const auto flagEntries = [](const VU1Interpreter &unit)
+    {
+        std::vector<std::array<uint64_t, 8>> entries;
+        for (uint32_t mask = unit.m_flagValid; mask != 0u; mask &= mask - 1u)
+        {
+            const auto &e = unit.m_flagPipeline[static_cast<size_t>(std::countr_zero(mask))];
+            entries.push_back({e.readyCycle, e.issueCycle, e.mac, e.status, e.extraSticky, e.clip,
+                               static_cast<uint64_t>(e.writesMac) | (static_cast<uint64_t>(e.writesStatus) << 1) |
+                                   (static_cast<uint64_t>(e.writesSticky) << 2) | (static_cast<uint64_t>(e.writesClip) << 3),
+                               0u});
+        }
+        std::sort(entries.begin(), entries.end());
+        return entries;
+    };
+    if (!realEnded && flagEntries(vu) != flagEntries(*shadow))
+        note("flags");
+    const auto scalarEqual = [](const auto &x, const auto &y)
+    {
+        return x.valid == y.valid && (!x.valid || (x.readyCycle == y.readyCycle && sameBits(x.value, y.value)));
+    };
+    if (!realEnded && (!scalarEqual(vu.m_fdiv, shadow->m_fdiv) || vu.m_fdiv.statusDi != shadow->m_fdiv.statusDi))
+        note("fdiv");
+    if (!realEnded && (!scalarEqual(vu.m_efu[0], shadow->m_efu[0]) || !scalarEqual(vu.m_efu[1], shadow->m_efu[1])))
+        note("efu");
+    if (vu.m_storeValid != 0u || shadow->m_storeValid != 0u)
+        note("stores");
+    const auto &xa = vu.m_xgkick;
+    const auto &xb = shadow->m_xgkick;
+    if (xa.active != xb.active || xa.sourceAddress != xb.sourceAddress || xa.totalBytes != xb.totalBytes ||
+        xa.copiedBytes != xb.copiedBytes || xa.currentTagEnd != xb.currentTagEnd || xa.cycleCredit != xb.cycleCredit ||
+        xa.issueCycle != xb.issueCycle || xa.currentTagEop != xb.currentTagEop ||
+        std::memcmp(xa.packet.data(), xb.packet.data(), std::min<size_t>(xa.copiedBytes, xa.packet.size())) != 0)
+        note("xgkick");
+    if (std::memcmp(vuData, shadowData.data(), dataSize) != 0)
+    {
+        uint32_t first = 0;
+        while (first < dataSize && vuData[first] == shadowData[first])
+            ++first;
+        char text[64];
+        std::snprintf(text, sizeof(text), "mem@%04x", first);
+        note(text);
+    }
+    if (realSink.packets != shadowSink.packets)
+        note("packets " + std::to_string(realSink.packets.size()) + "/" + std::to_string(shadowSink.packets.size()));
+
+    ++stats.runs;
+    if (!diff.empty())
+    {
+        ++stats.mismatches;
+        if (stats.mismatches <= 50u)
+        {
+            std::fprintf(stderr, "[vu1-verify] mismatch #%llu run %llu image %016llx entry %04x -> pc %04x/%04x:%s\n",
+                         static_cast<unsigned long long>(stats.mismatches), static_cast<unsigned long long>(stats.runs),
+                         static_cast<unsigned long long>(fnv1a64(vuCode, codeSize)), startPc, a.pc, b.pc, diff.c_str());
+            std::fflush(stderr);
+        }
+    }
+    if ((stats.runs & 0x3FFFu) == 0u)
+    {
+        std::fprintf(stderr, "[vu1-verify] %llu runs, %llu mismatches\n", static_cast<unsigned long long>(stats.runs),
+                     static_cast<unsigned long long>(stats.mismatches));
+        std::fflush(stderr);
+    }
 }
 
 void registerVu1CompiledProgram(uint64_t imageHash, VU1InterpreterAccess::CompiledProgram program)
 {
     vu1CompiledRegistry().programs[imageHash] = program;
-}
-
-std::string VU1InterpreterAccess::pairInitializer(const VU1Interpreter &vu, const uint8_t *vuCode, uint32_t pc, bool &reserved)
-{
-    const VU1Interpreter::DecodedInstructionPair decoded = vu.decodeInstructionPair(vuCode, pc);
-    reserved = decoded.upperUsage.reserved || decoded.lowerUsage.reserved;
-    const auto usage = [](const VU1Interpreter::InstructionUsage &u)
-    {
-        char text[512];
-        std::snprintf(text, sizeof(text),
-                      "{{{{%u, %u}, {%u, %u}}}, {%u, %u}, %u, 0x%04Xu, 0x%04Xu, %u, %u, %u, %u, %u, "
-                      "static_cast<VU1Interpreter::Pipeline>(%u), %s, %s, %s, %s, %s, %s}",
-                      u.vfRead[0].reg, u.vfRead[0].lanes, u.vfRead[1].reg, u.vfRead[1].lanes,
-                      u.vfWrite.reg, u.vfWrite.lanes, u.vfReadCount, u.viRead, u.viWrite,
-                      u.accRead, u.accWrite, u.latency, u.vfLatency, u.viLatency,
-                      static_cast<unsigned>(u.pipeline),
-                      u.waitQ ? "true" : "false", u.waitP ? "true" : "false",
-                      u.readsClip ? "true" : "false", u.writesClip ? "true" : "false",
-                      u.delaysNextBranchRead ? "true" : "false", u.reserved ? "true" : "false");
-        return std::string(text);
-    };
-    char head[64];
-    std::snprintf(head, sizeof(head), "{0x%08Xu, 0x%08Xu, ", decoded.lower, decoded.upper);
-    char tail[160];
-    std::snprintf(tail, sizeof(tail), ", %s, %s, %s, %s, %s, %u, %u}",
-                  decoded.iBit ? "true" : "false", decoded.eBit ? "true" : "false",
-                  decoded.mBit ? "true" : "false", decoded.dBit ? "true" : "false",
-                  decoded.tBit ? "true" : "false", decoded.upperVfShadowReg, decoded.suppressedLowerVf);
-    return std::string(head) + usage(decoded.lowerUsage) + ", " + usage(decoded.upperUsage) + tail;
-}
-
-VU1InterpreterAccess::StepResult VU1InterpreterAccess::stepPairOutOfLine(VU1Interpreter &vu,
-                                                                         const VU1Interpreter::DecodedInstructionPair &decoded,
-                                                                         const Vu1RunArgs &args)
-{
-    vu.commitReadyPipelines();
-    return stepPair(vu, decoded, args.vuData, args.dataSize, *args.gs, args.memory, args.codeSize, args.budgetEnd);
 }

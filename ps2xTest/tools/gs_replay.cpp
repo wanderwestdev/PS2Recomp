@@ -2,6 +2,7 @@
 #include "gs_reference_backend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_threaded_backend.h"
+#include "runtime/gs/gs_gpu_backend.h"
 #include "gs_sampler.h"
 
 #include <algorithm>
@@ -32,7 +33,224 @@ namespace
             return std::make_unique<GSCpuBackend>();
         if (name == "thread")
             return std::make_unique<GSThreadedBackend>(std::make_unique<GSCpuBackend>());
+        if (name == "gpu")
+            return std::make_unique<GSGpuBackend>();
+        if (name == "gputhread")
+            return std::make_unique<GSThreadedBackend>(std::make_unique<GSGpuBackend>());
         return nullptr;
+    }
+
+    uint32_t crc32(const uint8_t *data, size_t size, uint32_t crc = 0u)
+    {
+        static uint32_t table[256];
+        static bool ready = false;
+        if (!ready)
+        {
+            for (uint32_t i = 0; i < 256u; ++i)
+            {
+                uint32_t c = i;
+                for (int k = 0; k < 8; ++k)
+                    c = (c & 1u) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+                table[i] = c;
+            }
+            ready = true;
+        }
+        crc = ~crc;
+        for (size_t i = 0; i < size; ++i)
+            crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+        return ~crc;
+    }
+
+    bool writePng(const std::string &path, const uint8_t *rgba, uint32_t width, uint32_t height)
+    {
+        std::vector<uint8_t> raw;
+        raw.reserve(static_cast<size_t>(height) * (width * 3u + 1u));
+        for (uint32_t y = 0; y < height; ++y)
+        {
+            raw.push_back(0u);
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                const uint8_t *px = rgba + (static_cast<size_t>(y) * width + x) * 4u;
+                raw.insert(raw.end(), px, px + 3);
+            }
+        }
+        std::vector<uint8_t> z{0x78u, 0x01u};
+        uint32_t a = 1u, b = 0u;
+        for (uint8_t v : raw)
+        {
+            a = (a + v) % 65521u;
+            b = (b + a) % 65521u;
+        }
+        for (size_t offset = 0;; offset += 65535u)
+        {
+            const size_t n = std::min<size_t>(65535u, raw.size() - offset);
+            const bool last = offset + n >= raw.size();
+            z.push_back(last ? 1u : 0u);
+            z.push_back(static_cast<uint8_t>(n));
+            z.push_back(static_cast<uint8_t>(n >> 8));
+            z.push_back(static_cast<uint8_t>(~n));
+            z.push_back(static_cast<uint8_t>(~n >> 8));
+            z.insert(z.end(), raw.begin() + static_cast<std::ptrdiff_t>(offset), raw.begin() + static_cast<std::ptrdiff_t>(offset + n));
+            if (last)
+                break;
+        }
+        const uint32_t adler = (b << 16) | a;
+        for (int s = 24; s >= 0; s -= 8)
+            z.push_back(static_cast<uint8_t>(adler >> s));
+        std::FILE *file = std::fopen(path.c_str(), "wb");
+        if (!file)
+            return false;
+        const uint8_t signature[8] = {0x89u, 0x50u, 0x4Eu, 0x47u, 0x0Du, 0x0Au, 0x1Au, 0x0Au};
+        std::fwrite(signature, 1, 8, file);
+        auto chunk = [&](const char *type, const std::vector<uint8_t> &payload)
+        {
+            const uint32_t length = static_cast<uint32_t>(payload.size());
+            const uint8_t len[4] = {static_cast<uint8_t>(length >> 24), static_cast<uint8_t>(length >> 16), static_cast<uint8_t>(length >> 8),
+                                    static_cast<uint8_t>(length)};
+            std::fwrite(len, 1, 4, file);
+            std::vector<uint8_t> body(type, type + 4);
+            body.insert(body.end(), payload.begin(), payload.end());
+            std::fwrite(body.data(), 1, body.size(), file);
+            const uint32_t crc = crc32(body.data(), body.size());
+            const uint8_t c[4] = {static_cast<uint8_t>(crc >> 24), static_cast<uint8_t>(crc >> 16), static_cast<uint8_t>(crc >> 8),
+                                  static_cast<uint8_t>(crc)};
+            std::fwrite(c, 1, 4, file);
+        };
+        std::vector<uint8_t> header(13, 0u);
+        for (int i = 0; i < 4; ++i)
+        {
+            header[i] = static_cast<uint8_t>(width >> (24 - 8 * i));
+            header[4 + i] = static_cast<uint8_t>(height >> (24 - 8 * i));
+        }
+        header[8] = 8u;
+        header[9] = 2u;
+        chunk("IHDR", header);
+        chunk("IDAT", z);
+        chunk("IEND", {});
+        std::fclose(file);
+        return true;
+    }
+
+    GSPresentationRequest requestFor(const GSRecording::Checkpoint &checkpoint)
+    {
+        GSPresentationRequest request{};
+        request.pmode = checkpoint.display[0];
+        request.smode2 = checkpoint.display[1];
+        request.dispfb1 = checkpoint.display[2];
+        request.display1 = checkpoint.display[3];
+        request.dispfb2 = checkpoint.display[4];
+        request.display2 = checkpoint.display[5];
+        request.bgcolor = checkpoint.display[6];
+        request.vsyncTick = checkpoint.tick;
+        return request;
+    }
+
+    int compareBackends(const GSGolden::Recording &recording, const std::string &nameA, const std::string &nameB, const std::string &dumpDir)
+    {
+        auto backendA = makeBackend(nameA);
+        auto backendB = makeBackend(nameB);
+        if (!backendA || !backendB)
+        {
+            std::cerr << "unknown backend\n";
+            return 2;
+        }
+        std::vector<uint8_t> vramA = recording.initial.vram;
+        std::vector<uint8_t> vramB = recording.initial.vram;
+        GSRasterBackend *backends[2] = {backendA.get(), backendB.get()};
+        std::vector<uint8_t> *vrams[2] = {&vramA, &vramB};
+        double seconds[2] = {0.0, 0.0};
+        for (int i = 0; i < 2; ++i)
+        {
+            backends[i]->Initialize(vrams[i]->data(), static_cast<uint32_t>(vrams[i]->size()));
+            if (auto *access = dynamic_cast<GSBackendStateAccess *>(backends[i]))
+                access->ImportState(recording.initial.state);
+        }
+        uint32_t field = 0u;
+        for (const GSRecording::Record &record : recording.records)
+        {
+            if (record.op == GSRecording::Op::Hash)
+                continue;
+            if (record.op == GSRecording::Op::End)
+                break;
+            if (record.op != GSRecording::Op::Field)
+            {
+                for (int i = 0; i < 2; ++i)
+                {
+                    const auto start = std::chrono::steady_clock::now();
+                    GSRecording::Apply(*backends[i], record);
+                    seconds[i] += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                }
+                continue;
+            }
+            GSRecording::Checkpoint checkpoint;
+            if (!GSRecording::ParseCheckpoint(record, checkpoint))
+                continue;
+            PresentationFrame frames[2];
+            for (int i = 0; i < 2; ++i)
+            {
+                const auto start = std::chrono::steady_clock::now();
+                backends[i]->Flush();
+                backends[i]->Sync(GSSyncReason::DebugReadback);
+                frames[i] = backends[i]->Present(requestFor(checkpoint));
+                seconds[i] += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            }
+            size_t vramDiff = 0u;
+            for (size_t k = 0; k < vramA.size(); ++k)
+                vramDiff += vramA[k] != vramB[k];
+            size_t pixelDiff = 0u;
+            double absSum = 0.0;
+            int maxDiff = 0;
+            std::vector<uint8_t> diff;
+            if (frames[0].width == frames[1].width && frames[0].height == frames[1].height && frames[0])
+            {
+                const size_t count = static_cast<size_t>(frames[0].width) * frames[0].height;
+                diff.assign(count * 4u, 0u);
+                for (size_t p = 0; p < count; ++p)
+                {
+                    int worst = 0;
+                    for (int c = 0; c < 3; ++c)
+                    {
+                        const int d = std::abs(int(frames[0].pixels[p * 4u + c]) - int(frames[1].pixels[p * 4u + c]));
+                        worst = std::max(worst, d);
+                        absSum += d;
+                    }
+                    pixelDiff += worst != 0;
+                    maxDiff = std::max(maxDiff, worst);
+                    const uint8_t v = static_cast<uint8_t>(std::min(255, worst * 8));
+                    diff[p * 4u] = v;
+                    diff[p * 4u + 1u] = v;
+                    diff[p * 4u + 2u] = v;
+                    diff[p * 4u + 3u] = 255u;
+                }
+                std::printf("field %u (tick %llu): %ux%u pixels differing %zu (%.2f%%), mean abs %.3f, max %d; VRAM bytes differing %zu\n",
+                            field, static_cast<unsigned long long>(checkpoint.tick), frames[0].width, frames[0].height, pixelDiff,
+                            100.0 * static_cast<double>(pixelDiff) / static_cast<double>(count), absSum / (3.0 * static_cast<double>(count)), maxDiff,
+                            vramDiff);
+            }
+            else
+                std::printf("field %u: frame size mismatch %ux%u vs %ux%u; VRAM bytes differing %zu\n", field, frames[0].width, frames[0].height,
+                            frames[1].width, frames[1].height, vramDiff);
+            if (!dumpDir.empty())
+            {
+                const std::string base = dumpDir + "/field" + std::to_string(field);
+                if (frames[0])
+                    writePng(base + "_" + nameA + ".png", frames[0].pixels.data(), frames[0].width, frames[0].height);
+                if (frames[1])
+                    writePng(base + "_" + nameB + ".png", frames[1].pixels.data(), frames[1].width, frames[1].height);
+                if (!diff.empty())
+                    writePng(base + "_diff.png", diff.data(), frames[0].width, frames[0].height);
+            }
+            ++field;
+        }
+        std::printf("time %s %.3f s, %s %.3f s\n", nameA.c_str(), seconds[0], nameB.c_str(), seconds[1]);
+        if (auto *gpu = dynamic_cast<GSGpuBackend *>(backendB.get()))
+        {
+            const auto &s = gpu->GetStats();
+            std::printf("gpu: prims %llu batches %llu tiles %llu clut %llu flushes target %llu texture %llu other %llu\n",
+                        (unsigned long long)s.prims, (unsigned long long)s.batches, (unsigned long long)s.tiles, (unsigned long long)s.clutLoads,
+                        (unsigned long long)s.flushTarget, (unsigned long long)s.flushTexture, (unsigned long long)s.flushOther);
+        }
+        return 0;
     }
 
     void writeDraw(std::FILE *file, const GSPrimitiveBatch &batch)
@@ -235,9 +453,23 @@ int main(int argc, char **argv)
     bool doProfile = false;
     bool doSample = false;
     std::string textPath;
+    std::string compareA;
+    std::string compareB;
+    std::string dumpDir;
     for (int i = 2; i < argc; ++i)
     {
         const std::string arg = argv[i];
+        if (arg == "--compare-backends" && i + 2 < argc)
+        {
+            compareA = argv[++i];
+            compareB = argv[++i];
+            continue;
+        }
+        if (arg == "--dump" && i + 1 < argc)
+        {
+            dumpDir = argv[++i];
+            continue;
+        }
         if (arg == "--backend" && i + 1 < argc)
             backendName = argv[++i];
         else if (arg == "--repeat" && i + 1 < argc)
@@ -266,6 +498,9 @@ int main(int argc, char **argv)
 
     if (!textPath.empty())
         return writeText(recording, textPath);
+
+    if (!compareA.empty())
+        return compareBackends(recording, compareA, compareB, dumpDir);
 
     if (doProfile)
     {

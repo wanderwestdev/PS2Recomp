@@ -10,8 +10,10 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <emmintrin.h>
 #include <limits>
 #include <string>
+#include <vector>
 
 #ifndef VU1_FORCE_INLINE
 #if defined(_MSC_VER)
@@ -19,6 +21,12 @@
 #else
 #define VU1_FORCE_INLINE inline __attribute__((always_inline))
 #endif
+#endif
+
+#if defined(_MSC_VER)
+#define VU1_NOINLINE __declspec(noinline)
+#else
+#define VU1_NOINLINE __attribute__((noinline))
 #endif
 
 namespace vu1_impl
@@ -33,6 +41,14 @@ namespace vu1_impl
         const uint32_t freeMask = ~validMask & ((1u << capacity) - 1u);
         return freeMask == 0u ? -1 : std::countr_zero(freeMask);
     }
+
+    struct Vu1PacketSink
+    {
+        std::vector<std::vector<uint8_t>> packets;
+        bool forward = true;
+    };
+
+    inline thread_local Vu1PacketSink *packetSink = nullptr;
 }
 
 using namespace vu1_impl;
@@ -919,6 +935,15 @@ inline void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
+    if (Vu1PacketSink *sink = packetSink)
+    {
+        sink->packets.emplace_back(m_xgkick.packet.data(), m_xgkick.packet.data() + m_xgkick.totalBytes);
+        if (!sink->forward)
+        {
+            m_xgkick.active = false;
+            return;
+        }
+    }
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
@@ -2353,6 +2378,53 @@ struct Vu1RunArgs
     uint64_t budgetEnd = 0;
 };
 
+struct Vu1FlagRecord
+{
+    static constexpr uint32_t kMac = 1u;
+    static constexpr uint32_t kStatus = 2u;
+    static constexpr uint32_t kSticky = 4u;
+    static constexpr uint32_t kClip = 8u;
+
+    uint64_t ready = 0;
+    uint32_t mac = 0;
+    uint32_t status = 0;
+    uint32_t extra = 0;
+    uint32_t clip = 0;
+    uint32_t writes = 0;
+};
+
+struct Vu1FastCtx
+{
+    static constexpr uint32_t kFlagCapacity = 32u;
+    static constexpr uint32_t kFlagMask = kFlagCapacity - 1u;
+    static constexpr uint32_t kClipCapacity = 16u;
+    static constexpr uint32_t kClipMask = kClipCapacity - 1u;
+
+    uint64_t cycle = 0;
+    uint64_t budget = 0;
+    uint64_t xgkickDone = 0;
+    uint8_t *mem = nullptr;
+    GS *gs = nullptr;
+    PS2Memory *memory = nullptr;
+    uint32_t flagHead = 0;
+    uint32_t flagTail = 0;
+    uint32_t clipHead = 0;
+    uint32_t clipTail = 0;
+    bool stickyPending = false;
+    Vu1FlagRecord flags[kFlagCapacity];
+    Vu1FlagRecord clips[kClipCapacity];
+    float (*norm)[4] = nullptr;
+};
+
+struct Vu1NormShadow
+{
+    const void *owner = nullptr;
+    bool valid = false;
+    alignas(16) float norm[33][4];
+};
+
+inline Vu1NormShadow vu1NormShadow;
+
 struct VU1InterpreterAccess
 {
     enum class StepResult : uint8_t
@@ -2363,52 +2435,1008 @@ struct VU1InterpreterAccess
         Fallback,
     };
 
+    enum class FK : uint8_t
+    {
+        Add,
+        Sub,
+        Mul,
+        Madd,
+        Msub,
+        Opmsub,
+        Opmula,
+    };
+
     using CompiledProgram = StepResult (*)(VU1Interpreter &vu, const Vu1RunArgs &args);
-    using CompiledBlock = StepResult (*)(VU1Interpreter &vu, const Vu1RunArgs &args);
+    using FastBlock = StepResult (*)(VU1Interpreter &vu, Vu1FastCtx &ctx);
+    using Decoded = VU1Interpreter::DecodedInstructionPair;
+
+    static constexpr unsigned kPipeFmac = VU1Interpreter::PipelineFmac;
+    static constexpr unsigned kPipeLsu = VU1Interpreter::PipelineLsu;
+    static constexpr unsigned kPipeFdiv = VU1Interpreter::PipelineFdiv;
+    static constexpr unsigned kPipeEfu = VU1Interpreter::PipelineEfu;
+    static constexpr unsigned kPipeIalu = VU1Interpreter::PipelineIalu;
+    static constexpr unsigned kPipeBranch = VU1Interpreter::PipelineBranch;
+    static constexpr unsigned kPipeXgkick = VU1Interpreter::PipelineXgkick;
+    static constexpr uint32_t kFastMemSize = 0x4000u;
+    static constexpr uint32_t kFastCodeSize = 0x4000u;
 
     template <uint64_t ImageHash>
     static StepResult runImage(VU1Interpreter &vu, const Vu1RunArgs &args);
 
     template <uint64_t ImageHash, uint32_t Block>
-    static StepResult runBlock(VU1Interpreter &vu, const Vu1RunArgs &args);
+    static StepResult fastBlock(VU1Interpreter &vu, Vu1FastCtx &ctx);
 
-    static VU1Interpreter::DecodedInstructionPair decodePair(const VU1Interpreter &vu, const uint8_t *vuCode, uint32_t pc)
+    static Decoded decodePair(const VU1Interpreter &vu, const uint8_t *vuCode, uint32_t pc)
     {
         return vu.decodeInstructionPair(vuCode, pc);
     }
 
-    static std::string pairInitializer(const VU1Interpreter &vu, const uint8_t *vuCode, uint32_t pc, bool &reserved);
+    static unsigned pipeline(const VU1Interpreter::InstructionUsage &usage)
+    {
+        return static_cast<unsigned>(usage.pipeline);
+    }
 
     static uint32_t pc(const VU1Interpreter &vu)
     {
         return vu.m_state.pc;
     }
 
-    static VU1_FORCE_INLINE StepResult generatedStep(VU1Interpreter &vu,
-                                                     const VU1Interpreter::DecodedInstructionPair &decoded,
-                                                     const Vu1RunArgs &args)
+    static bool runLoop(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
+                        GS &gs, PS2Memory *memory, uint32_t maxCycles, bool allowCompiled);
+    static void runVerified(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
+                            GS &gs, PS2Memory *memory, uint32_t maxCycles);
+    static VU1State effectiveState(const VU1Interpreter &vu);
+
+    alignas(16) static constexpr uint32_t kDestMaskBits[16][4] = {
+        {0u, 0u, 0u, 0u},
+        {0u, 0u, 0u, ~0u},
+        {0u, 0u, ~0u, 0u},
+        {0u, 0u, ~0u, ~0u},
+        {0u, ~0u, 0u, 0u},
+        {0u, ~0u, 0u, ~0u},
+        {0u, ~0u, ~0u, 0u},
+        {0u, ~0u, ~0u, ~0u},
+        {~0u, 0u, 0u, 0u},
+        {~0u, 0u, 0u, ~0u},
+        {~0u, 0u, ~0u, 0u},
+        {~0u, 0u, ~0u, ~0u},
+        {~0u, ~0u, 0u, 0u},
+        {~0u, ~0u, 0u, ~0u},
+        {~0u, ~0u, ~0u, 0u},
+        {~0u, ~0u, ~0u, ~0u},
+    };
+
+    static constexpr uint8_t kRev4[16] = {0x0u, 0x8u, 0x4u, 0xCu, 0x2u, 0xAu, 0x6u, 0xEu,
+                                          0x1u, 0x9u, 0x5u, 0xDu, 0x3u, 0xBu, 0x7u, 0xFu};
+
+    static VU1_FORCE_INLINE uint64_t rmax(uint64_t a, uint64_t b)
     {
-        if (vu.m_cycle >= args.budgetEnd || vu.m_stopRequested)
-            return StepResult::Budget;
-        return stepPairOutOfLine(vu, decoded, args);
+        return a < b ? b : a;
     }
 
-    static StepResult stepPairOutOfLine(VU1Interpreter &vu,
-                                        const VU1Interpreter::DecodedInstructionPair &decoded,
-                                        const Vu1RunArgs &args);
+    static VU1_FORCE_INLINE __m128 destMask(uint32_t dest)
+    {
+        return _mm_load_ps(reinterpret_cast<const float *>(kDestMaskBits[dest]));
+    }
 
-    static StepResult runTable(VU1Interpreter &vu, const Vu1RunArgs &args, const CompiledBlock *table, uint32_t entries)
+    static VU1_FORCE_INLINE __m128 blendDest(__m128 old, __m128 value, uint32_t dest)
+    {
+        if (dest == 0xFu)
+            return value;
+        const __m128 mask = destMask(dest);
+        return _mm_or_ps(_mm_and_ps(mask, value), _mm_andnot_ps(mask, old));
+    }
+
+    static VU1_FORCE_INLINE void storeDest(float *target, __m128 value, uint32_t dest)
+    {
+        if (dest == 0xFu)
+            _mm_storeu_ps(target, value);
+        else
+            _mm_storeu_ps(target, blendDest(_mm_loadu_ps(target), value, dest));
+    }
+
+    static VU1_FORCE_INLINE __m128 vnorm(__m128 value)
+    {
+        const __m128i bits = _mm_castps_si128(value);
+        const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
+        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
+        const __m128i zero = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
+        const __m128i huge = _mm_cmpeq_epi32(exponent, _mm_set1_epi32(0x7F800000));
+        __m128i result = _mm_or_si128(_mm_andnot_si128(zero, bits), _mm_and_si128(zero, sign));
+        result = _mm_or_si128(_mm_andnot_si128(huge, result),
+                              _mm_and_si128(huge, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
+        return _mm_castsi128_ps(result);
+    }
+
+    static VU1_FORCE_INLINE __m128 vfN(VU1Interpreter &vu, uint32_t reg)
+    {
+        return vnorm(_mm_loadu_ps(vu.m_state.vf[reg]));
+    }
+
+    static VU1_FORCE_INLINE __m128 vfBc(VU1Interpreter &vu, uint32_t reg, uint32_t bc)
+    {
+        return vnorm(_mm_set1_ps(vu.m_state.vf[reg][bc]));
+    }
+
+    static VU1_FORCE_INLINE __m128 accN(VU1Interpreter &vu)
+    {
+        return vnorm(_mm_loadu_ps(vu.m_state.acc));
+    }
+
+    static VU1_FORCE_INLINE __m128 nv(Vu1FastCtx &ctx, uint32_t reg)
+    {
+        return _mm_load_ps(ctx.norm[reg]);
+    }
+
+    static VU1_FORCE_INLINE __m128 nbc(Vu1FastCtx &ctx, uint32_t reg, uint32_t bc)
+    {
+        return _mm_set1_ps(ctx.norm[reg][bc]);
+    }
+
+    static VU1_FORCE_INLINE __m128 nacc(Vu1FastCtx &ctx)
+    {
+        return _mm_load_ps(ctx.norm[32]);
+    }
+
+    static VU1_FORCE_INLINE float *rawReg(VU1Interpreter &vu, uint32_t reg)
+    {
+        return reg < 32u ? vu.m_state.vf[reg] : vu.m_state.acc;
+    }
+
+    static VU1_FORCE_INLINE void writeVf(VU1Interpreter &vu, Vu1FastCtx &ctx, uint32_t reg, __m128 raw, __m128 normalized, uint32_t dest)
+    {
+        storeDest(rawReg(vu, reg), raw, dest);
+        if (dest == 0xFu)
+            _mm_store_ps(ctx.norm[reg], normalized);
+        else
+            _mm_store_ps(ctx.norm[reg], blendDest(_mm_load_ps(ctx.norm[reg]), normalized, dest));
+    }
+
+    static VU1_FORCE_INLINE void writeVfFull(VU1Interpreter &vu, Vu1FastCtx &ctx, uint32_t reg, __m128 raw, __m128 normalized)
+    {
+        _mm_storeu_ps(rawReg(vu, reg), raw);
+        _mm_store_ps(ctx.norm[reg], normalized);
+    }
+
+    static VU1_FORCE_INLINE void resetVf0(VU1Interpreter &vu, Vu1FastCtx &ctx)
+    {
+        vu.m_state.vf[0][0] = 0.0f;
+        vu.m_state.vf[0][1] = 0.0f;
+        vu.m_state.vf[0][2] = 0.0f;
+        vu.m_state.vf[0][3] = 1.0f;
+        _mm_store_ps(ctx.norm[0], _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f));
+    }
+
+    static void syncAllNorm(VU1Interpreter &vu, Vu1FastCtx &ctx)
+    {
+        for (uint32_t reg = 0; reg < 33u; ++reg)
+            _mm_store_ps(ctx.norm[reg], vnorm(_mm_loadu_ps(rawReg(vu, reg))));
+    }
+
+    static VU1_FORCE_INLINE __m128 qN(VU1Interpreter &vu)
+    {
+        return vnorm(_mm_set1_ps(vu.m_state.q));
+    }
+
+    static VU1_FORCE_INLINE __m128 iN(VU1Interpreter &vu)
+    {
+        return vnorm(_mm_set1_ps(vu.m_state.i));
+    }
+
+    static VU1_FORCE_INLINE uint32_t maskBits(__m128d lo, __m128d hi)
+    {
+        return kRev4[static_cast<uint32_t>(_mm_movemask_pd(lo)) | (static_cast<uint32_t>(_mm_movemask_pd(hi)) << 2)];
+    }
+
+    static VU1_FORCE_INLINE void foldFlag(VU1Interpreter &vu, const Vu1FlagRecord &record)
+    {
+        if (record.writes & Vu1FlagRecord::kMac)
+            vu.m_state.mac = record.mac;
+        if (record.writes & Vu1FlagRecord::kStatus)
+        {
+            const uint32_t current = record.status & 0xFu;
+            vu.m_state.status = (vu.m_state.status & 0xFF0u) | current | ((current | record.extra) << 6);
+        }
+        if (record.writes & Vu1FlagRecord::kSticky)
+            vu.m_state.status = (vu.m_state.status & 0x03Fu) | (record.status & 0xFC0u);
+        if (record.writes & Vu1FlagRecord::kClip)
+            vu.m_state.clip = record.clip;
+    }
+
+    static VU1_FORCE_INLINE void commitDivResult(VU1Interpreter &vu)
+    {
+        vu.m_state.q = vu.m_fdiv.value;
+        const uint32_t currentDi = vu.m_fdiv.statusDi & 0x30u;
+        vu.m_state.status = (vu.m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+        vu.m_fdiv = {};
+    }
+
+    static VU1_NOINLINE void foldStatusSlow(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle)
+    {
+        while (ctx.flagHead != ctx.flagTail)
+        {
+            const Vu1FlagRecord &record = ctx.flags[ctx.flagHead & Vu1FastCtx::kFlagMask];
+            if (record.ready > cycle)
+                break;
+            if (vu.m_fdiv.valid && vu.m_fdiv.readyCycle < record.ready)
+                commitDivResult(vu);
+            foldFlag(vu, record);
+            ++ctx.flagHead;
+        }
+        if (ctx.flagHead == ctx.flagTail)
+            ctx.stickyPending = false;
+        if (vu.m_fdiv.valid && vu.m_fdiv.readyCycle <= cycle)
+            commitDivResult(vu);
+    }
+
+    static VU1_NOINLINE void foldStatus(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle)
+    {
+        if (ctx.stickyPending)
+        {
+            foldStatusSlow(vu, ctx, cycle);
+            return;
+        }
+        uint32_t head = ctx.flagHead;
+        const uint32_t start = head;
+        const uint32_t tail = ctx.flagTail;
+        uint32_t lastMac = 0u;
+        uint32_t orMac = 0u;
+        uint32_t orExtra = 0u;
+        while (head != tail)
+        {
+            const Vu1FlagRecord &record = ctx.flags[head & Vu1FastCtx::kFlagMask];
+            if (record.ready > cycle)
+                break;
+            lastMac = record.mac;
+            orMac |= record.mac;
+            orExtra |= record.extra;
+            ++head;
+        }
+        if (head != start)
+        {
+            const auto nibbles = [](uint32_t mac)
+            {
+                return ((mac & 0x000Fu) != 0u ? 1u : 0u) | ((mac & 0x00F0u) != 0u ? 2u : 0u) |
+                       ((mac & 0x0F00u) != 0u ? 4u : 0u) | ((mac & 0xF000u) != 0u ? 8u : 0u);
+            };
+            ctx.flagHead = head;
+            vu.m_state.mac = lastMac;
+            vu.m_state.status = (vu.m_state.status & 0xFF0u) | nibbles(lastMac) | ((nibbles(orMac) | orExtra) << 6);
+        }
+        if (vu.m_fdiv.valid && vu.m_fdiv.readyCycle <= cycle)
+            commitDivResult(vu);
+    }
+
+    static VU1_NOINLINE void foldClip(Vu1FastCtx &ctx, VU1Interpreter &vu, uint64_t cycle)
+    {
+        while (ctx.clipHead != ctx.clipTail)
+        {
+            const Vu1FlagRecord &record = ctx.clips[ctx.clipHead & Vu1FastCtx::kClipMask];
+            if (record.ready > cycle)
+                break;
+            if (record.writes & Vu1FlagRecord::kClip)
+                vu.m_state.clip = record.clip;
+            ++ctx.clipHead;
+        }
+    }
+
+    static VU1_FORCE_INLINE void commitStatus(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle)
+    {
+        if (ctx.flagHead != ctx.flagTail || vu.m_fdiv.valid)
+            foldStatus(vu, ctx, cycle);
+    }
+
+    static VU1_FORCE_INLINE void commitClip(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle)
+    {
+        if (ctx.clipHead != ctx.clipTail)
+            foldClip(ctx, vu, cycle);
+    }
+
+    static VU1_FORCE_INLINE void commitFlags(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle)
+    {
+        commitStatus(vu, ctx, cycle);
+        commitClip(vu, ctx, cycle);
+    }
+
+    static VU1_FORCE_INLINE void syncQ(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle)
+    {
+        if (vu.m_fdiv.valid && vu.m_fdiv.readyCycle <= cycle)
+        {
+            if (ctx.stickyPending)
+                foldStatusSlow(vu, ctx, cycle);
+            else
+                commitDivResult(vu);
+        }
+    }
+
+    static void commitEfu(VU1Interpreter &vu, uint64_t cycle)
     {
         for (;;)
         {
-            const uint32_t pc = vu.m_state.pc;
-            const uint32_t index = pc / 8u;
-            if ((pc & 7u) != 0u || index >= entries || table[index] == nullptr)
-                return StepResult::Fallback;
-            const StepResult result = table[index](vu, args);
-            if (result != StepResult::Continue)
-                return result;
+            int best = -1;
+            uint64_t bestReady = std::numeric_limits<uint64_t>::max();
+            for (int index = 0; index < 2; ++index)
+            {
+                const auto &entry = vu.m_efu[static_cast<size_t>(index)];
+                if (entry.valid && entry.readyCycle <= cycle && entry.readyCycle < bestReady)
+                {
+                    best = index;
+                    bestReady = entry.readyCycle;
+                }
+            }
+            if (best < 0)
+                return;
+            vu.m_state.p = vu.m_efu[static_cast<size_t>(best)].value;
+            vu.m_efu[static_cast<size_t>(best)] = {};
         }
+    }
+
+    static VU1_NOINLINE void makeStatusRoom(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle)
+    {
+        const uint32_t before = ctx.flagHead;
+        foldStatus(vu, ctx, cycle);
+        if (ctx.flagHead == before)
+            foldStatusSlow(vu, ctx, ctx.flags[ctx.flagHead & Vu1FastCtx::kFlagMask].ready);
+    }
+
+    static VU1_NOINLINE void makeClipRoom(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle)
+    {
+        const uint32_t before = ctx.clipHead;
+        foldClip(ctx, vu, cycle);
+        if (ctx.clipHead == before)
+            foldClip(ctx, vu, ctx.clips[ctx.clipHead & Vu1FastCtx::kClipMask].ready);
+    }
+
+    static VU1_FORCE_INLINE Vu1FlagRecord &statusPush(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle)
+    {
+        if (ctx.flagTail - ctx.flagHead == Vu1FastCtx::kFlagCapacity)
+            makeStatusRoom(vu, ctx, cycle);
+        Vu1FlagRecord &record = ctx.flags[ctx.flagTail++ & Vu1FastCtx::kFlagMask];
+        record.ready = cycle + VU1Interpreter::kFmacLatency;
+        record.mac = 0u;
+        record.status = 0u;
+        record.extra = 0u;
+        record.clip = 0u;
+        record.writes = 0u;
+        return record;
+    }
+
+    static VU1_FORCE_INLINE Vu1FlagRecord &clipPush(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle)
+    {
+        if (ctx.clipTail - ctx.clipHead == Vu1FastCtx::kClipCapacity)
+            makeClipRoom(vu, ctx, cycle);
+        Vu1FlagRecord &record = ctx.clips[ctx.clipTail++ & Vu1FastCtx::kClipMask];
+        record.ready = cycle + VU1Interpreter::kFmacLatency;
+        record.mac = 0u;
+        record.status = 0u;
+        record.extra = 0u;
+        record.clip = 0u;
+        record.writes = 0u;
+        return record;
+    }
+
+    static void loadFlags(VU1Interpreter &vu, Vu1FastCtx &ctx)
+    {
+        while (vu.m_flagValid != 0u)
+        {
+            int best = -1;
+            uint64_t bestReady = std::numeric_limits<uint64_t>::max();
+            for (uint32_t mask = vu.m_flagValid; mask != 0u; mask &= mask - 1u)
+            {
+                const int index = std::countr_zero(mask);
+                const uint64_t ready = vu.m_flagPipeline[static_cast<size_t>(index)].readyCycle;
+                if (ready < bestReady)
+                {
+                    best = index;
+                    bestReady = ready;
+                }
+            }
+            auto &entry = vu.m_flagPipeline[static_cast<size_t>(best)];
+            const uint32_t writes = (entry.writesMac ? Vu1FlagRecord::kMac : 0u) | (entry.writesStatus ? Vu1FlagRecord::kStatus : 0u) |
+                                    (entry.writesSticky ? Vu1FlagRecord::kSticky : 0u) | (entry.writesClip ? Vu1FlagRecord::kClip : 0u);
+            const bool clip = entry.writesClip || (!entry.writesMac && !entry.writesStatus && !entry.writesSticky && entry.clip != 0u);
+            Vu1FlagRecord &record = clip ? ctx.clips[ctx.clipTail++ & Vu1FastCtx::kClipMask] : ctx.flags[ctx.flagTail++ & Vu1FastCtx::kFlagMask];
+            record.ready = entry.readyCycle;
+            record.mac = entry.mac;
+            record.status = entry.status;
+            record.extra = entry.extraSticky;
+            record.clip = entry.clip;
+            record.writes = writes;
+            if (entry.writesSticky)
+                ctx.stickyPending = true;
+            entry = {};
+            vu.m_flagValid &= ~(1u << best);
+        }
+    }
+
+    static void storeFlags(VU1Interpreter &vu, Vu1FastCtx &ctx)
+    {
+        uint32_t slot = 0u;
+        while (ctx.flagHead != ctx.flagTail || ctx.clipHead != ctx.clipTail)
+        {
+            const bool takeClip = ctx.flagHead == ctx.flagTail ||
+                                  (ctx.clipHead != ctx.clipTail &&
+                                   ctx.clips[ctx.clipHead & Vu1FastCtx::kClipMask].ready < ctx.flags[ctx.flagHead & Vu1FastCtx::kFlagMask].ready);
+            const Vu1FlagRecord &record = takeClip ? ctx.clips[ctx.clipHead++ & Vu1FastCtx::kClipMask] : ctx.flags[ctx.flagHead++ & Vu1FastCtx::kFlagMask];
+            while ((vu.m_flagValid >> slot) & 1u)
+                ++slot;
+            auto &entry = vu.m_flagPipeline[slot];
+            entry = {};
+            entry.valid = true;
+            entry.readyCycle = record.ready;
+            entry.issueCycle = record.ready - VU1Interpreter::kFmacLatency;
+            entry.mac = record.mac;
+            entry.status = record.status;
+            entry.extraSticky = record.extra;
+            entry.clip = record.clip;
+            entry.writesMac = (record.writes & Vu1FlagRecord::kMac) != 0u;
+            entry.writesStatus = (record.writes & Vu1FlagRecord::kStatus) != 0u;
+            entry.writesSticky = (record.writes & Vu1FlagRecord::kSticky) != 0u;
+            entry.writesClip = (record.writes & Vu1FlagRecord::kClip) != 0u;
+            vu.m_flagValid |= 1u << slot;
+            vu.noteReadyCycle(entry.readyCycle);
+        }
+        ctx.stickyPending = false;
+    }
+
+    static VU1_FORCE_INLINE void pushFmacFlags(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t mac, uint32_t status,
+                                               uint32_t extra)
+    {
+        Vu1FlagRecord &record = statusPush(vu, ctx, cycle);
+        record.mac = mac;
+        record.status = status;
+        record.extra = extra;
+        record.writes = Vu1FlagRecord::kMac | Vu1FlagRecord::kStatus;
+    }
+
+    static VU1_FORCE_INLINE void clearSameCycle(Vu1FlagRecord *ring, uint32_t mask, uint32_t head, uint32_t tail, uint64_t cycle, uint32_t writes)
+    {
+        const uint64_t ready = cycle + VU1Interpreter::kFmacLatency;
+        for (uint32_t index = tail; index != head; --index)
+        {
+            Vu1FlagRecord &record = ring[(index - 1u) & mask];
+            if (record.ready != ready)
+                break;
+            record.writes &= ~writes;
+        }
+    }
+
+    static VU1_FORCE_INLINE void queueClipAt(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t clip)
+    {
+        vu.m_workingClip = ((vu.m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
+        Vu1FlagRecord &record = clipPush(vu, ctx, cycle);
+        record.clip = vu.m_workingClip;
+        record.writes = Vu1FlagRecord::kClip;
+    }
+
+    static VU1_FORCE_INLINE void queueFssetAt(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t immediate)
+    {
+        clearSameCycle(ctx.flags, Vu1FastCtx::kFlagMask, ctx.flagHead, ctx.flagTail, cycle, Vu1FlagRecord::kStatus);
+        Vu1FlagRecord &record = statusPush(vu, ctx, cycle);
+        record.status = immediate & 0xFC0u;
+        record.writes = Vu1FlagRecord::kSticky;
+        ctx.stickyPending = true;
+    }
+
+    static VU1_FORCE_INLINE void queueFcsetAt(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t clip)
+    {
+        vu.m_workingClip = clip & 0xFFFFFFu;
+        clearSameCycle(ctx.clips, Vu1FastCtx::kClipMask, ctx.clipHead, ctx.clipTail, cycle, Vu1FlagRecord::kClip);
+        Vu1FlagRecord &record = clipPush(vu, ctx, cycle);
+        record.clip = vu.m_workingClip;
+        record.writes = Vu1FlagRecord::kClip;
+    }
+
+    static VU1_FORCE_INLINE void queueQAt(VU1Interpreter &vu, uint64_t cycle, float value, uint32_t latency, uint32_t statusDi)
+    {
+        uint32_t ignoredFlags = 0u;
+        value = vu.normalizeResult(value, ignoredFlags);
+        vu.m_fdiv.valid = true;
+        vu.m_fdiv.readyCycle = cycle + latency;
+        vu.m_fdiv.value = value;
+        vu.m_fdiv.statusDi = statusDi & 0x30u;
+        vu.noteReadyCycle(vu.m_fdiv.readyCycle);
+    }
+
+    template <FK K>
+    static VU1_NOINLINE __m128 fmacExact(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t dest, __m128 s, __m128 t, __m128 a,
+                                         __m128 result, __m128 &normalized)
+    {
+        constexpr bool cross = K == FK::Opmsub || K == FK::Opmula;
+        constexpr bool productSum = K == FK::Madd || K == FK::Msub || K == FK::Opmsub;
+        constexpr bool usesAcc = K == FK::Madd || K == FK::Msub || K == FK::Opmsub;
+        const __m128d sLo = _mm_cvtps_pd(s);
+        const __m128d sHi = _mm_cvtps_pd(_mm_movehl_ps(s, s));
+        const __m128d tLo = _mm_cvtps_pd(t);
+        const __m128d tHi = _mm_cvtps_pd(_mm_movehl_ps(t, t));
+        __m128d eLo;
+        __m128d eHi;
+        __m128d pLo = _mm_setzero_pd();
+        __m128d pHi = _mm_setzero_pd();
+        if constexpr (K == FK::Add)
+        {
+            eLo = _mm_add_pd(sLo, tLo);
+            eHi = _mm_add_pd(sHi, tHi);
+        }
+        else if constexpr (K == FK::Sub)
+        {
+            eLo = _mm_sub_pd(sLo, tLo);
+            eHi = _mm_sub_pd(sHi, tHi);
+        }
+        else
+        {
+            pLo = _mm_mul_pd(sLo, tLo);
+            pHi = _mm_mul_pd(sHi, tHi);
+            if constexpr (usesAcc)
+            {
+                const __m128d aLo = _mm_cvtps_pd(a);
+                const __m128d aHi = _mm_cvtps_pd(_mm_movehl_ps(a, a));
+                if constexpr (K == FK::Madd)
+                {
+                    eLo = _mm_add_pd(aLo, pLo);
+                    eHi = _mm_add_pd(aHi, pHi);
+                }
+                else
+                {
+                    eLo = _mm_sub_pd(aLo, pLo);
+                    eHi = _mm_sub_pd(aHi, pHi);
+                }
+            }
+            else
+            {
+                eLo = pLo;
+                eHi = pHi;
+            }
+        }
+        if constexpr (cross)
+            eHi = _mm_unpacklo_pd(eHi, _mm_setzero_pd());
+
+        const __m128d absMask = _mm_castsi128_pd(_mm_set1_epi64x(0x7FFFFFFFFFFFFFFFll));
+        const __m128d maxD = _mm_set1_pd(static_cast<double>(std::numeric_limits<float>::max()));
+        const __m128d minD = _mm_set1_pd(static_cast<double>(std::numeric_limits<float>::min()));
+        const __m128d aLo = _mm_and_pd(eLo, absMask);
+        const __m128d aHi = _mm_and_pd(eHi, absMask);
+        const __m128d zLo = _mm_cmpeq_pd(aLo, _mm_setzero_pd());
+        const __m128d zHi = _mm_cmpeq_pd(aHi, _mm_setzero_pd());
+        const __m128d oLo = _mm_cmpgt_pd(aLo, maxD);
+        const __m128d oHi = _mm_cmpgt_pd(aHi, maxD);
+        const __m128d smLo = _mm_cmplt_pd(aLo, minD);
+        const __m128d smHi = _mm_cmplt_pd(aHi, minD);
+
+        const __m128 smallF = _mm_shuffle_ps(_mm_castpd_ps(smLo), _mm_castpd_ps(smHi), _MM_SHUFFLE(2, 0, 2, 0));
+        const __m128 overF = _mm_shuffle_ps(_mm_castpd_ps(oLo), _mm_castpd_ps(oHi), _MM_SHUFFLE(2, 0, 2, 0));
+        const __m128 signF = _mm_and_ps(_mm_shuffle_ps(_mm_castpd_ps(eLo), _mm_castpd_ps(eHi), _MM_SHUFFLE(3, 1, 3, 1)),
+                                        _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u))));
+        result = _mm_or_ps(_mm_andnot_ps(smallF, result), _mm_and_ps(smallF, signF));
+        result = _mm_or_ps(_mm_andnot_ps(overF, result),
+                           _mm_and_ps(overF, _mm_or_ps(signF, _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF)))));
+
+        if (dest != 0u)
+        {
+            const uint32_t zeroBits = maskBits(zLo, zHi);
+            const uint32_t smallBits = maskBits(smLo, smHi) & dest;
+            const uint32_t signBits = maskBits(eLo, eHi) & dest;
+            const uint32_t underBits = smallBits & ~zeroBits;
+            const uint32_t overBits = maskBits(oLo, oHi) & dest;
+            const uint32_t mac = smallBits | (signBits << 4) | (underBits << 8) | (overBits << 12);
+            const uint32_t status = (smallBits ? 1u : 0u) | (signBits ? 2u : 0u) | (underBits ? 4u : 0u) | (overBits ? 8u : 0u);
+            uint32_t extra = 0u;
+            if constexpr (productSum)
+            {
+                const __m128d paLo = _mm_and_pd(pLo, absMask);
+                const __m128d paHi = _mm_and_pd(pHi, absMask);
+                const uint32_t pZero = maskBits(_mm_cmpeq_pd(paLo, _mm_setzero_pd()), _mm_cmpeq_pd(paHi, _mm_setzero_pd()));
+                const uint32_t pSmall = maskBits(_mm_cmplt_pd(paLo, minD), _mm_cmplt_pd(paHi, minD)) & dest;
+                const uint32_t pSign = maskBits(pLo, pHi) & dest;
+                const uint32_t pOver = maskBits(_mm_cmpgt_pd(paLo, maxD), _mm_cmpgt_pd(paHi, maxD)) & dest;
+                extra = (pSmall ? 1u : 0u) | (pSign ? 2u : 0u) | ((pSmall & ~pZero) ? 4u : 0u) | (pOver ? 8u : 0u);
+            }
+            pushFmacFlags(vu, ctx, cycle, mac, status, extra);
+        }
+        normalized = vnorm(result);
+        return result;
+    }
+
+    template <FK K>
+    static VU1_FORCE_INLINE __m128 fmac(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t dest, __m128 s, __m128 t, __m128 a,
+                                        __m128 &normalized)
+    {
+        constexpr bool cross = K == FK::Opmsub || K == FK::Opmula;
+        constexpr bool productSum = K == FK::Madd || K == FK::Msub || K == FK::Opmsub;
+        if constexpr (cross)
+        {
+            s = _mm_shuffle_ps(s, s, _MM_SHUFFLE(3, 0, 2, 1));
+            t = _mm_shuffle_ps(t, t, _MM_SHUFFLE(3, 1, 0, 2));
+        }
+
+        __m128 result;
+        __m128 product = _mm_setzero_ps();
+        if constexpr (K == FK::Add)
+            result = _mm_add_ps(s, t);
+        else if constexpr (K == FK::Sub)
+            result = _mm_sub_ps(s, t);
+        else
+        {
+            product = _mm_mul_ps(s, t);
+            if constexpr (K == FK::Mul || K == FK::Opmula)
+                result = product;
+            else if constexpr (K == FK::Madd)
+                result = _mm_add_ps(a, product);
+            else
+                result = _mm_sub_ps(a, product);
+        }
+        if constexpr (cross)
+            result = _mm_and_ps(result, destMask(0xEu));
+
+        const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+        const __m128 absResult = _mm_and_ps(result, absMask);
+        __m128 safe = _mm_and_ps(_mm_cmpge_ps(absResult, _mm_set1_ps(4.0f * std::numeric_limits<float>::min())),
+                                 _mm_cmplt_ps(absResult, _mm_set1_ps(0.5f * std::numeric_limits<float>::max())));
+        if constexpr (productSum)
+        {
+            const __m128 absProduct = _mm_and_ps(product, absMask);
+            safe = _mm_and_ps(safe, _mm_cmpgt_ps(absResult, _mm_mul_ps(absProduct, _mm_set1_ps(1.0f / 2097152.0f))));
+            safe = _mm_and_ps(safe, _mm_and_ps(_mm_cmpge_ps(absProduct, _mm_set1_ps(std::numeric_limits<float>::min())),
+                                               _mm_cmplt_ps(absProduct, _mm_set1_ps(std::numeric_limits<float>::max()))));
+        }
+        const uint32_t destLanes = kRev4[dest];
+        if ((static_cast<uint32_t>(_mm_movemask_ps(safe)) & destLanes) != destLanes)
+            return fmacExact<K>(vu, ctx, cycle, dest, s, t, a, result, normalized);
+        if (dest != 0u)
+        {
+            const uint32_t sign = kRev4[_mm_movemask_ps(result)] & dest;
+            uint32_t extra = 0u;
+            if constexpr (productSum)
+                extra = (static_cast<uint32_t>(_mm_movemask_ps(product)) & destLanes) != 0u ? 2u : 0u;
+            pushFmacFlags(vu, ctx, cycle, sign << 4, sign != 0u ? 2u : 0u, extra);
+        }
+        normalized = result;
+        return result;
+    }
+
+    template <uint32_t Shift>
+    static VU1_FORCE_INLINE __m128 itof(__m128 raw)
+    {
+        const __m128 value = _mm_cvtepi32_ps(_mm_castps_si128(raw));
+        if constexpr (Shift == 0u)
+            return value;
+        else
+            return _mm_div_ps(value, _mm_set1_ps(static_cast<float>(1u << Shift)));
+    }
+
+    template <uint32_t Shift>
+    static VU1_FORCE_INLINE __m128 ftoi(__m128 normalized)
+    {
+        __m128 scaled = normalized;
+        if constexpr (Shift != 0u)
+            scaled = _mm_mul_ps(normalized, _mm_set1_ps(static_cast<float>(1u << Shift)));
+        const __m128i truncated = _mm_cvttps_epi32(scaled);
+        const __m128i big = _mm_castps_si128(_mm_cmpge_ps(scaled, _mm_set1_ps(2147483648.0f)));
+        return _mm_castsi128_ps(_mm_or_si128(_mm_andnot_si128(big, truncated), _mm_and_si128(big, _mm_set1_epi32(0x7FFFFFFF))));
+    }
+
+    static VU1_FORCE_INLINE __m128 absN(__m128 normalized)
+    {
+        return _mm_andnot_ps(_mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u))), normalized);
+    }
+
+    static VU1_FORCE_INLINE void clipOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t fs, uint32_t ft)
+    {
+        uint32_t wBits = 0u;
+        std::memcpy(&wBits, &vu.m_state.vf[ft][3], sizeof(wBits));
+        const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
+        uint32_t flags = 0u;
+        for (uint32_t component = 0; component < 3u; ++component)
+        {
+            uint32_t bits = 0u;
+            std::memcpy(&bits, &vu.m_state.vf[fs][component], sizeof(bits));
+            if (static_cast<int32_t>(bits) > limit)
+                flags |= 1u << (component * 2u);
+            if (static_cast<int32_t>(bits ^ 0x80000000u) > limit)
+                flags |= 2u << (component * 2u);
+        }
+        queueClipAt(vu, ctx, cycle, flags);
+    }
+
+    static VU1_FORCE_INLINE uint32_t qaddr(int32_t base, int32_t imm)
+    {
+        return (static_cast<uint32_t>(base + imm) * 16u) & (kFastMemSize - 1u);
+    }
+
+    static VU1_FORCE_INLINE __m128 ldq(const uint8_t *mem, uint32_t address)
+    {
+        return _mm_loadu_ps(reinterpret_cast<const float *>(mem + address));
+    }
+
+    static VU1_FORCE_INLINE uint32_t ldw(const uint8_t *mem, uint32_t address)
+    {
+        uint32_t value = 0u;
+        std::memcpy(&value, mem + address, sizeof(value));
+        return value;
+    }
+
+    static void xgkickAdvance(VU1Interpreter &vu, uint64_t cycles)
+    {
+        auto &x = vu.m_xgkick;
+        if (!x.active || cycles == 0u || !vu.m_activeVuData || vu.m_activeVuDataSize == 0u)
+            return;
+        const uint64_t total = x.cycleCredit + cycles;
+        uint64_t copies = total / 2u;
+        const uint32_t remainder = static_cast<uint32_t>(total % 2u);
+        const uint32_t size = vu.m_activeVuDataSize;
+        while (copies > 0u && x.active)
+        {
+            const uint64_t inTag = x.currentTagEnd > x.copiedBytes ? (x.currentTagEnd - x.copiedBytes) / 16u : 0u;
+            if (x.currentTagEnd == 0u || inTag <= 1u || x.copiedBytes > VU1Interpreter::XgkickPipeline::kBufferSize - 16u)
+            {
+                x.cycleCredit = 1u;
+                vu.progressXgkick();
+                --copies;
+                continue;
+            }
+            uint32_t bulk = static_cast<uint32_t>(std::min<uint64_t>(copies, inTag - 1u)) * 16u;
+            copies -= bulk / 16u;
+            while (bulk != 0u)
+            {
+                const uint32_t source = (x.sourceAddress + x.copiedBytes) % size;
+                const uint32_t chunk = std::min(bulk, size - source);
+                std::memcpy(x.packet.data() + x.copiedBytes, vu.m_activeVuData + source, chunk);
+                x.copiedBytes += chunk;
+                bulk -= chunk;
+            }
+        }
+        if (x.active)
+            x.cycleCredit = remainder;
+    }
+
+    static VU1_FORCE_INLINE void xgkickSync(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle)
+    {
+        if (vu.m_xgkick.active && cycle > ctx.xgkickDone)
+            xgkickAdvance(vu, cycle - ctx.xgkickDone);
+        ctx.xgkickDone = cycle;
+    }
+
+    static VU1_FORCE_INLINE void stq(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t address, __m128 value, uint32_t dest)
+    {
+        xgkickSync(vu, ctx, cycle);
+        storeDest(reinterpret_cast<float *>(ctx.mem + address), value, dest);
+    }
+
+    static VU1_FORCE_INLINE void stw(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t address, int32_t vi, uint32_t dest)
+    {
+        stq(vu, ctx, cycle, address, _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(static_cast<uint16_t>(vi & 0xFFFF)))), dest);
+    }
+
+    static uint64_t xgkickRun(VU1Interpreter &vu, uint64_t maxCycles)
+    {
+        const uint32_t credit = vu.m_xgkick.cycleCredit;
+        const uint32_t copiedBefore = vu.m_xgkick.copiedBytes;
+        xgkickAdvance(vu, maxCycles);
+        if (vu.m_xgkick.active)
+            return maxCycles;
+        const uint64_t copies = (vu.m_xgkick.copiedBytes - copiedBefore) / 16u;
+        return copies == 0u ? 0u : 2u * copies - credit;
+    }
+
+    static bool xgkickStall(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t &cycle, uint64_t regReady, uint64_t budget)
+    {
+        xgkickSync(vu, ctx, cycle);
+        uint64_t finish = cycle;
+        if (vu.m_xgkick.active)
+        {
+            const uint64_t used = xgkickRun(vu, budget > cycle ? budget - cycle : 0u);
+            if (vu.m_xgkick.active)
+            {
+                ctx.xgkickDone = budget;
+                cycle = budget;
+                return false;
+            }
+            finish = cycle + used;
+            ctx.xgkickDone = finish;
+        }
+        const uint64_t target = rmax(regReady, finish);
+        if (target <= cycle)
+            return true;
+        if (target >= budget)
+        {
+            xgkickSync(vu, ctx, budget);
+            cycle = budget;
+            return false;
+        }
+        xgkickSync(vu, ctx, target);
+        cycle = target;
+        return true;
+    }
+
+    static VU1_FORCE_INLINE void xgkickStart(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, int32_t vi)
+    {
+        vu.m_cycle = cycle;
+        vu.startXgkick(static_cast<uint32_t>(static_cast<uint16_t>(vi)));
+        ctx.xgkickDone = cycle;
+    }
+
+    static VU1_FORCE_INLINE void divOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t fs, uint32_t fsf, uint32_t ft, uint32_t ftf)
+    {
+        syncQ(vu, ctx, cycle);
+        const float num = vu.normalizeOperand(vu.m_state.vf[fs][fsf]);
+        const float den = vu.normalizeOperand(vu.m_state.vf[ft][ftf]);
+        uint32_t statusDi = 0u;
+        float result = 0.0f;
+        if (den == 0.0f)
+        {
+            statusDi = num == 0.0f ? 0x10u : 0x20u;
+            result = std::signbit(num) != std::signbit(den)
+                         ? -std::numeric_limits<float>::max()
+                         : std::numeric_limits<float>::max();
+        }
+        else
+        {
+            result = num / den;
+        }
+        uint32_t ignoredFlags = 0u;
+        result = vu.normalizeResult(result, ignoredFlags);
+        queueQAt(vu, cycle, result, 7u, statusDi);
+    }
+
+    static VU1_FORCE_INLINE void sqrtOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t ft, uint32_t ftf)
+    {
+        syncQ(vu, ctx, cycle);
+        const float val = vu.normalizeOperand(vu.m_state.vf[ft][ftf]);
+        queueQAt(vu, cycle, std::sqrt(std::fabs(val)), 7u, val < 0.0f ? 0x10u : 0u);
+    }
+
+    static VU1_FORCE_INLINE void rsqrtOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t fs, uint32_t fsf, uint32_t ft, uint32_t ftf)
+    {
+        syncQ(vu, ctx, cycle);
+        const float num = vu.normalizeOperand(vu.m_state.vf[fs][fsf]);
+        const float radicand = vu.normalizeOperand(vu.m_state.vf[ft][ftf]);
+        const float den = std::sqrt(std::fabs(radicand));
+        uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
+        float result = 0.0f;
+        if (den != 0.0f)
+            result = num / den;
+        else
+        {
+            statusDi = num == 0.0f ? 0x10u : 0x20u;
+            result = std::signbit(num)
+                         ? -std::numeric_limits<float>::max()
+                         : std::numeric_limits<float>::max();
+        }
+        uint32_t ignoredFlags = 0u;
+        result = vu.normalizeResult(result, ignoredFlags);
+        queueQAt(vu, cycle, result, 13u, statusDi);
+    }
+
+    static void genericUpper(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t upper)
+    {
+        vu.m_cycle = cycle;
+        commitFlags(vu, ctx, cycle);
+        storeFlags(vu, ctx);
+        vu.execUpper(upper);
+        loadFlags(vu, ctx);
+    }
+
+    static void genericLower(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t lower, uint32_t upper)
+    {
+        vu.m_cycle = cycle;
+        commitFlags(vu, ctx, cycle);
+        storeFlags(vu, ctx);
+        commitEfu(vu, cycle);
+        xgkickSync(vu, ctx, cycle);
+        vu.execLower(lower, ctx.mem, kFastMemSize, *ctx.gs, ctx.memory, upper);
+        for (uint32_t mask = vu.m_storeValid; mask != 0u; mask &= mask - 1u)
+        {
+            const uint32_t index = static_cast<uint32_t>(std::countr_zero(mask));
+            auto &store = vu.m_storePipeline[index];
+            uint32_t words[4]{};
+            std::memcpy(words, ctx.mem + store.address, sizeof(words));
+            for (uint32_t component = 0; component < 4u; ++component)
+            {
+                if ((store.laneMask & laneForComponent(component)) != 0u)
+                    words[component] = store.words[component];
+            }
+            std::memcpy(ctx.mem + store.address, words, sizeof(words));
+            store = {};
+        }
+        vu.m_storeValid = 0u;
+        if (vu.m_xgkick.active && vu.m_xgkick.issueCycle == cycle)
+            ctx.xgkickDone = cycle;
+        loadFlags(vu, ctx);
+    }
+
+    static void materializeWrites(VU1Interpreter &vu)
+    {
+        for (uint32_t mask = vu.m_vfWriteValid; mask != 0u; mask &= mask - 1u)
+        {
+            auto &write = vu.m_vfWritePipeline[static_cast<size_t>(std::countr_zero(mask))];
+            for (uint32_t component = 0; component < 4u; ++component)
+            {
+                if ((write.laneMask & laneForComponent(component)) != 0u &&
+                    vu.m_vfLatestWrite[write.reg][component] == write.sequence)
+                    vu.m_state.vf[write.reg][component] = write.value[component];
+            }
+            write.valid = false;
+        }
+        vu.m_vfWriteValid = 0u;
+        for (uint32_t mask = vu.m_viWriteValid; mask != 0u; mask &= mask - 1u)
+        {
+            auto &write = vu.m_viWritePipeline[static_cast<size_t>(std::countr_zero(mask))];
+            if (vu.m_viLatestWrite[write.reg] == write.sequence)
+                vu.m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+            write.valid = false;
+        }
+        vu.m_viWriteValid = 0u;
+        for (uint32_t mask = vu.m_accWriteValid; mask != 0u; mask &= mask - 1u)
+        {
+            auto &write = vu.m_accWritePipeline[static_cast<size_t>(std::countr_zero(mask))];
+            for (uint32_t component = 0; component < 4u; ++component)
+            {
+                if ((write.laneMask & laneForComponent(component)) != 0u &&
+                    vu.m_accLatestWrite[component] == write.sequence)
+                    vu.m_state.acc[component] = write.value[component];
+            }
+            write.valid = false;
+        }
+        vu.m_accWriteValid = 0u;
+    }
+
+    static StepResult runFast(VU1Interpreter &vu, const Vu1RunArgs &args, const FastBlock *table, uint32_t entries)
+    {
+        if (vu.m_state.branchPending || vu.m_state.ebit || vu.m_state.haltAfterDelaySlot || vu.m_stopRequested ||
+            args.dataSize != kFastMemSize || args.codeSize != kFastCodeSize || !args.vuData || vu.m_storeValid != 0u)
+            return StepResult::Fallback;
+        materializeWrites(vu);
+        Vu1FastCtx ctx;
+        ctx.norm = vu1NormShadow.norm;
+        if (!vu1NormShadow.valid || vu1NormShadow.owner != &vu)
+        {
+            syncAllNorm(vu, ctx);
+            vu1NormShadow.owner = &vu;
+            vu1NormShadow.valid = true;
+        }
+        ctx.cycle = vu.m_cycle;
+        ctx.budget = args.budgetEnd;
+        ctx.xgkickDone = vu.m_cycle;
+        ctx.mem = args.vuData;
+        ctx.gs = args.gs;
+        ctx.memory = args.memory;
+        loadFlags(vu, ctx);
+        StepResult result = StepResult::Fallback;
+        for (;;)
+        {
+            const uint32_t pc = vu.m_state.pc;
+            const uint32_t index = pc >> 3;
+            if ((pc & 7u) != 0u || index >= entries || table[index] == nullptr)
+            {
+                result = StepResult::Fallback;
+                break;
+            }
+            result = table[index](vu, ctx);
+            if (result != StepResult::Continue)
+                break;
+            if (vu.m_stopRequested)
+            {
+                result = StepResult::Budget;
+                break;
+            }
+        }
+        xgkickSync(vu, ctx, ctx.cycle);
+        if (result == StepResult::Ended)
+        {
+            constexpr uint64_t kAll = std::numeric_limits<uint64_t>::max() / 2u;
+            xgkickAdvance(vu, kAll);
+            commitFlags(vu, ctx, kAll);
+            commitEfu(vu, kAll);
+        }
+        else
+        {
+            commitFlags(vu, ctx, ctx.cycle);
+            commitEfu(vu, ctx.cycle);
+        }
+        storeFlags(vu, ctx);
+        vu.m_cycle = ctx.cycle;
+        vu.m_state.cycles = ctx.cycle;
+        return result;
     }
 
     static VU1_FORCE_INLINE StepResult stepPair(VU1Interpreter &vu,

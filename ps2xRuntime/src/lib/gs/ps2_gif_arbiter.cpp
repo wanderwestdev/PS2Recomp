@@ -2,6 +2,11 @@
 #include <algorithm>
 #include <cstring>
 
+namespace
+{
+    thread_local std::vector<std::vector<uint8_t>> s_packetPool;
+}
+
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
 {
@@ -27,8 +32,12 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
+    if (!s_packetPool.empty())
+    {
+        pkt.data = std::move(s_packetPool.back());
+        s_packetPool.pop_back();
+    }
+    pkt.data.assign(data, data + sizeBytes);
     m_queue.push_back(std::move(pkt));
 }
 
@@ -58,6 +67,11 @@ void GifArbiter::drain()
         {
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
+    }
+    for (GifArbiterPacket &pkt : m_queue)
+    {
+        if (s_packetPool.size() < 64u && pkt.data.capacity() != 0u)
+            s_packetPool.push_back(std::move(pkt.data));
     }
     m_queue.clear();
 }

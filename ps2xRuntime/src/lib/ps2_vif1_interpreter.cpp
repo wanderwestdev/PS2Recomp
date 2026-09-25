@@ -569,7 +569,84 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
-            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes && !maskEnable && cl >= wl && (vl != 3u || vn == 3u))
+            {
+                const uint8_t *srcBase = data + pos;
+                const uint32_t mode = vif1_regs.mode & 3u;
+                const bool add = (vl != 3u || vn != 3u) && (mode == 1u || mode == 2u);
+                const uint32_t limit = components > 4 ? 4u : static_cast<uint32_t>(components);
+                uint32_t firstWrite = 0u;
+                if (vl == 0u && components == 4 && !add && cl == wl)
+                {
+                    const uint32_t first = std::min(writeVectorCount, 0x400u - vuAddr);
+                    std::memcpy(m_vu1Data + vuAddr * 16u, srcBase, first * 16u);
+                    if (first < writeVectorCount)
+                        std::memcpy(m_vu1Data, srcBase + first * 16u, (writeVectorCount - first) * 16u);
+                    firstWrite = writeVectorCount;
+                }
+                for (uint32_t writeIndex = firstWrite; writeIndex < writeVectorCount; ++writeIndex)
+                {
+                    const uint32_t destVec = (vuAddr + (writeIndex / wl) * cl + writeIndex % wl) & 0x3FFu;
+                    uint8_t *dst = m_vu1Data + destVec * 16u;
+                    const uint8_t *srcVec = srcBase + writeIndex * bytesPerVector;
+                    uint32_t v[4];
+                    if (vl == 0u && components == 4)
+                        std::memcpy(v, srcVec, sizeof(v));
+                    else
+                    {
+                        std::memcpy(v, dst, sizeof(v));
+                        if (vl == 0u)
+                        {
+                            if (components == 1)
+                            {
+                                uint32_t scalar;
+                                std::memcpy(&scalar, srcVec, sizeof(scalar));
+                                v[0] = v[1] = v[2] = v[3] = scalar;
+                            }
+                            else
+                                std::memcpy(v, srcVec, limit * 4u);
+                        }
+                        else if (vl == 1u)
+                        {
+                            for (uint32_t c = 0; c < (components == 1 ? 1u : limit); ++c)
+                            {
+                                uint16_t raw;
+                                std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
+                                v[c] = zeroExtend ? static_cast<uint32_t>(raw) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+                            }
+                            if (components == 1)
+                                v[1] = v[2] = v[3] = v[0];
+                        }
+                        else if (vl == 2u)
+                        {
+                            for (uint32_t c = 0; c < (components == 1 ? 1u : limit); ++c)
+                                v[c] = zeroExtend ? static_cast<uint32_t>(srcVec[c]) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(srcVec[c])));
+                            if (components == 1)
+                                v[1] = v[2] = v[3] = v[0];
+                        }
+                        else
+                        {
+                            uint16_t packed;
+                            std::memcpy(&packed, srcVec, sizeof(packed));
+                            v[0] = packed & 0x1Fu;
+                            v[1] = (packed >> 5) & 0x1Fu;
+                            v[2] = (packed >> 10) & 0x1Fu;
+                            v[3] = (packed >> 15) & 0x01u;
+                        }
+                    }
+                    if (add)
+                    {
+                        for (uint32_t c = 0; c < 4u; ++c)
+                        {
+                            v[c] += vif1_regs.row[c];
+                            if (mode == 2u)
+                                vif1_regs.row[c] = v[c];
+                        }
+                    }
+                    std::memcpy(dst, v, sizeof(v));
+                }
+            }
+            else if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;

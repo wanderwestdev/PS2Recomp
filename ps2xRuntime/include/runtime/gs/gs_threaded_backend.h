@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -19,6 +20,7 @@ public:
 
     static std::unique_ptr<GSRasterBackend> MakeDefault();
     static void SetEnabledByDefault(bool enabled);
+    static void SetGpuByDefault(bool enabled);
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
@@ -58,11 +60,13 @@ private:
         TextureFlush,
         WriteVram,
         Sync,
+        Call,
     };
 
     void Enqueue(Op op, const void *payload, uint32_t size);
     void PublishLocked();
     void Drain() const;
+    void RunOnWorker(const std::function<void()> &function) const;
     void WorkerLoop();
     void Execute(const std::vector<uint8_t> &chunk);
 

@@ -328,6 +328,11 @@ public:
         return m_transferPending;
     }
 
+    [[nodiscard]] bool unwinding() const noexcept
+    {
+        return m_unwinding;
+    }
+
     int createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option);
     int deleteSemaphore(int id, bool interruptSafe);
     int signalSemaphore(int id, bool interruptSafe);
@@ -464,6 +469,7 @@ private:
     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
     int m_currentThreadId = 0;
     bool m_rescheduleRequested = false;
+    bool m_unwinding = false;
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
     bool m_deferTransfers = false;

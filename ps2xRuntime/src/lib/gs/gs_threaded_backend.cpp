@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_threaded_backend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_gpu_backend.h"
 #include "ThreadNaming.h"
 
 #include <atomic>
@@ -12,6 +13,17 @@ namespace
     constexpr size_t kPublishBytes = 64u * 1024u;
     constexpr size_t kMaxPendingChunks = 256u;
     std::atomic<bool> s_enabledByDefault{false};
+    std::atomic<bool> s_gpuByDefault{false};
+
+    bool discardDraws()
+    {
+        static const bool discard = []
+        {
+            const char *value = std::getenv("PS2X_GS_DISCARD_DRAWS");
+            return value && *value && *value != '0';
+        }();
+        return discard;
+    }
 
     struct LoadClutArgs
     {
@@ -62,6 +74,10 @@ std::unique_ptr<GSRasterBackend> GSThreadedBackend::MakeDefault()
 {
     const char *value = std::getenv("PS2X_GS_THREAD");
     const bool enabled = (value && *value) ? *value != '0' : s_enabledByDefault.load();
+    const char *gpu = std::getenv("PS2X_GS_GPU");
+    const bool useGpu = (gpu && *gpu) ? *gpu != '0' : s_gpuByDefault.load();
+    if (useGpu)
+        return std::make_unique<GSThreadedBackend>(std::make_unique<GSGpuBackend>());
     if (!enabled)
         return std::make_unique<GSCpuBackend>();
     return std::make_unique<GSThreadedBackend>(std::make_unique<GSCpuBackend>());
@@ -70,6 +86,11 @@ std::unique_ptr<GSRasterBackend> GSThreadedBackend::MakeDefault()
 void GSThreadedBackend::SetEnabledByDefault(bool enabled)
 {
     s_enabledByDefault.store(enabled);
+}
+
+void GSThreadedBackend::SetGpuByDefault(bool enabled)
+{
+    s_gpuByDefault.store(enabled);
 }
 
 void GSThreadedBackend::Enqueue(Op op, const void *payload, uint32_t size)
@@ -154,7 +175,7 @@ void GSThreadedBackend::WorkerLoop()
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
             ++m_completed;
-            if (m_spare.size() < 8u)
+            if (m_spare.size() < 64u)
                 m_spare.push_back(std::move(chunk));
         }
         m_doneCv.notify_all();
@@ -178,7 +199,8 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk)
             _mm_setcsr(readAt<uint32_t>(payload));
             break;
         case Op::Submit:
-            m_inner->Submit(readAt<GSPrimitiveBatch>(payload));
+            if (!discardDraws())
+                m_inner->Submit(readAt<GSPrimitiveBatch>(payload));
             break;
         case Op::LoadClut:
         {
@@ -204,22 +226,29 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk)
         case Op::Sync:
             m_inner->Sync(readAt<GSSyncReason>(payload));
             break;
+        case Op::Call:
+            (*readAt<const std::function<void()> *>(payload))();
+            break;
         }
     }
 }
 
+void GSThreadedBackend::RunOnWorker(const std::function<void()> &function) const
+{
+    auto *self = const_cast<GSThreadedBackend *>(this);
+    const std::function<void()> *pointer = &function;
+    self->Enqueue(Op::Call, &pointer, sizeof(pointer));
+    Drain();
+}
+
 void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 {
-    Drain();
-    std::lock_guard<std::mutex> exec(m_execMutex);
-    m_inner->Initialize(vram, vramSize);
+    RunOnWorker([&] { m_inner->Initialize(vram, vramSize); });
 }
 
 void GSThreadedBackend::Reset()
 {
-    Drain();
-    std::lock_guard<std::mutex> exec(m_execMutex);
-    m_inner->Reset();
+    RunOnWorker([&] { m_inner->Reset(); });
 }
 
 void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
@@ -245,8 +274,6 @@ void GSThreadedBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 
 void GSThreadedBackend::Flush()
 {
-    std::lock_guard<std::mutex> lock(m_producerMutex);
-    PublishLocked();
 }
 
 void GSThreadedBackend::TextureFlush()
@@ -261,37 +288,35 @@ void GSThreadedBackend::Sync(GSSyncReason reason)
         Enqueue(Op::Sync, &reason, sizeof(reason));
         return;
     }
-    Drain();
-    std::lock_guard<std::mutex> exec(m_execMutex);
-    m_inner->Sync(reason);
+    RunOnWorker([&] { m_inner->Sync(reason); });
 }
 
 PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &request)
 {
-    Drain();
-    std::lock_guard<std::mutex> exec(m_execMutex);
-    return m_inner->Present(request);
+    PresentationFrame frame;
+    RunOnWorker([&] { frame = m_inner->Present(request); });
+    return frame;
 }
 
 bool GSThreadedBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 {
-    Drain();
-    std::lock_guard<std::mutex> exec(m_execMutex);
-    return m_inner->ClearFramebuffer(context, rgba);
+    bool result = false;
+    RunOnWorker([&] { result = m_inner->ClearFramebuffer(context, rgba); });
+    return result;
 }
 
 uint32_t GSThreadedBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
-    Drain();
-    std::lock_guard<std::mutex> exec(m_execMutex);
-    return m_inner->ConsumeLocalToHostBytes(dst, maxBytes);
+    uint32_t result = 0u;
+    RunOnWorker([&] { result = m_inner->ConsumeLocalToHostBytes(dst, maxBytes); });
+    return result;
 }
 
 uint32_t GSThreadedBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
-    Drain();
-    std::lock_guard<std::mutex> exec(m_execMutex);
-    return m_inner->ReadVram(psm, base, bw, x, y);
+    uint32_t result = 0u;
+    RunOnWorker([&] { result = m_inner->ReadVram(psm, base, bw, x, y); });
+    return result;
 }
 
 void GSThreadedBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
@@ -302,30 +327,32 @@ void GSThreadedBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint
 
 void GSThreadedBackend::SnapshotVram(std::vector<uint8_t> &out) const
 {
-    Drain();
-    std::lock_guard<std::mutex> exec(m_execMutex);
-    m_inner->SnapshotVram(out);
+    RunOnWorker([&] { m_inner->SnapshotVram(out); });
 }
 
 GSTransferSnapshot GSThreadedBackend::GetTransferSnapshot() const
 {
-    Drain();
-    std::lock_guard<std::mutex> exec(m_execMutex);
-    return m_inner->GetTransferSnapshot();
+    GSTransferSnapshot result;
+    RunOnWorker([&] { result = m_inner->GetTransferSnapshot(); });
+    return result;
 }
 
 bool GSThreadedBackend::ExportState(GSBackendState &out)
 {
-    Drain();
-    std::lock_guard<std::mutex> exec(m_execMutex);
-    auto *access = dynamic_cast<GSBackendStateAccess *>(m_inner.get());
-    return access && access->ExportState(out);
+    bool result = false;
+    RunOnWorker([&]
+                {
+        auto *access = dynamic_cast<GSBackendStateAccess *>(m_inner.get());
+        result = access && access->ExportState(out); });
+    return result;
 }
 
 bool GSThreadedBackend::ImportState(const GSBackendState &state)
 {
-    Drain();
-    std::lock_guard<std::mutex> exec(m_execMutex);
-    auto *access = dynamic_cast<GSBackendStateAccess *>(m_inner.get());
-    return access && access->ImportState(state);
+    bool result = false;
+    RunOnWorker([&]
+                {
+        auto *access = dynamic_cast<GSBackendStateAccess *>(m_inner.get());
+        result = access && access->ImportState(state); });
+    return result;
 }
