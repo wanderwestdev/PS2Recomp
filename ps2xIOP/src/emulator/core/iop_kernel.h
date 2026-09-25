@@ -68,6 +68,10 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
 
+        [[nodiscard]] int createModuleStartThread(uint32_t entry, uint32_t gp, uint32_t a0, uint32_t a1, uint32_t priority, uint32_t stackSize);
+        [[nodiscard]] bool threadFinished(int id) const;
+        uint32_t releaseModuleStartThread(int id);
+
     private:
         struct Semaphore
         {
@@ -90,6 +94,7 @@ namespace ps2x::iop::detail
         void wakeOneSemaphore(int id);
         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
         void wakeEventWaiters(EventFlag &event);
+        void yieldIfHigherPriorityReady(IopCpuState &cpu);
 
         IopMemory &m_memory;
         std::map<int, IopThread> m_threads;

@@ -173,6 +173,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
         m_pendingInvocations.clear();
     }
     m_eventSequence = 0;
+    m_cycleWaitSequence = 0;
     m_invocationSequence = 0;
     m_vsyncTick = 0;
     m_vsyncFlagAddress = 0;
@@ -451,6 +452,38 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     {
         m_checkpointPending.store(true, std::memory_order_release);
     }
+}
+
+uint64_t EeScheduler::skipIdleCycles() noexcept
+{
+    const GuestThread *running = currentThread();
+    if (running == nullptr || m_insideInterrupt || !running->invocations.empty() ||
+        hasReadyAtOrAbovePriority(running->currentPriority))
+    {
+        return 0u;
+    }
+
+    uint64_t skipped = 0u;
+    while (!m_checkpointPending.load(std::memory_order_acquire) &&
+           !m_rescheduleRequested &&
+           m_pendingInvocations.empty())
+    {
+        const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+        if (nextEventCycle == 0u || m_eeCycle >= nextEventCycle)
+        {
+            break;
+        }
+        const uint64_t step = std::min({nextEventCycle - m_eeCycle,
+                                        kIdleSkipStepCycles,
+                                        m_runtime.memory().cyclesUntilNextEeTimerInterrupt()});
+        if (step == 0u)
+        {
+            break;
+        }
+        accountCycles(static_cast<uint32_t>(step));
+        skipped += step;
+    }
+    return skipped;
 }
 
 bool EeScheduler::isExecutingGuest() const noexcept
@@ -1469,6 +1502,21 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
         makeReady(*waiter, result, false);
     }
     publishSnapshot();
+}
+
+[[noreturn]] void EeScheduler::waitUntilCycle(uint64_t cycle, int result, std::function<void(R5900Context &)> completion)
+{
+    const uint64_t token = ++m_cycleWaitSequence;
+    scheduleEvent(cycle, std::chrono::steady_clock::now(), EeEvent{EeEventType::ExternalWake, kCycleWaitType, token});
+    waitExternal(EeWaitReason::External, kCycleWaitType, token,
+                 [result, completion = std::move(completion)](R5900Context &context)
+                 {
+                     setReturnS32(&context, result);
+                     if (completion)
+                     {
+                         completion(context);
+                     }
+                 });
 }
 
 [[noreturn]] void EeScheduler::waitExternal(EeWaitReason reason,

@@ -27,6 +27,10 @@ if(MSVC)
 endif()
 
 add_executable(gs_replay tools/gs_replay.cpp)
+
+add_executable(vu1_recomp tools/vu1_recomp.cpp)
+target_link_libraries(vu1_recomp PRIVATE ps2_gs_reference)
+target_include_directories(vu1_recomp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ps2xRuntime/src/lib/vu)
 target_link_libraries(gs_replay PRIVATE ps2_gs_reference)
 if(MSVC)
     target_compile_options(gs_replay PRIVATE /Zi)

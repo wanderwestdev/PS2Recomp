@@ -216,6 +216,13 @@ private:
     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
+    uint32_t m_flagValid = 0;
+    uint32_t m_storeValid = 0;
+    uint32_t m_vfWriteValid = 0;
+    uint32_t m_viWriteValid = 0;
+    uint32_t m_accWriteValid = 0;
+    uint64_t m_nextCommitCycle = 0;
+    DecodedInstructionPair m_fallbackDecoded{};
     XgkickPipeline m_xgkick{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
@@ -250,7 +257,7 @@ private:
     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+    const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
 
     void execUpper(uint32_t instr);
@@ -275,6 +282,15 @@ private:
     void queueViWrite(uint8_t reg, int32_t value, uint32_t latency);
     void queueAccWrite(uint8_t laneMask, const float value[4], uint32_t latency);
     void startXgkick(uint32_t qwordAddress);
+    void resetXgkick();
+
+    void noteReadyCycle(uint64_t cycle)
+    {
+        if (cycle < m_nextCommitCycle)
+            m_nextCommitCycle = cycle;
+    }
+
+    friend struct VU1InterpreterAccess;
 
     void resetScheduler();
     void commitReadyPipelines();

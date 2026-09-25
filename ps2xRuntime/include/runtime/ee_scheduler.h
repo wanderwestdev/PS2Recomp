@@ -267,6 +267,8 @@ public:
     static constexpr uint32_t kGeneratedCheckpointCycles = 32u;
     static constexpr uint32_t kGuestDispatchCycles = 8u;
     static constexpr uint64_t kDefaultTimeSliceCycles = 65536ull;
+    static constexpr uint64_t kIdleSkipStepCycles = 1024ull;
+    static constexpr uint32_t kCycleWaitType = 0xC1C1E000u;
 
     explicit EeScheduler(PS2Runtime &runtime);
     ~EeScheduler();
@@ -280,6 +282,7 @@ public:
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
+    uint64_t skipIdleCycles() noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
     // Kernel object API. All calls except postEvent/requestStop execute on the
@@ -367,6 +370,11 @@ public:
     void completeVSync(uint64_t tick);
     void completeExternalWait(uint32_t type, uint64_t token, int result);
     [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void waitUntilCycle(uint64_t cycle, int result, std::function<void(R5900Context &)> completion = {});
+    [[nodiscard]] uint64_t currentCycle() const noexcept
+    {
+        return m_eeCycle;
+    }
 
     [[nodiscard]] GuestThread *thread(int id);
     [[nodiscard]] const GuestThread *thread(int id) const;
@@ -477,6 +485,7 @@ private:
     std::vector<ScheduledEvent> m_deadlines;
     std::deque<GuestInvocation> m_pendingInvocations;
     uint64_t m_eventSequence = 0;
+    uint64_t m_cycleWaitSequence = 0;
     uint64_t m_invocationSequence = 0;
     uint64_t m_vsyncTick = 0;
     uint32_t m_vsyncFlagAddress = 0;

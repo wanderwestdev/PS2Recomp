@@ -613,6 +613,24 @@ namespace ps2x::iop::detail
             }
         }
 
+        uint32_t runModuleStart(uint32_t entry, uint32_t argc, uint32_t argv, uint32_t gp)
+        {
+            const int id = kernel.createModuleStartThread(entry, gp, argc, argv, kModuleStartPriority, kModuleStartStackSize);
+            if (id == 0)
+                return callFunction(entry, argc, argv, 0u, 0u, gp);
+            const uint64_t deadline = totalCycles + kModuleStartMaxCycles;
+            while (!kernel.threadFinished(id) && totalCycles < deadline)
+                runCycles(kDefaultSlice);
+            if (!kernel.threadFinished(id))
+            {
+                std::ostringstream out;
+                out << "[IOP] module_start at 0x" << std::hex << entry << " did not return; its thread keeps running";
+                log(LogLevel::Warning, out.str());
+                return 0u;
+            }
+            return kernel.releaseModuleStartThread(id);
+        }
+
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
         {
             ModuleLoadResult result{true, -1, -1};
@@ -649,7 +667,7 @@ namespace ps2x::iop::detail
                     write8(args + argumentSize, 0u);
                 }
             }
-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
+            const uint32_t startResult = runModuleStart(module.entry, argumentSize, args, module.gp);
             if (args)
                 freeAllocation(args);
             module.resident = startResult == 0u || startResult == 2u;
