@@ -348,13 +348,16 @@ void EeScheduler::run()
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
             m_unwinding = false;
+            loadSharedVu0Random(context);
             function(m_rdram, &context, &m_runtime);
+            saveSharedVu0Random(context);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
             m_transferPending = false;
         }
         catch (const EeDispatcherTransfer &)
         {
+            saveSharedVu0Random(context);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
             m_transferPending = false;
@@ -2286,6 +2289,22 @@ void EeScheduler::copyMainContextToRuntime()
     {
         m_runtime.m_cpuContext = main->context;
     }
+}
+
+void EeScheduler::loadSharedVu0Random(R5900Context &context)
+{
+    if (!m_sharedVu0RandomValid)
+    {
+        saveSharedVu0Random(context);
+        return;
+    }
+    context.vu0_r = m_sharedVu0Random;
+}
+
+void EeScheduler::saveSharedVu0Random(const R5900Context &context)
+{
+    m_sharedVu0Random = context.vu0_r;
+    m_sharedVu0RandomValid = true;
 }
 
 void EeScheduler::publishDebugContext(const R5900Context &context)

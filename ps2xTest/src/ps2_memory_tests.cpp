@@ -1210,6 +1210,46 @@ void register_ps2_memory_tests()
             t.IsTrue(contentOk, "scratchpad alias chain payload should match scratchpad bytes");
         });
 
+        tc.Run("GIF DMA chain longer than 4096 tags is transferred to its END tag", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kChain = 0x00100000u;
+            constexpr uint32_t kCntTags = 6000u;
+
+            uint8_t *rdram = mem.getRDRAM();
+            uint32_t addr = kChain;
+            for (uint32_t i = 0; i <= kCntTags; ++i)
+            {
+                const bool last = i == kCntTags;
+                writeDmaTag(rdram, addr, makeDmaTag(1u, last ? 7u : 1u, 0u, false));
+                const uint32_t marker = last ? 0xE0D0E0D0u : i;
+                std::memset(rdram + addr + 16u, 0, 16u);
+                std::memcpy(rdram + addr + 16u, &marker, sizeof(marker));
+                addr += 32u;
+            }
+
+            std::vector<uint8_t> captured;
+            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.insert(captured.end(), data, data + sizeBytes);
+            });
+
+            t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kChain), "write TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x104u), "write CHCR STR|CHAIN should succeed");
+            mem.processPendingTransfers();
+
+            t.Equals(captured.size(), static_cast<size_t>((kCntTags + 1u) * 16u), "every tag's payload should be transferred");
+            uint32_t lastMarker = 0u;
+            if (captured.size() >= 16u)
+            {
+                std::memcpy(&lastMarker, captured.data() + captured.size() - 16u, sizeof(lastMarker));
+            }
+            t.Equals(lastMarker, 0xE0D0E0D0u, "the END tag's payload should arrive last");
+        });
+
         tc.Run("native GIF image upload recognizes canonical load-image chain", [](TestCase &t)
         {
             PS2Memory mem;

@@ -28,6 +28,13 @@ endif()
 
 add_executable(gs_replay tools/gs_replay.cpp)
 
+set(PS2X_VU0_AUDIT_CORPUS "" CACHE FILEPATH "Generated VU0 macro corpus for the vu0_audit tool")
+if(PS2X_VU0_AUDIT_CORPUS)
+    add_executable(vu0_audit tools/vu0_audit.cpp)
+    target_link_libraries(vu0_audit PRIVATE ps2_gs_reference)
+    target_compile_definitions(vu0_audit PRIVATE "VU0_CORPUS=\"${PS2X_VU0_AUDIT_CORPUS}\"")
+endif()
+
 add_executable(vu1_recomp tools/vu1_recomp.cpp)
 target_link_libraries(vu1_recomp PRIVATE ps2_gs_reference)
 target_include_directories(vu1_recomp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ps2xRuntime/src/lib/vu)
