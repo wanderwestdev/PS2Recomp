@@ -376,7 +376,10 @@ namespace ps2_syscalls
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
         ee.sleepCurrent();
-        setReturnS32(ctx, KE_OK);
+        if (!ee.transferPending())
+        {
+            setReturnS32(ctx, KE_OK);
+        }
     }
 
     void WakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

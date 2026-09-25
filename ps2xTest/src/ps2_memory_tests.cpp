@@ -309,6 +309,72 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kTimer0Count), 0u, "ZRET should clear COUNT when it equals COMP");
         });
 
+        tc.Run("EE timers advanced lazily match an eager read after every step", [](TestCase &t)
+        {
+            constexpr uint32_t kBases[] = {0x10000000u, 0x10000800u, 0x10001000u, 0x10001800u};
+            constexpr uint32_t kZret = 1u << 6u;
+            constexpr uint32_t kCue = 1u << 7u;
+            constexpr uint32_t kCmpe = 1u << 8u;
+            constexpr uint32_t kOvfe = 1u << 9u;
+            constexpr uint32_t kEquf = 1u << 10u;
+            constexpr uint32_t kOvff = 1u << 11u;
+            const uint32_t modes[] = {0u | kCue | kCmpe | kZret, 1u | kCue | kOvfe, 2u | kCue | kCmpe | kOvfe, 3u | kCue | kCmpe};
+            const uint32_t compares[] = {5u, 0x100u, 0x30u, 0u};
+            const uint32_t counts[] = {0u, 0xFF00u, 0x10u, 0x7u};
+
+            PS2Memory eager;
+            PS2Memory lazy;
+            t.IsTrue(eager.initialize() && lazy.initialize(), "PS2Memory initialize should succeed");
+            for (PS2Memory *mem : {&eager, &lazy})
+            {
+                for (size_t i = 0; i < 4u; ++i)
+                {
+                    mem->writeIORegister(kBases[i], counts[i]);
+                    mem->writeIORegister(kBases[i] + 0x20u, compares[i]);
+                    mem->writeIORegister(kBases[i] + 0x10u, modes[i]);
+                }
+            }
+
+            uint32_t seed = 12345u;
+            bool allMatch = true;
+            int interrupts = 0;
+            for (int step = 0; step < 200000; ++step)
+            {
+                seed = seed * 1103515245u + 12345u;
+                const uint64_t cycles = 1u + ((seed >> 16u) % 97u);
+                const uint32_t eagerMask = eager.advanceEeTimers(cycles);
+                for (uint32_t base : kBases)
+                {
+                    (void)eager.readIORegister(base);
+                }
+                const uint32_t lazyMask = lazy.advanceEeTimers(cycles);
+                allMatch = allMatch && eagerMask == lazyMask &&
+                           eager.cyclesUntilNextEeTimerInterrupt() == lazy.cyclesUntilNextEeTimerInterrupt();
+                if (eagerMask != 0u)
+                {
+                    ++interrupts;
+                    for (PS2Memory *mem : {&eager, &lazy})
+                    {
+                        for (size_t i = 0; i < 4u; ++i)
+                        {
+                            const uint32_t mode = mem->readIORegister(kBases[i] + 0x10u);
+                            mem->writeIORegister(kBases[i] + 0x10u, mode | kEquf | kOvff);
+                        }
+                    }
+                }
+                if (step % 5000 == 4999)
+                {
+                    for (size_t i = 0; i < 4u; ++i)
+                    {
+                        allMatch = allMatch && eager.readIORegister(kBases[i]) == lazy.readIORegister(kBases[i]) &&
+                                   eager.readIORegister(kBases[i] + 0x10u) == lazy.readIORegister(kBases[i] + 0x10u);
+                    }
+                }
+            }
+            t.IsTrue(interrupts > 100, "the scenario should raise many timer interrupts");
+            t.IsTrue(allMatch, "lazy timer advance must raise the same interrupts in the same step and keep the same COUNT and MODE");
+        });
+
         tc.Run("scratchpad alias accesses the same bytes as base", [](TestCase &t)
         {
             PS2Memory mem;

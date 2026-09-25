@@ -1331,7 +1331,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
 
-    if (isStopRequested() || ctx->pc == 0u)
+    if (m_eeScheduler->transferPending() || isStopRequested() || ctx->pc == 0u)
     {
         return false;
     }
@@ -1385,12 +1385,12 @@ void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_
     executeVU0Microprogram(rdram, ctx, address);
 }
 
-void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
+bool PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
 {
-    handleSyscall(rdram, ctx, 0);
+    return handleSyscall(rdram, ctx, 0);
 }
 
-void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId)
+bool PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId)
 {
     if (ctx->in_delay_slot)
     {
@@ -1402,13 +1402,12 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                    ? encodedSyscallId
                                    : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
 
-    if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
+    EeScheduler::DeferredTransferScope deferTransfers(*m_eeScheduler);
+    if (!ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
     {
-        return;
+        ps2_syscalls::TODO(rdram, ctx, this, encodedSyscallId);
     }
-
-    // God help you
-    ps2_syscalls::TODO(rdram, ctx, this, encodedSyscallId);
+    return !m_eeScheduler->transferPending();
 }
 
 void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
@@ -2186,6 +2185,18 @@ void PS2Runtime::removeEeExitHandlers(int threadId)
 
 bool PS2Runtime::findEeSyscallOverride(uint32_t syscallNumber, uint32_t &handler) const
 {
+    const uint32_t presenceIndex = syscallNumber + 256u;
+    if (presenceIndex < 512u)
+    {
+        if ((m_eeSyscallOverridePresence[presenceIndex >> 6u].load(std::memory_order_acquire) & (1ull << (presenceIndex & 63u))) == 0u)
+        {
+            return false;
+        }
+    }
+    else if (m_eeSyscallOverridesOutOfRange.load(std::memory_order_acquire) == 0u)
+    {
+        return false;
+    }
     std::lock_guard lock(m_eeKernelStateMutex);
     const auto it = m_eeSyscallOverrides.find(syscallNumber);
     if (it == m_eeSyscallOverrides.end())
@@ -2211,6 +2222,26 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
     else
     {
         m_eeSyscallOverrides[syscallNumber] = handler;
+    }
+    const uint32_t presenceIndex = syscallNumber + 256u;
+    if (presenceIndex < 512u)
+    {
+        const uint64_t bit = 1ull << (presenceIndex & 63u);
+        if (handler == 0u)
+            m_eeSyscallOverridePresence[presenceIndex >> 6u].fetch_and(~bit, std::memory_order_acq_rel);
+        else
+            m_eeSyscallOverridePresence[presenceIndex >> 6u].fetch_or(bit, std::memory_order_acq_rel);
+    }
+    else
+    {
+        uint32_t outOfRange = 0u;
+        for (const auto &[number, value] : m_eeSyscallOverrides)
+        {
+            (void)value;
+            if (number + 256u >= 512u)
+                ++outOfRange;
+        }
+        m_eeSyscallOverridesOutOfRange.store(outOfRange, std::memory_order_release);
     }
     if (!rdram || address < 0 || address + 4 > kMirrorLimit)
     {
@@ -2293,6 +2324,8 @@ void PS2Runtime::run()
     Texture2D frameTex{};
 
     std::atomic<bool> gameThreadFinished{false};
+    ps2_host_input::setFieldCounter(&m_memory.gs().vsyncTick);
+    ps2_host_input::sample();
 
     std::thread gameThread([&]()
                            {
@@ -2376,7 +2409,7 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
-        ps2_host_input::sample(m_memory.gs().vsyncTick.load());
+        ps2_host_input::sample();
 
         if (WindowShouldClose())
         {

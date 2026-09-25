@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -194,7 +195,15 @@ namespace ps2_host_input
             return low ? 0x00u : 0xFFu;
         }
 
-        PadInputState readPort(uint32_t port, uint64_t vsyncTick)
+        std::atomic<const std::atomic<uint64_t> *> g_fieldCounter{nullptr};
+
+        void applyPressure(PadInputState &state)
+        {
+            for (const auto &[pressure, button] : kPressureButtons)
+                state.pressure[static_cast<size_t>(pressure)] = (state.buttons & button) != 0u ? 0xFFu : 0x00u;
+        }
+
+        PadInputState readPort(uint32_t port)
         {
             PadInputState state;
             const int gamepad = static_cast<int>(port);
@@ -212,9 +221,6 @@ namespace ps2_host_input
                 if (padDown || keyDown)
                     state.buttons |= binding.button;
             }
-            if (keyboard)
-                state.buttons |= scriptedButtons(vsyncTick);
-
             if (gamepadAvailable)
             {
                 state.leftX = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
@@ -234,17 +240,21 @@ namespace ps2_host_input
                     state.rightY = y;
             }
 
-            for (const auto &[pressure, button] : kPressureButtons)
-                state.pressure[static_cast<size_t>(pressure)] = (state.buttons & button) != 0u ? 0xFFu : 0x00u;
+            applyPressure(state);
             return state;
         }
     }
 
-    void sample(uint64_t vsyncTick)
+    void setFieldCounter(const std::atomic<uint64_t> *counter)
+    {
+        g_fieldCounter.store(counter);
+    }
+
+    void sample()
     {
         std::array<PadInputState, kPadPorts> state{};
         for (uint32_t port = 0; port < kPadPorts; ++port)
-            state[port] = readPort(port, vsyncTick);
+            state[port] = readPort(port);
         std::lock_guard<std::mutex> lock(g_mutex);
         g_state = state;
     }
@@ -253,7 +263,22 @@ namespace ps2_host_input
     {
         if (port >= kPadPorts)
             return {};
-        std::lock_guard<std::mutex> lock(g_mutex);
-        return g_state[port];
+        PadInputState state;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            state = g_state[port];
+        }
+        if (port == 0u)
+        {
+            const std::atomic<uint64_t> *counter = g_fieldCounter.load();
+            const uint16_t scripted = scriptedButtons(counter ? counter->load() : 0u);
+            if (scripted != 0u)
+            {
+                state.connected = true;
+                state.buttons |= scripted;
+                applyPressure(state);
+            }
+        }
+        return state;
     }
 }

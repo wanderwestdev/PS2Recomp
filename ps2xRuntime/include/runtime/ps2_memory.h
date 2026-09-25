@@ -449,6 +449,11 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    uint64_t m_eeTimerPendingCycles = 0;
+    uint64_t m_eeTimerEventBudget = ~0ull;
+    bool m_gifStatWritten = false;
+    uint32_t flushEeTimers() noexcept;
+    [[nodiscard]] uint64_t computeCyclesUntilNextEeTimerInterrupt() const noexcept;
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);

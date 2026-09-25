@@ -2,12 +2,14 @@
 
 #include "ps2x/iop/iop_pad.h"
 
+#include <atomic>
 #include <cstdint>
 
 namespace ps2_host_input
 {
     constexpr uint32_t kPadPorts = 2u;
 
-    void sample(uint64_t vsyncTick);
+    void setFieldCounter(const std::atomic<uint64_t> *counter);
+    void sample();
     [[nodiscard]] ps2x::iop::PadInputState padState(uint32_t port);
 }

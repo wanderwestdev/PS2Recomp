@@ -300,6 +300,31 @@ public:
     int releaseWait(int id, bool interruptSafe);
     void transferIfRequested(bool interruptSafe);
 
+    class DeferredTransferScope
+    {
+    public:
+        explicit DeferredTransferScope(EeScheduler &scheduler) noexcept
+            : m_scheduler(scheduler), m_previous(scheduler.m_deferTransfers)
+        {
+            scheduler.m_deferTransfers = true;
+        }
+        ~DeferredTransferScope()
+        {
+            m_scheduler.m_deferTransfers = m_previous;
+        }
+        DeferredTransferScope(const DeferredTransferScope &) = delete;
+        DeferredTransferScope &operator=(const DeferredTransferScope &) = delete;
+
+    private:
+        EeScheduler &m_scheduler;
+        bool m_previous;
+    };
+
+    [[nodiscard]] bool transferPending() const noexcept
+    {
+        return m_transferPending;
+    }
+
     int createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option);
     int deleteSemaphore(int id, bool interruptSafe);
     int signalSemaphore(int id, bool interruptSafe);
@@ -384,7 +409,9 @@ private:
     void makeRunning(GuestThread &thread);
     void makeDormant(GuestThread &thread);
     void removeFromWaitObject(GuestThread &thread);
-    [[noreturn]] void blockCurrent(EeWaitState wait);
+    void enterWait(EeWaitState wait);
+    void blockCurrent(EeWaitState wait);
+    void requestTransfer();
     void makeReady(GuestThread &thread, int result, bool interruptSafe);
     void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
     void applyPendingPreemption();
@@ -431,6 +458,8 @@ private:
     bool m_rescheduleRequested = false;
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
+    bool m_deferTransfers = false;
+    bool m_transferPending = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint32_t m_gsInterruptLatched = 0;
     uint64_t m_eeCycle = 0;

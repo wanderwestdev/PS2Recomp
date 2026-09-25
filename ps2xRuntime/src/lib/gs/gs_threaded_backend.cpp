@@ -201,6 +201,9 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk)
             m_inner->WriteVram(a.psm, a.base, a.bw, a.x, a.y, a.value);
             break;
         }
+        case Op::Sync:
+            m_inner->Sync(readAt<GSSyncReason>(payload));
+            break;
         }
     }
 }
@@ -253,6 +256,11 @@ void GSThreadedBackend::TextureFlush()
 
 void GSThreadedBackend::Sync(GSSyncReason reason)
 {
+    if (reason == GSSyncReason::Finish)
+    {
+        Enqueue(Op::Sync, &reason, sizeof(reason));
+        return;
+    }
     Drain();
     std::lock_guard<std::mutex> exec(m_execMutex);
     m_inner->Sync(reason);

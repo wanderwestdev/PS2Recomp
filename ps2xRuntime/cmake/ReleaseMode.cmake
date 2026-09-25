@@ -21,6 +21,13 @@ function(EnableFastReleaseMode TargetName)
                 /GS- # Disable Buffer Security Check (faster)
                 /Qspectre- # Disable Spectre mitigations (faster)
             >
+            $<$<CONFIG:RelWithDebInfo>:
+                /Ob2
+                /Oi
+                /GL
+                /Gy
+                /Gw
+            >
         )
 
         if(TARGET ${TargetName})

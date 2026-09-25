@@ -57,6 +57,7 @@ private:
         Upload,
         TextureFlush,
         WriteVram,
+        Sync,
     };
 
     void Enqueue(Op op, const void *payload, uint32_t size);

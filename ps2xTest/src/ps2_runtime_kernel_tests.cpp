@@ -532,6 +532,91 @@ namespace
         ctx->pc = 0u;
     }
 
+    constexpr uint32_t K_DEFER_SLEEPER = 0x300700u;
+    constexpr uint32_t K_DEFER_SLEEPER_RESUME = 0x300704u;
+    constexpr uint32_t K_DEFER_WAKER = 0x300710u;
+    constexpr uint32_t K_DEFER_WAKER_RESUME = 0x300714u;
+    constexpr uint32_t K_DEFER_SEMA_WAITER = 0x300720u;
+    constexpr uint32_t K_DEFER_SEMA_WAITER_RESUME = 0x300724u;
+    constexpr uint32_t K_DEFER_SEMA_SIGNALER = 0x300730u;
+    constexpr uint32_t K_DEFER_SEMA_SIGNALER_RESUME = 0x300734u;
+    std::vector<int> gDeferTrace;
+    int gDeferPeerId = 0;
+    int gDeferSemaphoreId = 0;
+
+    void deferRecordSyscall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t number, uint32_t resumePc, int continued)
+    {
+        SET_GPR_U32(ctx, 3, number);
+        ctx->pc = resumePc;
+        if (!runtime->handleSyscall(rdram, ctx, 0u))
+        {
+            gDeferTrace.push_back(-continued);
+            return;
+        }
+        gDeferTrace.push_back(continued);
+    }
+
+    void deferMainExit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gDeferTrace.push_back(1);
+        ExitThread(rdram, ctx, runtime);
+    }
+
+    void deferSleeper(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == K_DEFER_SLEEPER)
+        {
+            gDeferTrace.push_back(10);
+            deferRecordSyscall(rdram, ctx, runtime, 0x32u, K_DEFER_SLEEPER_RESUME, 12);
+            return;
+        }
+        gDeferTrace.push_back(getRegS32(*ctx, 2) == KE_OK ? 11 : -11);
+        ctx->pc = 0u;
+    }
+
+    void deferWaker(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == K_DEFER_WAKER)
+        {
+            gDeferTrace.push_back(20);
+            SET_GPR_U32(ctx, 4, static_cast<uint32_t>(gDeferPeerId));
+            deferRecordSyscall(rdram, ctx, runtime, 0x33u, K_DEFER_WAKER_RESUME, 22);
+            return;
+        }
+        gDeferTrace.push_back(21);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void deferSemaWaiter(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == K_DEFER_SEMA_WAITER)
+        {
+            gDeferTrace.push_back(30);
+            SET_GPR_U32(ctx, 4, static_cast<uint32_t>(gDeferSemaphoreId));
+            deferRecordSyscall(rdram, ctx, runtime, 0x44u, K_DEFER_SEMA_WAITER_RESUME, 32);
+            return;
+        }
+        gDeferTrace.push_back(getRegS32(*ctx, 2) == gDeferSemaphoreId ? 31 : -31);
+        ctx->pc = 0u;
+    }
+
+    void deferSemaSignaler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == K_DEFER_SEMA_SIGNALER)
+        {
+            gDeferTrace.push_back(40);
+            SET_GPR_U32(ctx, 4, static_cast<uint32_t>(gDeferSemaphoreId));
+            deferRecordSyscall(rdram, ctx, runtime, 0x42u, K_DEFER_SEMA_SIGNALER_RESUME, 42);
+            return;
+        }
+        gDeferTrace.push_back(41);
+        SET_GPR_U32(ctx, 4, static_cast<uint32_t>(gDeferSemaphoreId));
+        deferRecordSyscall(rdram, ctx, runtime, 0x42u, 0u, 43);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
     struct TestEnv
     {
         std::vector<uint8_t> rdram;
@@ -887,6 +972,74 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(gSchedulerWaitResultA, gSchedulerSemaphoreId, "first waiter receives sid on resume");
             t.Equals(gSchedulerWaitResultB, gSchedulerSemaphoreId, "second waiter receives sid on resume");
             t.Equals(ee.semaphore(gSchedulerSemaphoreId)->count, 0, "direct handoff must not increment count");
+        });
+
+        tc.Run("SleepThread through handleSyscall blocks without throwing and WakeupThread preempts in order", [](TestCase &t)
+        {
+            TestEnv env;
+            gDeferTrace.clear();
+            env.runtime.registerFunction(K_SCHED_MAIN, deferMainExit);
+            env.runtime.registerFunction(K_DEFER_SLEEPER, deferSleeper);
+            env.runtime.registerFunction(K_DEFER_SLEEPER_RESUME, deferSleeper);
+            env.runtime.registerFunction(K_DEFER_WAKER, deferWaker);
+            env.runtime.registerFunction(K_DEFER_WAKER_RESUME, deferWaker);
+            env.ctx.pc = K_SCHED_MAIN;
+
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            gDeferPeerId = ee.createThread(EeThreadCreateParams{0, K_DEFER_SLEEPER, 0x20000u, 0x800u, 0, 10, 0});
+            const int waker = ee.createThread(EeThreadCreateParams{0, K_DEFER_WAKER, 0x21000u, 0x800u, 0, 20, 0});
+            ee.startThread(gDeferPeerId, 0, env.ctx, false);
+            ee.startThread(waker, 0, env.ctx, false);
+            ee.run();
+
+            const std::vector<int> expected{1, 10, -12, 20, -22, 11, 21};
+            t.IsTrue(gDeferTrace == expected,
+                     "the sleeper must stop at the syscall, the waker must hand over to the higher-priority sleeper, then resume");
+            t.IsFalse(ee.transferPending(), "the dispatcher must consume the deferred transfer");
+        });
+
+        tc.Run("SleepThread through handleSyscall continues when a wakeup is pending", [](TestCase &t)
+        {
+            TestEnv env;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            ee.bindMainContextForSyscall(env.ctx, env.rdram.data());
+            ee.thread(EeScheduler::kMainThreadId)->wakeupCount = 1u;
+            SET_GPR_U32(&env.ctx, 3, 0x32u);
+            SET_GPR_U32(&env.ctx, 2, 0x1234u);
+            const bool continued = env.runtime.handleSyscall(env.rdram.data(), &env.ctx, 0u);
+            t.IsTrue(continued, "a SleepThread that consumes a pending wakeup must let the caller continue");
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "the non-blocking SleepThread returns KE_OK");
+            t.IsTrue(ee.thread(EeScheduler::kMainThreadId)->status == EeThreadStatus::Running,
+                     "the caller keeps running");
+            t.IsFalse(ee.transferPending(), "no transfer is pending after a non-blocking syscall");
+        });
+
+        tc.Run("WaitSema and SignalSema through handleSyscall hand over without throwing", [](TestCase &t)
+        {
+            TestEnv env;
+            gDeferTrace.clear();
+            env.runtime.registerFunction(K_SCHED_MAIN, deferMainExit);
+            env.runtime.registerFunction(K_DEFER_SEMA_WAITER, deferSemaWaiter);
+            env.runtime.registerFunction(K_DEFER_SEMA_WAITER_RESUME, deferSemaWaiter);
+            env.runtime.registerFunction(K_DEFER_SEMA_SIGNALER, deferSemaSignaler);
+            env.runtime.registerFunction(K_DEFER_SEMA_SIGNALER_RESUME, deferSemaSignaler);
+            env.ctx.pc = K_SCHED_MAIN;
+
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            gDeferSemaphoreId = ee.createSemaphore(0, 2, 0, 0);
+            const int waiter = ee.createThread(EeThreadCreateParams{0, K_DEFER_SEMA_WAITER, 0x20000u, 0x800u, 0, 10, 0});
+            const int signaler = ee.createThread(EeThreadCreateParams{0, K_DEFER_SEMA_SIGNALER, 0x21000u, 0x800u, 0, 20, 0});
+            ee.startThread(waiter, 0, env.ctx, false);
+            ee.startThread(signaler, 0, env.ctx, false);
+            ee.run();
+
+            const std::vector<int> expected{1, 30, -32, 40, -42, 31, 41, 43};
+            t.IsTrue(gDeferTrace == expected,
+                     "the waiter blocks, the signal preempts to it, a signal without waiters continues in place");
+            t.Equals(ee.semaphore(gDeferSemaphoreId)->count, 1, "the second signal has no waiter and increments the count");
         });
 
         tc.Run("setup heap and allocator primitives track end-of-heap", [](TestCase &t)

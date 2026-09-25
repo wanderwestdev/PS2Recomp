@@ -366,8 +366,8 @@ public:
     void vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
 
 public:
-    void handleSyscall(uint8_t *rdram, R5900Context *ctx);
-    void handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId);
+    bool handleSyscall(uint8_t *rdram, R5900Context *ctx);
+    bool handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId);
     void handleBreak(uint8_t *rdram, R5900Context *ctx);
 
     void handleTrap(uint8_t *rdram, R5900Context *ctx);
@@ -505,6 +505,8 @@ private:
     mutable std::mutex m_eeKernelStateMutex;
     std::unordered_map<int, std::vector<EeExitHandlerRegistration>> m_eeExitHandlers;
     std::unordered_map<uint32_t, uint32_t> m_eeSyscallOverrides;
+    std::array<std::atomic<uint64_t>, 8> m_eeSyscallOverridePresence{};
+    std::atomic<uint32_t> m_eeSyscallOverridesOutOfRange{0u};
     std::unordered_set<uint32_t> m_eeSyscallMirrorAddresses;
     mutable std::mutex m_guestHeapMutex;
     mutable std::mutex m_asyncCallbackStackMutex;

@@ -223,7 +223,9 @@ void register_code_generator_tests()
         CodeGenerator gen({}, {});
         const std::string generated = gen.generateFunction(func, {syscall, after}, false);
         const size_t continuation = generated.find("ctx->pc = 0x9004u;");
-        const size_t dispatch = generated.find("runtime->handleSyscall(rdram, ctx, 0x44u);");
+        const size_t dispatch = generated.find("if (!runtime->handleSyscall(rdram, ctx, 0x44u)) {");
+        const size_t transferReturn = generated.find("return;", dispatch == std::string::npos ? 0u : dispatch);
+        const size_t nextInstruction = generated.find("0x9004: ", dispatch == std::string::npos ? 0u : dispatch);
 
         t.IsTrue(continuation != std::string::npos,
                  "generated syscall must publish the next guest PC");
@@ -231,6 +233,9 @@ void register_code_generator_tests()
                  "generated syscall must still dispatch the encoded syscall");
         t.IsTrue(continuation < dispatch,
                  "the continuation PC must be visible before a syscall can transfer to the scheduler");
+        t.IsTrue(transferReturn != std::string::npos &&
+                     (nextInstruction == std::string::npos || transferReturn < nextInstruction),
+                 "a syscall that transferred to the scheduler must return before the next guest instruction");
     });
 
     tc.Run("SYSCALL fallthrough is a resumable entry", [](TestCase &t) {
