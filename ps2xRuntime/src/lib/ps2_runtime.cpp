@@ -2016,7 +2016,7 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
-        return m_memory.read128(vaddr);
+        return m_memory.read128(vaddr & ~0xFu);
     }
     catch (const std::exception &)
     {
@@ -2082,10 +2082,10 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
 {
     alignas(16) uint64_t _parts[2];
     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
-    ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
+    ps2TraceGuestWrite(rdram, vaddr & ~0xFu, 16u, _parts[0], _parts[1], "WRITE128", ctx);
     try
     {
-        m_memory.write128(vaddr, value);
+        m_memory.write128(vaddr & ~0xFu, value);
     }
     catch (const std::exception &)
     {

@@ -47,6 +47,7 @@ namespace GSRaster
         uint32_t ztest = 0u;
         bool abe = false;
         bool pabe = false;
+        bool colclamp = true;
         uint8_t asel = 0u;
         uint8_t bsel = 0u;
         uint8_t csel = 0u;

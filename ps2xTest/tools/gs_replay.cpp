@@ -4,6 +4,7 @@
 #include "runtime/gs/gs_threaded_backend.h"
 #include "runtime/gs/gs_gpu_backend.h"
 #include "gs_sampler.h"
+#include "runtime/gs/gs_frontend.h"
 
 #include <algorithm>
 #include <array>
@@ -276,8 +277,8 @@ namespace
         for (uint32_t i = 0; i < batch.vertexCount; ++i)
         {
             const GSVertex &v = batch.vertices[i];
-            std::fprintf(file, " | %.2f,%.2f z=%.0f rgba=%02x%02x%02x%02x uv=%.2f,%.2f st=%g,%g q=%g",
-                         v.x, v.y, v.z, v.r, v.g, v.b, v.a, v.u / 16.0, v.v / 16.0, v.s, v.t, v.q);
+            std::fprintf(file, " | %.2f,%.2f z=%.0f rgba=%02x%02x%02x%02x uv=%.2f,%.2f st=%g,%g q=%g f=%u",
+                         v.x, v.y, v.z, v.r, v.g, v.b, v.a, v.u / 16.0, v.v / 16.0, v.s, v.t, v.q, static_cast<unsigned>(v.fog));
         }
         std::fputc('\n', file);
     }
@@ -433,10 +434,130 @@ namespace
     }
 }
 
+namespace
+{
+    int playGsDump(const std::string &path, const std::string &backendName, const std::string &dumpDir)
+    {
+        std::FILE *file = std::fopen(path.c_str(), "rb");
+        if (!file)
+        {
+            std::cerr << "cannot open " << path << "\n";
+            return 2;
+        }
+        std::vector<uint8_t> data;
+        uint8_t chunk[65536];
+        size_t got;
+        while ((got = std::fread(chunk, 1, sizeof(chunk), file)) > 0)
+            data.insert(data.end(), chunk, chunk + got);
+        std::fclose(file);
+        const size_t vramSize = 4u * 1024u * 1024u;
+        if (data.size() < 8u + vramSize + 4u || std::memcmp(data.data(), "PS2XGSD1", 8) != 0)
+        {
+            std::cerr << "not an exported GS dump\n";
+            return 2;
+        }
+        _mm_setcsr(0xFFC0u);
+        std::vector<uint8_t> vram(data.begin() + 8, data.begin() + 8 + vramSize);
+        auto owned = makeBackend(backendName);
+        if (!owned)
+        {
+            std::cerr << "unknown backend\n";
+            return 2;
+        }
+        GSRasterBackend *backend = owned.get();
+        GS gs;
+        gs.setRasterBackend(std::move(owned));
+        gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+        size_t o = 8u + vramSize;
+        uint32_t initCount = 0u;
+        std::memcpy(&initCount, data.data() + o, 4u);
+        o += 4u;
+        for (uint32_t i = 0; i < initCount; ++i)
+        {
+            uint64_t value = 0u;
+            std::memcpy(&value, data.data() + o + 1u, 8u);
+            gs.writeRegister(data[o], value);
+            o += 9u;
+        }
+        uint32_t field = 0u;
+        uint32_t packets = 0u;
+        uint32_t snapshotFirst = 0u;
+        uint32_t snapshotLast = 0u;
+        uint32_t snapshotEvery = 0u;
+        if (const char *spec = std::getenv("GS_REPLAY_SNAPSHOTS"))
+            std::sscanf(spec, "%u:%u:%u", &snapshotFirst, &snapshotLast, &snapshotEvery);
+        while (o < data.size())
+        {
+            const uint8_t kind = data[o++];
+            if (kind == 0u)
+            {
+                uint32_t size = 0u;
+                std::memcpy(&size, data.data() + o, 4u);
+                o += 4u;
+                gs.processGIFPacket(data.data() + o, size);
+                o += size;
+                ++packets;
+                if (snapshotEvery != 0u && !dumpDir.empty() && packets >= snapshotFirst && packets <= snapshotLast &&
+                    (packets - snapshotFirst) % snapshotEvery == 0u)
+                {
+                    backend->Flush();
+                    backend->Sync(GSSyncReason::DebugReadback);
+                    std::vector<uint8_t> snapshot;
+                    backend->SnapshotVram(snapshot);
+                    if (std::FILE *out = std::fopen((dumpDir + "/snap_" + std::to_string(packets) + ".vram").c_str(), "wb"))
+                    {
+                        std::fwrite(snapshot.data(), 1, snapshot.size(), out);
+                        std::fclose(out);
+                    }
+                }
+                continue;
+            }
+            if (kind != 1u)
+            {
+                std::cerr << "bad record " << static_cast<unsigned>(kind) << "\n";
+                return 2;
+            }
+            uint64_t display[7];
+            std::memcpy(display, data.data() + o, sizeof(display));
+            o += sizeof(display);
+            backend->Flush();
+            backend->Sync(GSSyncReason::DebugReadback);
+            GSPresentationRequest request{};
+            request.pmode = display[0];
+            request.smode2 = display[1];
+            request.dispfb1 = display[2];
+            request.display1 = display[3];
+            request.dispfb2 = display[4];
+            request.display2 = display[5];
+            request.bgcolor = display[6];
+            const PresentationFrame frame = backend->Present(request);
+            if (!dumpDir.empty() && frame)
+                writePng(dumpDir + "/dump_field" + std::to_string(field) + ".png", frame.pixels.data(), frame.width, frame.height);
+            std::printf("field %u after %u packets\n", field, packets);
+            ++field;
+        }
+        backend->Flush();
+        backend->Sync(GSSyncReason::DebugReadback);
+        if (!dumpDir.empty())
+        {
+            std::vector<uint8_t> snapshot;
+            backend->SnapshotVram(snapshot);
+            if (std::FILE *out = std::fopen((dumpDir + "/dump_end.vram").c_str(), "wb"))
+            {
+                std::fwrite(snapshot.data(), 1, snapshot.size(), out);
+                std::fclose(out);
+            }
+        }
+        return 0;
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && std::string(argv[1]) == "--check-lround")
         return checkLround();
+    if (argc >= 3 && std::string(argv[1]) == "--gsdump")
+        return playGsDump(argv[2], argc >= 4 ? argv[3] : "cpu", argc >= 5 ? argv[4] : "");
     if (argc < 2)
     {
         std::cerr << "usage: gs_replay <recording.gsr> [--backend cpu|ref] [--repeat N] [--no-compare]"

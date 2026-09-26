@@ -1,6 +1,8 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "gs_cpu_backend_internal.h"
 #include "gs_cpu_raster_inline.h"
+#include "gs_sprite_rules.h"
+#include "gs_triangle_rules.h"
 #include "runtime/gs/gs_band_pool.h"
 
 #include <algorithm>
@@ -97,6 +99,7 @@ namespace GSRaster
         s.ztest = static_cast<uint32_t>((ctx.test >> 17) & 3u);
         s.abe = state.prim.abe;
         s.pabe = state.pabe;
+        s.colclamp = (state.colclamp & 1u) != 0u;
         const uint64_t alphaReg = ctx.alpha;
         s.asel = static_cast<uint8_t>(alphaReg & 3u);
         s.bsel = static_cast<uint8_t>((alphaReg >> 2) & 3u);
@@ -373,26 +376,16 @@ bool GSCpuBackend::DrawSpriteFast(const GSPrimitiveBatch &batch)
     const GSVertex &v1 = batch.vertices[1];
     const auto &ctx = state.context;
 
-    const int ofx = ctx.xyoffset.ofx >> 4;
-    const int ofy = ctx.xyoffset.ofy >> 4;
-
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
+    const GSSpriteAxis axisX = gsSpriteAxis(v0.x, v1.x, static_cast<float>(ctx.xyoffset.ofx) / 16.0f);
+    const GSSpriteAxis axisY = gsSpriteAxis(v0.y, v1.y, static_cast<float>(ctx.xyoffset.ofy) / 16.0f);
     const u32 z1 = static_cast<u32>(v1.z);
 
-    if (x0 > x1)
-        std::swap(x0, x1);
-    if (y0 > y1)
-        std::swap(y0, y1);
-
-    const int unclippedX0 = x0;
-    const int unclippedY0 = y0;
-    const int spanX = std::max(1, x1 - x0);
-    const int spanY = std::max(1, y1 - y0);
-    const int unclippedX1 = unclippedX0 + spanX - 1;
-    const int unclippedY1 = unclippedY0 + spanY - 1;
+    const int unclippedX0 = axisX.first;
+    const int unclippedY0 = axisY.first;
+    const int unclippedX1 = axisX.last;
+    const int unclippedY1 = axisY.last;
+    if (unclippedX1 < unclippedX0 || unclippedY1 < unclippedY0)
+        return true;
 
     if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
         unclippedY1 < ctx.scissor.y0 || unclippedY0 > ctx.scissor.y1)
@@ -464,10 +457,10 @@ bool GSCpuBackend::DrawSpriteFast(const GSPrimitiveBatch &batch)
     float u0f, v0f, u1f, v1f;
     if (state.prim.fst)
     {
-        u0f = static_cast<float>(v0.u >> 4);
-        v0f = static_cast<float>(v0.v >> 4);
-        u1f = static_cast<float>(v1.u >> 4);
-        v1f = static_cast<float>(v1.v >> 4);
+        u0f = static_cast<float>(v0.u) / 16.0f;
+        v0f = static_cast<float>(v0.v) / 16.0f;
+        u1f = static_cast<float>(v1.u) / 16.0f;
+        v1f = static_cast<float>(v1.v) / 16.0f;
     }
     else
     {
@@ -478,13 +471,6 @@ bool GSCpuBackend::DrawSpriteFast(const GSPrimitiveBatch &batch)
         u1f = (v1.s / q1) * static_cast<float>(texW);
         v1f = (v1.t / q1) * static_cast<float>(texH);
     }
-
-    float spriteW = static_cast<float>(spanX);
-    float spriteH = static_cast<float>(spanY);
-    if (spriteW < 1.0f)
-        spriteW = 1.0f;
-    if (spriteH < 1.0f)
-        spriteH = 1.0f;
 
     const bool linear = state.linearFilter;
     auto axisSample = [&](float texF, int size, bool isU) -> AxisSample
@@ -526,7 +512,7 @@ bool GSCpuBackend::DrawSpriteFast(const GSPrimitiveBatch &batch)
     m_pixelColumns.resize(static_cast<size_t>(columns));
     for (int x = drawX0; x <= drawX1; ++x)
     {
-        const float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
+        const float tx = gsSpriteParameter(axisX, x);
         const float texUf = u0f + (u1f - u0f) * tx;
         AxisSample sample = axisSample(texUf, texW, true);
         MakeTextureParts(tex, sample, false);
@@ -538,7 +524,7 @@ bool GSCpuBackend::DrawSpriteFast(const GSPrimitiveBatch &batch)
     m_rowSamples.resize(static_cast<size_t>(rows));
     for (int y = drawY0; y <= drawY1; ++y)
     {
-        const float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+        const float ty = gsSpriteParameter(axisY, y);
         const float texVf = v0f + (v1f - v0f) * ty;
         AxisSample sample = axisSample(texVf, texH, false);
         MakeTextureParts(tex, sample, true);
@@ -611,29 +597,13 @@ bool GSCpuBackend::DrawTriangleFast(const GSPrimitiveBatch &batch)
     const GSVertex &v2 = batch.vertices[2];
     const auto &ctx = state.context;
 
-    const int ofx = ctx.xyoffset.ofx >> 4;
-    const int ofy = ctx.xyoffset.ofy >> 4;
-
-    const float fx0 = v0.x - static_cast<float>(ofx);
-    const float fy0 = v0.y - static_cast<float>(ofy);
-    const float fx1 = v1.x - static_cast<float>(ofx);
-    const float fy1 = v1.y - static_cast<float>(ofy);
-    const float fx2 = v2.x - static_cast<float>(ofx);
-    const float fy2 = v2.y - static_cast<float>(ofy);
-
-    int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
-    int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
-    int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
-    int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
-
-    minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
-    maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
-    minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
-    maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
-
-    const float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
-    if (std::fabs(denom) < 0.001f)
+    GSTriangleRaster tri;
+    if (!gsTriangleSetup(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, ctx.xyoffset.ofx, ctx.xyoffset.ofy, tri))
         return true;
+    const int minX = std::max(tri.minX, static_cast<int>(ctx.scissor.x0));
+    const int maxX = std::min(tri.maxX, static_cast<int>(ctx.scissor.x1));
+    const int minY = std::max(tri.minY, static_cast<int>(ctx.scissor.y0));
+    const int maxY = std::min(tri.maxY, static_cast<int>(ctx.scissor.y1));
     if (minX > maxX || minY > maxY)
         return true;
 
@@ -666,26 +636,10 @@ bool GSCpuBackend::DrawTriangleFast(const GSPrimitiveBatch &batch)
         m_textureCache.Materialize(m_vram);
     }
 
-    const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
-    const float invAbsDenom = 1.0f / std::fabs(denom);
-    constexpr float kEdgeEpsilon = 1.0e-4f;
-
-    const float e0x = fy1 - fy2;
-    const float e0y = fx2 - fx1;
-    const float e1x = fy2 - fy0;
-    const float e1y = fx0 - fx2;
-
     const int columns = maxX - minX + 1;
-    m_edgeColumns.resize(static_cast<size_t>(columns) * 2u);
     m_pixelColumns.resize(static_cast<size_t>(columns));
     for (int x = minX; x <= maxX; ++x)
-    {
-        const float pxf = static_cast<float>(x) + 0.5f;
-        const size_t i = static_cast<size_t>(x - minX);
-        m_edgeColumns[i * 2u] = e0x * (pxf - fx2);
-        m_edgeColumns[i * 2u + 1u] = e1x * (pxf - fx2);
-        m_pixelColumns[i] = MakeColumn(px, static_cast<uint32_t>(x));
-    }
+        m_pixelColumns[static_cast<size_t>(x - minX)] = MakeColumn(px, static_cast<uint32_t>(x));
 
     const GSTex0Reg &tex0 = ctx.tex0;
     const bool linear = state.linearFilter;
@@ -698,19 +652,17 @@ bool GSCpuBackend::DrawTriangleFast(const GSPrimitiveBatch &batch)
     uint32_t lastTexelByte = UINT32_MAX;
     for (int y = yBegin; y <= yEnd; ++y)
     {
-        const float py = static_cast<float>(y) + 0.5f;
-        const float row0 = e0y * (py - fy2);
-        const float row1 = e1y * (py - fy2);
         const PixelRow pixelRow = MakeRow(px, static_cast<uint32_t>(y));
-        for (int x = minX; x <= maxX; ++x)
+        int64_t e[3] = {gsTriangleEdge(tri, 0, minX, y), gsTriangleEdge(tri, 1, minX, y), gsTriangleEdge(tri, 2, minX, y)};
+        const int64_t stepX[3] = {tri.a[0] * 16, tri.a[1] * 16, tri.a[2] * 16};
+        for (int x = minX; x <= maxX; ++x, e[0] += stepX[0], e[1] += stepX[1], e[2] += stepX[2])
         {
             const size_t i = static_cast<size_t>(x - minX);
-            const float w0 = ((m_edgeColumns[i * 2u] + row0) * winding) * invAbsDenom;
-            const float w1 = ((m_edgeColumns[i * 2u + 1u] + row1) * winding) * invAbsDenom;
-            const float w2 = 1.0f - w0 - w1;
-
-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+            if (!gsTriangleCovers(tri, e))
                 continue;
+            const float w0 = gsTriangleWeight(tri, e[0]);
+            const float w1 = gsTriangleWeight(tri, e[1]);
+            const float w2 = gsTriangleWeight(tri, e[2]);
 
             const double z = v0.z + (v1.z - v0.z) * static_cast<double>(w1) + (v2.z - v0.z) * static_cast<double>(w2);
 

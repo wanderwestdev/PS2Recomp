@@ -161,6 +161,37 @@ inline float ps2FpuClamp(float value)
     return value;
 }
 
+inline void ps2FpuAlignOperands(float &a, float &b)
+{
+    uint32_t ua;
+    uint32_t ub;
+    std::memcpy(&ua, &a, sizeof(ua));
+    std::memcpy(&ub, &b, sizeof(ub));
+    const int32_t diff = static_cast<int32_t>((ua >> 23) & 0xFFu) - static_cast<int32_t>((ub >> 23) & 0xFFu);
+    if (diff >= 25)
+        ub &= 0x80000000u;
+    else if (diff > 0)
+        ub &= 0xFFFFFFFFu << (diff - 1);
+    else if (diff <= -25)
+        ua &= 0x80000000u;
+    else if (diff < 0)
+        ua &= 0xFFFFFFFFu << (-diff - 1);
+    std::memcpy(&a, &ua, sizeof(a));
+    std::memcpy(&b, &ub, sizeof(b));
+}
+
+inline float ps2FpuAdd(float a, float b)
+{
+    ps2FpuAlignOperands(a, b);
+    return ps2FpuClamp(a + b);
+}
+
+inline float ps2FpuSub(float a, float b)
+{
+    ps2FpuAlignOperands(a, b);
+    return ps2FpuClamp(a - b);
+}
+
 inline float ps2SignedFloatMax(uint32_t signSource)
 {
     const uint32_t bits = (signSource & 0x80000000u) | 0x7F7FFFFFu;
@@ -186,6 +217,24 @@ constexpr uint32_t PS2_FCR31_D = 0x00010000u;
 constexpr uint32_t PS2_FCR31_SI = 0x00000040u;
 constexpr uint32_t PS2_FCR31_SD = 0x00000020u;
 
+inline float ps2FpuDivideNearest(float dividend, float divisor)
+{
+    const uint32_t csr = _mm_getcsr();
+    _mm_setcsr(csr & ~0x6000u);
+    const float result = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(dividend), _mm_set_ss(divisor)));
+    _mm_setcsr(csr);
+    return result;
+}
+
+inline float ps2FpuSqrtNearest(float value)
+{
+    const uint32_t csr = _mm_getcsr();
+    _mm_setcsr(csr & ~0x6000u);
+    const float result = _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(value)));
+    _mm_setcsr(csr);
+    return result;
+}
+
 inline float ps2FpuDivide(uint32_t &fcr31, float dividend, float divisor)
 {
     if (ps2FloatIsZero(divisor))
@@ -196,14 +245,14 @@ inline float ps2FpuDivide(uint32_t &fcr31, float dividend, float divisor)
             fcr31 |= PS2_FCR31_D | PS2_FCR31_SD;
         return ps2SignedFloatMax(ps2FloatBits(dividend) ^ ps2FloatBits(divisor));
     }
-    return ps2FpuClamp(dividend / divisor);
+    return ps2FpuClamp(ps2FpuDivideNearest(dividend, divisor));
 }
 
 inline float ps2FpuSqrt(uint32_t &fcr31, float value)
 {
     if ((ps2FloatBits(value) & 0x80000000u) != 0u && !ps2FloatIsZero(value))
         fcr31 |= PS2_FCR31_I | PS2_FCR31_SI;
-    return ps2FpuClamp(std::sqrt(std::fabs(value)));
+    return ps2FpuClamp(ps2FpuSqrtNearest(std::fabs(value)));
 }
 
 inline float ps2FpuRsqrt(uint32_t &fcr31, float numerator, float value)
@@ -215,7 +264,7 @@ inline float ps2FpuRsqrt(uint32_t &fcr31, float numerator, float value)
     }
     if ((ps2FloatBits(value) & 0x80000000u) != 0u)
         fcr31 |= PS2_FCR31_I | PS2_FCR31_SI;
-    return ps2FpuClamp(numerator / std::sqrt(std::fabs(value)));
+    return ps2FpuClamp(ps2FpuDivideNearest(numerator, ps2FpuSqrtNearest(std::fabs(value))));
 }
 
 inline int32_t ps2FpuConvertToWord(float value)
@@ -353,7 +402,7 @@ static inline uint64_t Ps2FastRead64(const uint8_t *rdram, uint32_t addr)
 
 static inline __m128i Ps2FastRead128(const uint8_t *rdram, uint32_t addr)
 {
-    const uint32_t offset = addr & PS2_RAM_MASK;
+    const uint32_t offset = addr & PS2_RAM_MASK & ~0xFu;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
     {
         alignas(16) uint8_t wrapped[sizeof(__m128i)];
@@ -426,7 +475,7 @@ static inline void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
 
 static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 {
-    const uint32_t offset = addr & PS2_RAM_MASK;
+    const uint32_t offset = addr & PS2_RAM_MASK & ~0xFu;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
     {
         alignas(16) uint8_t wrapped[sizeof(__m128i)];
@@ -477,7 +526,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
         : FAST_READ64(_addr); }())
 
 #define READ128(addr) ([&]() -> __m128i {                     \
-    uint32_t _addr = (uint32_t)(addr);                        \
+    uint32_t _addr = (uint32_t)(addr) & ~0xFu;                \
     return PS2Runtime::isSpecialAddress(_addr)                \
         ? runtime->Load128(rdram, ctx, _addr)                 \
         : FAST_READ128(_addr); }())
@@ -537,7 +586,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 #define WRITE128(addr, val)                                                          \
     do                                                                               \
     {                                                                                \
-        uint32_t _addr = (addr);                                                     \
+        uint32_t _addr = (uint32_t)(addr) & ~0xFu;                                   \
         __m128i _value = (val);                                                      \
         if (PS2Runtime::isSpecialAddress(_addr))                                     \
             runtime->Store128(rdram, ctx, _addr, _value);                            \
@@ -734,8 +783,8 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
-#define FPU_ADD_S(a, b) ps2FpuClamp((float)(a) + (float)(b))
-#define FPU_SUB_S(a, b) ps2FpuClamp((float)(a) - (float)(b))
+#define FPU_ADD_S(a, b) ps2FpuAdd((float)(a), (float)(b))
+#define FPU_SUB_S(a, b) ps2FpuSub((float)(a), (float)(b))
 #define FPU_MUL_S(a, b) ps2FpuClamp((float)(a) * (float)(b))
 #define FPU_DIV_S(a, b) ps2FpuClamp((float)(a) / (float)(b))
 #define FPU_SQRT_S(a) ps2FpuClamp(std::sqrt(std::fabs((float)(a))))

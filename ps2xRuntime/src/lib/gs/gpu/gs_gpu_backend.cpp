@@ -2,6 +2,8 @@
 #include "runtime/gs/gs_swizzle.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "../gs_cpu_backend_internal.h"
+#include "../gs_sprite_rules.h"
+#include "../gs_triangle_rules.h"
 #include "gs_gl.h"
 #include "gs_gpu_shaders.h"
 
@@ -70,6 +72,7 @@ namespace
     constexpr uint32_t FFst = 16u;
     constexpr uint32_t FPabe = 32u;
     constexpr uint32_t FLinear = 64u;
+    constexpr uint32_t FWrap = 128u;
 
     uint32_t fbits(float value)
     {
@@ -590,7 +593,7 @@ struct GSGpuBackend::Impl
         s[SScissorY] = static_cast<uint32_t>(ctx.scissor.y0) | (static_cast<uint32_t>(ctx.scissor.y1) << 16u);
         const uint32_t flags = (state.prim.iip ? FIip : 0u) | (state.prim.tme ? FTme : 0u) | (state.prim.fge ? FFge : 0u) |
                                (state.prim.abe ? FAbe : 0u) | (state.prim.fst ? FFst : 0u) | (state.pabe ? FPabe : 0u) |
-                               (state.linearFilter ? FLinear : 0u);
+                               (state.linearFilter ? FLinear : 0u) | ((state.colclamp & 1u) == 0u ? FWrap : 0u);
         s[SFlags] = flags;
         if (state.prim.tme)
         {
@@ -708,22 +711,14 @@ struct GSGpuBackend::Impl
         const GSVertex &v0 = batch.vertices[0];
         const GSVertex &v1 = batch.vertices[1];
         const auto &ctx = state.context;
-        const int ofx = ctx.xyoffset.ofx >> 4;
-        const int ofy = ctx.xyoffset.ofy >> 4;
-        int x0 = static_cast<int>(v0.x) - ofx;
-        int y0 = static_cast<int>(v0.y) - ofy;
-        int x1 = static_cast<int>(v1.x) - ofx;
-        int y1 = static_cast<int>(v1.y) - ofy;
-        if (x0 > x1)
-            std::swap(x0, x1);
-        if (y0 > y1)
-            std::swap(y0, y1);
-        const int unclippedX0 = x0;
-        const int unclippedY0 = y0;
-        const int spanX = std::max(1, x1 - x0);
-        const int spanY = std::max(1, y1 - y0);
-        const int unclippedX1 = unclippedX0 + spanX - 1;
-        const int unclippedY1 = unclippedY0 + spanY - 1;
+        const GSSpriteAxis axisX = gsSpriteAxis(v0.x, v1.x, static_cast<float>(ctx.xyoffset.ofx) / 16.0f);
+        const GSSpriteAxis axisY = gsSpriteAxis(v0.y, v1.y, static_cast<float>(ctx.xyoffset.ofy) / 16.0f);
+        const int unclippedX0 = axisX.first;
+        const int unclippedY0 = axisY.first;
+        const int unclippedX1 = axisX.last;
+        const int unclippedY1 = axisY.last;
+        if (unclippedX1 < unclippedX0 || unclippedY1 < unclippedY0)
+            return;
         if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 || unclippedY1 < ctx.scissor.y0 || unclippedY0 > ctx.scissor.y1)
             return;
         const int drawX0 = clampInt(unclippedX0, ctx.scissor.x0, ctx.scissor.x1);
@@ -736,19 +731,19 @@ struct GSGpuBackend::Impl
         uint32_t *p = newPrim(PrimSprite, s);
         p[1] = static_cast<uint32_t>(drawX0) | (static_cast<uint32_t>(drawX1) << 16u);
         p[2] = static_cast<uint32_t>(drawY0) | (static_cast<uint32_t>(drawY1) << 16u);
-        p[3] = static_cast<uint32_t>(unclippedX0);
-        p[4] = static_cast<uint32_t>(unclippedY0);
-        p[5] = fbits(std::max(1.0f, static_cast<float>(spanX)));
-        p[6] = fbits(std::max(1.0f, static_cast<float>(spanY)));
+        p[3] = fbits(axisX.origin);
+        p[4] = fbits(axisY.origin);
+        p[5] = fbits(axisX.scale);
+        p[6] = fbits(axisY.scale);
         if (state.prim.tme)
         {
             float u0f, v0f, u1f, v1f;
             if (state.prim.fst)
             {
-                u0f = static_cast<float>(v0.u >> 4);
-                v0f = static_cast<float>(v0.v >> 4);
-                u1f = static_cast<float>(v1.u >> 4);
-                v1f = static_cast<float>(v1.v >> 4);
+                u0f = static_cast<float>(v0.u) / 16.0f;
+                v0f = static_cast<float>(v0.v) / 16.0f;
+                u1f = static_cast<float>(v1.u) / 16.0f;
+                v1f = static_cast<float>(v1.v) / 16.0f;
             }
             else
             {
@@ -777,41 +772,28 @@ struct GSGpuBackend::Impl
         const GSVertex &v1 = batch.vertices[1];
         const GSVertex &v2 = batch.vertices[2];
         const auto &ctx = state.context;
-        const int ofx = ctx.xyoffset.ofx >> 4;
-        const int ofy = ctx.xyoffset.ofy >> 4;
-        const float fx0 = v0.x - static_cast<float>(ofx);
-        const float fy0 = v0.y - static_cast<float>(ofy);
-        const float fx1 = v1.x - static_cast<float>(ofx);
-        const float fy1 = v1.y - static_cast<float>(ofy);
-        const float fx2 = v2.x - static_cast<float>(ofx);
-        const float fy2 = v2.y - static_cast<float>(ofy);
-        int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
-        int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
-        int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
-        int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
-        minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
-        maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
-        minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
-        maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
-        const float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
-        if (std::fabs(denom) < 0.001f || minX > maxX || minY > maxY)
+        GSTriangleRaster tri;
+        if (!gsTriangleSetup(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, ctx.xyoffset.ofx, ctx.xyoffset.ofy, tri))
             return;
-        const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
-        const float invAbsDenom = 1.0f / std::fabs(denom);
+        const int minX = std::max(tri.minX, static_cast<int>(ctx.scissor.x0));
+        const int maxX = std::min(tri.maxX, static_cast<int>(ctx.scissor.x1));
+        const int minY = std::max(tri.minY, static_cast<int>(ctx.scissor.y0));
+        const int maxY = std::min(tri.maxY, static_cast<int>(ctx.scissor.y1));
+        if (minX > maxX || minY > maxY)
+            return;
 
         prepareTarget(state, minX, minY, maxX, maxY);
         const uint32_t s = addState(state);
         uint32_t *p = newPrim(PrimTriangle, s);
         p[1] = static_cast<uint32_t>(minX) | (static_cast<uint32_t>(maxX) << 16u);
         p[2] = static_cast<uint32_t>(minY) | (static_cast<uint32_t>(maxY) << 16u);
-        p[3] = fbits(fx0);
-        p[4] = fbits(fy0);
-        p[5] = fbits(fx1);
-        p[6] = fbits(fy1);
-        p[7] = fbits(fx2);
-        p[8] = fbits(fy2);
-        p[9] = fbits(winding);
-        p[10] = fbits(invAbsDenom);
+        for (uint32_t i = 0; i < 3u; ++i)
+        {
+            p[3u + i * 2u] = static_cast<uint32_t>(static_cast<int32_t>(tri.x[i]));
+            p[4u + i * 2u] = static_cast<uint32_t>(static_cast<int32_t>(tri.y[i]));
+        }
+        p[9] = static_cast<uint32_t>(tri.winding);
+        p[10] = fbits(static_cast<float>(tri.invArea));
         std::memcpy(p + 11, &v0.z, 8u);
         std::memcpy(p + 13, &v1.z, 8u);
         std::memcpy(p + 15, &v2.z, 8u);

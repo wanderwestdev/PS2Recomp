@@ -220,6 +220,7 @@ const uint F_ABE = 8u;
 const uint F_FST = 16u;
 const uint F_PABE = 32u;
 const uint F_LINEAR = 64u;
+const uint F_WRAP = 128u;
 
 uint st(uint s, uint i) { return states[s * STATE_WORDS + i]; }
 uint pw(uint p, uint i) { return prims[p * PRIM_WORDS + i]; }
@@ -535,9 +536,21 @@ void writePixel(uint s, int x, int y, uint z, uvec4 c, uint fog)
             uint dsel = (alphaReg >> 6u) & 3u;
             int fix = int(st(s, S_ALPHA_FIX) & 0xFFu);
             int cAlpha = csel == 0u ? a : (csel == 1u ? da : fix);
-            r = int(clampU8(((pickRgb(asel, r, dr) - pickRgb(bsel, r, dr)) * cAlpha >> 7) + pickRgb(dsel, r, dr)));
-            g = int(clampU8(((pickRgb(asel, g, dg) - pickRgb(bsel, g, dg)) * cAlpha >> 7) + pickRgb(dsel, g, dg)));
-            b = int(clampU8(((pickRgb(asel, b, db) - pickRgb(bsel, b, db)) * cAlpha >> 7) + pickRgb(dsel, b, db)));
+            int br = ((pickRgb(asel, r, dr) - pickRgb(bsel, r, dr)) * cAlpha >> 7) + pickRgb(dsel, r, dr);
+            int bg = ((pickRgb(asel, g, dg) - pickRgb(bsel, g, dg)) * cAlpha >> 7) + pickRgb(dsel, g, dg);
+            int bb = ((pickRgb(asel, b, db) - pickRgb(bsel, b, db)) * cAlpha >> 7) + pickRgb(dsel, b, db);
+            if ((flags & F_WRAP) != 0u)
+            {
+                r = br & 0xFF;
+                g = bg & 0xFF;
+                b = bb & 0xFF;
+            }
+            else
+            {
+                r = int(clampU8(br));
+                g = int(clampU8(bg));
+                b = int(clampU8(bb));
+            }
         }
         if (writeAlpha && (st(s, S_FBA) & 1u) != 0u && fpsm != 1u)
             a = a | 0x80;
@@ -585,17 +598,17 @@ void drawSprite(uint p, uint s, int x, int y)
         writePixel(s, x, y, z, color, fog);
         return;
     }
-    int ux0 = int(pw(p, 3u));
-    int uy0 = int(pw(p, 4u));
-    float spriteW = pf(p, 5u);
-    float spriteH = pf(p, 6u);
+    float ox = pf(p, 3u);
+    float oy = pf(p, 4u);
+    float scaleX = pf(p, 5u);
+    float scaleY = pf(p, 6u);
     float u0f = pf(p, 7u);
     float v0f = pf(p, 8u);
     float u1f = pf(p, 9u);
     float v1f = pf(p, 10u);
-    precise float ty = (float(y - uy0) + 0.5) / spriteH;
+    precise float ty = (float(y) - oy) * scaleY;
     precise float texVf = v0f + (v1f - v0f) * ty;
-    precise float tx = (float(x - ux0) + 0.5) / spriteW;
+    precise float tx = (float(x) - ox) * scaleX;
     precise float texUf = u0f + (u1f - u0f) * tx;
     uint texel;
     if ((flags & F_FST) != 0u)
@@ -619,22 +632,40 @@ void drawTriangle(uint p, uint s, int x, int y)
     uint yr = pw(p, 2u);
     if (x < int(xr & 0xFFFFu) || x > int(xr >> 16u) || y < int(yr & 0xFFFFu) || y > int(yr >> 16u))
         return;
-    float fx0 = pf(p, 3u);
-    float fy0 = pf(p, 4u);
-    float fx1 = pf(p, 5u);
-    float fy1 = pf(p, 6u);
-    float fx2 = pf(p, 7u);
-    float fy2 = pf(p, 8u);
-    float winding = pf(p, 9u);
-    float invAbsDenom = pf(p, 10u);
-    precise float px = float(x) + 0.5;
-    precise float py = float(y) + 0.5;
-    precise float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-    precise float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-    precise float w2 = 1.0 - w0 - w1;
-    const float eps = 1.0e-4;
-    if (w0 < -eps || w1 < -eps || w2 < -eps)
-        return;
+    int vx[3];
+    int vy[3];
+    for (uint i = 0u; i < 3u; ++i)
+    {
+        vx[i] = int(pw(p, 3u + i * 2u));
+        vy[i] = int(pw(p, 4u + i * 2u));
+    }
+    int sgn = int(pw(p, 9u));
+    float invArea = pf(p, 10u);
+    int sx = x * 16;
+    int sy = y * 16;
+    float e[3];
+    for (uint i = 0u; i < 3u; ++i)
+    {
+        uint a = (i + 1u) % 3u;
+        uint b = (i + 2u) % 3u;
+        int ea = -(vy[b] - vy[a]) * sgn;
+        int eb = (vx[b] - vx[a]) * sgn;
+        int hi1, lo1, hi2, lo2;
+        imulExtended(ea, sx - vx[a], hi1, lo1);
+        imulExtended(eb, sy - vy[a], hi2, lo2);
+        uint carry;
+        uint lo = uaddCarry(uint(lo1), uint(lo2), carry);
+        int hi = hi1 + hi2 + int(carry);
+        bool bias = ea > 0 || (ea == 0 && eb > 0);
+        bool positive = hi > 0 || (hi == 0 && lo != 0u);
+        bool zero = hi == 0 && lo == 0u;
+        if (!(positive || (zero && bias)))
+            return;
+        e[i] = float(hi) * 4294967296.0 + float(lo);
+    }
+    float w0 = e[0] * invArea;
+    float w1 = e[1] * invArea;
+    float w2 = e[2] * invArea;
 
     double z0 = pd(p, 11u);
     double z1 = pd(p, 13u);

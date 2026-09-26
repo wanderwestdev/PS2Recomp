@@ -226,9 +226,12 @@ namespace GSRaster
                         return 0;
                     };
                     const int cAlpha = (s.csel == 0) ? a : (s.csel == 1) ? da : s.fix;
-                    r = GSInternal::clampU8(((pick(s.asel, r, dr) - pick(s.bsel, r, dr)) * cAlpha >> 7) + pick(s.dsel, r, dr));
-                    g = GSInternal::clampU8(((pick(s.asel, g, dg) - pick(s.bsel, g, dg)) * cAlpha >> 7) + pick(s.dsel, g, dg));
-                    b = GSInternal::clampU8(((pick(s.asel, b, db) - pick(s.bsel, b, db)) * cAlpha >> 7) + pick(s.dsel, b, db));
+                    const int br = ((pick(s.asel, r, dr) - pick(s.bsel, r, dr)) * cAlpha >> 7) + pick(s.dsel, r, dr);
+                    const int bg = ((pick(s.asel, g, dg) - pick(s.bsel, g, dg)) * cAlpha >> 7) + pick(s.dsel, g, dg);
+                    const int bb = ((pick(s.asel, b, db) - pick(s.bsel, b, db)) * cAlpha >> 7) + pick(s.dsel, b, db);
+                    r = s.colclamp ? GSInternal::clampU8(br) : static_cast<uint8_t>(br & 0xFF);
+                    g = s.colclamp ? GSInternal::clampU8(bg) : static_cast<uint8_t>(bg & 0xFF);
+                    b = s.colclamp ? GSInternal::clampU8(bb) : static_cast<uint8_t>(bb & 0xFF);
                 }
             }
 

@@ -1295,7 +1295,7 @@ void register_ps2_runtime_expansion_tests()
             // With XYOFFSET=(1,1), vertex at (2,2) draws to pixel (1,1).
             const uint64_t xyz = (32ull) | (32ull << 16) | (0ull << 32);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz + (16ull | (16ull << 16)));
 
             const uint32_t insideOff = frameOffsetBytes(1u, 1u, 1u);
             t.Equals(vram[insideOff + 0u], static_cast<uint8_t>(200u), "inside draw should write R");
@@ -1309,7 +1309,7 @@ void register_ps2_runtime_expansion_tests()
             const uint64_t scissorOutside = (3ull) | (4ull << 16) | (3ull << 32) | (4ull << 48);
             gs.writeRegister(GS_REG_SCISSOR_1, scissorOutside);
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz + (16ull | (16ull << 16)));
 
             bool anyWrite = false;
             for (size_t i = 0; i < 1024u; ++i)
@@ -1321,6 +1321,36 @@ void register_ps2_runtime_expansion_tests()
                 }
             }
             t.IsFalse(anyWrite, "fully-outside sprite should not render any pixel");
+        });
+
+        tc.Run("GS sprite covers ceil(x0) to ceil(x1)-1 and zero-width sprites draw nothing", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_1, (1ull << 16));
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_XYOFFSET_1, (16ull) | (16ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (63ull << 48));
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+            gs.writeRegister(GS_REG_RGBAQ, 0xFF3214C8ull);
+            gs.writeRegister(GS_REG_XYZ2, 8ull | (8ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 72ull | (24ull << 16));
+
+            const auto written = [&vram](uint32_t x, uint32_t y) { return vram[frameOffsetBytes(x, y, 1u)] == 200u; };
+            t.IsTrue(written(0u, 0u), "x0=-0.5 starts at pixel 0");
+            t.IsTrue(written(3u, 0u), "x1=3.5 still covers pixel 3");
+            t.IsFalse(written(4u, 0u), "pixel 4 lies past x1");
+            t.IsFalse(written(0u, 1u), "y1=0.5 covers only row 0");
+
+            std::memset(vram.data(), 0, 4096u);
+            gs.writeRegister(GS_REG_XYZ2, 64ull | (64ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 64ull | (96ull << 16));
+            bool anyWrite = false;
+            for (size_t i = 0; i < 4096u; ++i)
+                anyWrite = anyWrite || vram[i] != 0u;
+            t.IsFalse(anyWrite, "a zero-width sprite draws nothing");
         });
 
         tc.Run("GS alpha blend uses ALPHA register FIX factor", [](TestCase &t)
@@ -1358,12 +1388,49 @@ void register_ps2_runtime_expansion_tests()
 
             const uint64_t xyz = (16ull) | (16ull << 16) | (0ull << 32); // pixel (1,1)
             gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
+            gs.writeRegister(GS_REG_XYZ2, xyz + (16ull | (16ull << 16)));
 
             // ((200 - 40) * 64 >> 7) + 40 = 120
             t.Equals(vram[pxOff + 0u], static_cast<uint8_t>(120u), "alpha blend should update R with FIX factor");
             t.Equals(vram[pxOff + 1u], static_cast<uint8_t>(120u), "alpha blend should update G with FIX factor");
             t.Equals(vram[pxOff + 2u], static_cast<uint8_t>(120u), "alpha blend should update B with FIX factor");
+        });
+
+        tc.Run("GS alpha blend wraps when COLCLAMP is 0 and saturates when it is 1", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_1, (1ull << 16));
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, (0ull) | (4ull << 16) | (0ull << 32) | (4ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 6));
+            gs.writeRegister(GS_REG_ALPHA_1, (0ull << 0) | (2ull << 2) | (2ull << 4) | (1ull << 6) | (128ull << 32));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80010203ull);
+            const uint32_t pxOff = frameOffsetBytes(1u, 1u, 1u);
+            const auto draw = [&gs]()
+            {
+                gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
+                gs.writeRegister(GS_REG_XYZ2, 32ull | (32ull << 16));
+            };
+
+            gs.writeRegister(GS_REG_COLCLAMP, 0ull);
+            vram[pxOff + 0u] = 255u;
+            vram[pxOff + 1u] = 254u;
+            vram[pxOff + 2u] = 10u;
+            draw();
+            t.Equals(vram[pxOff + 0u], static_cast<uint8_t>(2u), "255 + 3 wraps to 2");
+            t.Equals(vram[pxOff + 1u], static_cast<uint8_t>(0u), "254 + 2 wraps to 0");
+            t.Equals(vram[pxOff + 2u], static_cast<uint8_t>(11u), "no overflow keeps the sum");
+
+            gs.writeRegister(GS_REG_COLCLAMP, 1ull);
+            vram[pxOff + 0u] = 255u;
+            vram[pxOff + 1u] = 254u;
+            draw();
+            t.Equals(vram[pxOff + 0u], static_cast<uint8_t>(255u), "COLCLAMP=1 saturates");
+            t.Equals(vram[pxOff + 1u], static_cast<uint8_t>(255u), "COLCLAMP=1 saturates");
         });
 
         tc.Run("sceVu0ApplyMatrix uses libvux matrix math with the imported EE ABI", [](TestCase &t)
