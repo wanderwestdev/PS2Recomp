@@ -12,6 +12,8 @@
 #include <limits>
 #include <stdexcept>
 
+void ps2xTraceSchedulerDispatch(R5900Context *ctx);
+
 namespace
 {
     constexpr int KE_OK = 0;
@@ -336,6 +338,7 @@ void EeScheduler::run()
             }
             continue;
         }
+        ps2xTraceSchedulerDispatch(&context);
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
 
         if (checkpointDue(kGuestDispatchCycles))

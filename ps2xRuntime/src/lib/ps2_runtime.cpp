@@ -106,6 +106,82 @@ namespace
     };
 
     thread_local DispatchHistory g_dispatchHistory;
+    thread_local uint64_t g_guestJumpSerial = 0u;
+
+    struct BranchEvent
+    {
+        uint32_t kind;
+        uint32_t source;
+        uint32_t target;
+        uint32_t sp;
+        uint32_t ra;
+        uint32_t extra;
+    };
+
+    struct BranchTrace
+    {
+        std::vector<BranchEvent> events;
+        size_t next = 0u;
+        bool wrapped = false;
+    };
+
+    BranchTrace *branchTrace()
+    {
+        static const size_t size = []() -> size_t
+        {
+            const char *value = std::getenv("PS2X_BRANCH_TRACE");
+            return value ? static_cast<size_t>(std::strtoul(value, nullptr, 10)) : 0u;
+        }();
+        if (size == 0u)
+        {
+            return nullptr;
+        }
+        thread_local BranchTrace trace;
+        if (trace.events.empty())
+        {
+            trace.events.resize(size);
+        }
+        return &trace;
+    }
+
+    void pushBranchEvent(uint32_t kind, uint32_t source, uint32_t target, R5900Context *ctx, uint32_t extra)
+    {
+        BranchTrace *trace = branchTrace();
+        if (!trace)
+        {
+            return;
+        }
+        trace->events[trace->next] = {kind, source, target, static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)),
+                                      static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)), extra};
+        trace->next = (trace->next + 1u) % trace->events.size();
+        if (trace->next == 0u)
+        {
+            trace->wrapped = true;
+        }
+    }
+
+    void dumpBranchTrace()
+    {
+        BranchTrace *trace = branchTrace();
+        if (!trace)
+        {
+            return;
+        }
+        const char *path = std::getenv("PS2X_BRANCH_TRACE_FILE");
+        FILE *file = path ? std::fopen(path, "w") : nullptr;
+        FILE *out = file ? file : stderr;
+        const size_t count = trace->wrapped ? trace->events.size() : trace->next;
+        static const char *const kKinds[] = {"call", "ret", "jump", "sched"};
+        for (size_t i = 0; i < count; ++i)
+        {
+            const BranchEvent &e = trace->events[(trace->next + trace->events.size() - count + i) % trace->events.size()];
+            std::fprintf(out, "%s src=%08x dst=%08x sp=%08x ra=%08x x=%08x\n", kKinds[e.kind & 3u], e.source, e.target, e.sp, e.ra, e.extra);
+        }
+        if (file)
+        {
+            std::fclose(file);
+        }
+    }
 
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
@@ -1082,6 +1158,11 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
     }
 }
 
+void ps2xTraceSchedulerDispatch(R5900Context *ctx)
+{
+    pushBranchEvent(3u, 0u, ctx->pc, ctx, 0u);
+}
+
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
@@ -1270,6 +1351,15 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             std::lock_guard<std::mutex> lock(s_missingFunctionLogMutex);
             std::cerr << oss.str() << std::endl;
         }
+        dumpBranchTrace();
+        if (const char *dumpPath = std::getenv("PS2X_DUMP_RAM_ON_MISSING"); dumpPath && *dumpPath && rdram)
+        {
+            if (FILE *file = std::fopen(dumpPath, "wb"))
+            {
+                std::fwrite(rdram, 1, PS2_RAM_SIZE, file);
+                std::fclose(file);
+            }
+        }
     }
 
     if (firstReport && policy == MissingFunctionPolicy::BreakOnce)
@@ -1311,6 +1401,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (!isCall)
     {
+        pushBranchEvent(2u, sourcePc, targetPc, ctx, 0u);
+        ++g_guestJumpSerial;
         if (!hasFunction(targetPc))
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
@@ -1344,14 +1436,17 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint64_t jumpSerial = g_guestJumpSerial;
+    pushBranchEvent(0u, sourcePc, targetPc, ctx, fallthroughPc);
     targetFn(rdram, ctx, this);
+    pushBranchEvent(1u, targetPc, ctx->pc, ctx, fallthroughPc);
 
     if (m_eeScheduler->transferPending() || m_eeScheduler->unwinding() || isStopRequested() || ctx->pc == 0u)
     {
         return false;
     }
 
-    if (ctx->pc == entryPc)
+    if (ctx->pc == entryPc && jumpSerial == g_guestJumpSerial)
     {
         ctx->pc = fallthroughPc;
     }

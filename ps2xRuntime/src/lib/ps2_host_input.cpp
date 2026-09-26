@@ -71,7 +71,26 @@ namespace ps2_host_input
             double end = 0.0;
             bool fields = false;
             uint16_t buttons = 0u;
+            std::array<uint8_t, 4> axes{0x80u, 0x80u, 0x80u, 0x80u};
         };
+
+        struct AxisName
+        {
+            std::string_view name;
+            size_t axis;
+            uint8_t value;
+        };
+
+        constexpr std::array<AxisName, 8> kAxisNames{{
+            {"lleft", 0u, 0x00u},
+            {"lright", 0u, 0xFFu},
+            {"lup", 1u, 0x00u},
+            {"ldown", 1u, 0xFFu},
+            {"rleft", 2u, 0x00u},
+            {"rright", 2u, 0xFFu},
+            {"rup", 3u, 0x00u},
+            {"rdown", 3u, 0xFFu},
+        }};
 
         constexpr std::array<std::pair<std::string_view, uint16_t>, 16> kButtonNames{{
             {"select", PadButton::Select},
@@ -124,6 +143,13 @@ namespace ps2_host_input
                 step.end = step.start + (fields.size() == 3u ? std::stod(std::string(fields[2])) : defaultHold);
                 for (std::string_view name : split(fields[1], '+'))
                 {
+                    const auto axis = std::find_if(kAxisNames.begin(), kAxisNames.end(), [&](const AxisName &entry)
+                                                   { return entry.name == name; });
+                    if (axis != kAxisNames.end())
+                    {
+                        step.axes[axis->axis] = axis->value;
+                        continue;
+                    }
                     const auto found = std::find_if(kButtonNames.begin(), kButtonNames.end(), [&](const auto &entry)
                                                     { return entry.first == name; });
                     if (found == kButtonNames.end())
@@ -155,21 +181,39 @@ namespace ps2_host_input
             return script;
         }
 
-        uint16_t scriptedButtons(uint64_t vsyncTick)
+        struct ScriptedInput
+        {
+            uint16_t buttons = 0u;
+            std::array<uint8_t, 4> axes{0x80u, 0x80u, 0x80u, 0x80u};
+            bool active = false;
+        };
+
+        ScriptedInput scriptedInput(uint64_t vsyncTick)
         {
             static const std::vector<ScriptStep> script = loadScript();
             static const auto origin = std::chrono::steady_clock::now();
+            ScriptedInput input;
             if (script.empty())
-                return 0u;
+                return input;
             const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - origin).count();
-            uint16_t buttons = 0u;
             for (const ScriptStep &step : script)
             {
                 const double clock = step.fields ? static_cast<double>(vsyncTick) : now;
                 if (clock >= step.start && clock < step.end)
-                    buttons |= step.buttons;
+                {
+                    input.buttons |= step.buttons;
+                    for (size_t i = 0; i < input.axes.size(); ++i)
+                    {
+                        if (step.axes[i] != 0x80u)
+                        {
+                            input.axes[i] = step.axes[i];
+                            input.active = true;
+                        }
+                    }
+                }
             }
-            return buttons;
+            input.active = input.active || input.buttons != 0u;
+            return input;
         }
 
         std::mutex g_mutex;
@@ -271,11 +315,19 @@ namespace ps2_host_input
         if (port == 0u)
         {
             const std::atomic<uint64_t> *counter = g_fieldCounter.load();
-            const uint16_t scripted = scriptedButtons(counter ? counter->load() : 0u);
-            if (scripted != 0u)
+            const ScriptedInput scripted = scriptedInput(counter ? counter->load() : 0u);
+            if (scripted.active)
             {
                 state.connected = true;
-                state.buttons |= scripted;
+                state.buttons |= scripted.buttons;
+                if (scripted.axes[0] != 0x80u)
+                    state.leftX = scripted.axes[0];
+                if (scripted.axes[1] != 0x80u)
+                    state.leftY = scripted.axes[1];
+                if (scripted.axes[2] != 0x80u)
+                    state.rightX = scripted.axes[2];
+                if (scripted.axes[3] != 0x80u)
+                    state.rightY = scripted.axes[3];
                 applyPressure(state);
             }
         }
