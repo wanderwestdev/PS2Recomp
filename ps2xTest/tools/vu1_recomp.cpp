@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <set>
@@ -18,6 +19,12 @@ namespace
 
     constexpr uint32_t kCodeSize = 16u * 1024u;
     constexpr uint32_t kDefaultBlockPairs = 128u;
+    constexpr uint32_t kMaxVfLatency = 4u;
+    constexpr uint32_t kMaxViLatency = 4u;
+    constexpr uint32_t kMaxAccLatency = 1u;
+    constexpr uint32_t kFmacLatency = 4u;
+    constexpr uint32_t kSegmentJoinLimit = 24u;
+    constexpr size_t kPartBytes = 400u * 1024u;
 
     uint64_t fnv1a64(const uint8_t *data, size_t size)
     {
@@ -83,7 +90,108 @@ namespace
     int32_t fImm11(uint32_t i) { return static_cast<int32_t>(i << 21) >> 21; }
 
     std::string vf(uint32_t reg) { return "vu.m_state.vf[" + num(reg) + "]"; }
-    std::string vi(uint32_t reg) { return "vu.m_state.vi[" + num(reg) + "]"; }
+
+    struct RegView
+    {
+        bool local = false;
+        bool record = false;
+        std::set<uint32_t> vfUsed;
+        std::set<uint32_t> vfWritten;
+        std::set<uint32_t> viUsed;
+        std::set<uint32_t> viWritten;
+    };
+
+    RegView gView;
+
+    std::string vi(uint32_t reg)
+    {
+        if (!gView.local)
+            return "vu.m_state.vi[" + num(reg) + "]";
+        if (reg == 0u)
+            return "0";
+        if (gView.record)
+            gView.viUsed.insert(reg);
+        return "vi" + num(reg);
+    }
+
+    std::string viW(uint32_t reg)
+    {
+        if (gView.local && gView.record && reg != 0u)
+            gView.viWritten.insert(reg);
+        return vi(reg);
+    }
+
+    void noteVf(uint32_t reg, bool write)
+    {
+        if (!gView.record || reg == 0u)
+            return;
+        gView.vfUsed.insert(reg);
+        if (write)
+            gView.vfWritten.insert(reg);
+    }
+
+    std::string rawV(uint32_t reg)
+    {
+        if (!gView.local)
+            return reg == 32u ? std::string("_mm_loadu_ps(vu.m_state.acc)") : "_mm_loadu_ps(" + vf(reg) + ")";
+        if (reg == 0u)
+            return "kVf0()";
+        noteVf(reg, false);
+        return "vr" + num(reg);
+    }
+
+    std::string normV(uint32_t reg)
+    {
+        if (!gView.local)
+            return reg == 32u ? std::string("nacc(ctx)") : "nv(ctx, " + num(reg) + "u)";
+        if (reg == 0u)
+            return "kVf0()";
+        noteVf(reg, false);
+        return "vn" + num(reg);
+    }
+
+    std::string normBc(uint32_t reg, uint32_t bc)
+    {
+        if (!gView.local)
+            return "nbc(ctx, " + num(reg) + "u, " + num(bc) + "u)";
+        return "bcast<" + num(bc) + "u>(" + normV(reg) + ")";
+    }
+
+    std::string laneBits(uint32_t reg, uint32_t component)
+    {
+        if (!gView.local)
+            return "std::bit_cast<uint32_t>(" + vf(reg) + "[" + num(component) + "])";
+        return "static_cast<uint32_t>(_mm_extract_ps(" + rawV(reg) + ", " + num(component) + "))";
+    }
+
+    std::string laneFloat(uint32_t reg, uint32_t component)
+    {
+        if (!gView.local)
+            return vf(reg) + "[" + num(component) + "]";
+        return "laneF<" + num(component) + "u>(" + rawV(reg) + ")";
+    }
+
+    std::string writeV(uint32_t reg, const std::string &raw, const std::string &norm, const std::string &dest)
+    {
+        if (!gView.local)
+            return "writeVf(vu, ctx, " + num(reg) + "u, " + raw + ", " + norm + ", " + dest + ");";
+        if (reg == 0u)
+            return "";
+        noteVf(reg, true);
+        const std::string r = "vr" + num(reg);
+        const std::string n = "vn" + num(reg);
+        return r + " = blendDest(" + r + ", " + raw + ", " + dest + "); " + n + " = blendDest(" + n + ", " + norm + ", " + dest + ");";
+    }
+
+    std::string writeFullV(uint32_t reg, const std::string &raw, const std::string &norm)
+    {
+        if (!gView.local)
+            return "writeVfFull(vu, ctx, " + num(reg) + "u, " + raw + ", " + norm + ");";
+        if (reg == 0u)
+            return "";
+        noteVf(reg, true);
+        return "vr" + num(reg) + " = " + raw + "; vn" + num(reg) + " = " + norm + ";";
+    }
 
     struct UpperEmit
     {
@@ -98,6 +206,7 @@ namespace
         bool isFmac = false;
         bool normalize = false;
         uint32_t reg = 0u;
+        std::string fmacCall;
     };
 
     UpperEmit upperEmit(uint32_t upper)
@@ -108,9 +217,9 @@ namespace
         const uint32_t ft = fFt(upper);
         const uint32_t fs = fFs(upper);
         const uint32_t fd = fFd(upper);
-        const std::string s = "nv(ctx, " + num(fs) + "u)";
-        const auto bcExpr = [&](uint32_t bc) { return "nbc(ctx, " + num(ft) + "u, " + num(bc) + "u)"; };
-        const std::string tVec = "nv(ctx, " + num(ft) + "u)";
+        const std::string s = normV(fs);
+        const auto bcExpr = [&](uint32_t bc) { return normBc(ft, bc); };
+        const std::string tVec = normV(ft);
         const std::string zero = "_mm_setzero_ps()";
 
         const auto fmac = [&](const char *kind, const std::string &t, bool usesAcc, bool toAcc, bool readsQ)
@@ -121,8 +230,9 @@ namespace
             e.dest = dest;
             e.readsQ = readsQ;
             e.isFmac = true;
-            e.value = std::string("fmac<FK::") + kind + ">(vu, ctx, cyc, " + hx(dest) + ", " + s + ", " + t + ", " +
-                      (usesAcc ? "nacc(ctx)" : zero) + ", un)";
+            e.fmacCall = std::string("<FK::") + kind + ">(vu, ctx, cyc, " + hx(dest) + ", " + s + ", " + t + ", " +
+                         (usesAcc ? normV(32u) : zero) + ", un";
+            e.value = "fmac" + e.fmacCall + ")";
             if (toAcc)
             {
                 e.reg = 32u;
@@ -211,7 +321,7 @@ namespace
         switch (special)
         {
         case 0x10: case 0x11: case 0x12: case 0x13:
-            unary("itof<" + num(kShift[special & 3u]) + "u>(_mm_loadu_ps(" + vf(fs) + "))", ft);
+            unary("itof<" + num(kShift[special & 3u]) + "u>(" + rawV(fs) + ")", ft);
             break;
         case 0x14: case 0x15: case 0x16: case 0x17:
             unary("ftoi<" + num(kShift[special & 3u]) + "u>(" + s + ")", ft, true);
@@ -221,7 +331,7 @@ namespace
         case 0x1E: fmac("Mul", "iN(vu)", false, true, false); break;
         case 0x1F:
             e.nop = false;
-            e.statement = "clipOp(vu, ctx, cyc, " + num(fs) + "u, " + num(ft) + "u);";
+            e.statement = "clipOp(vu, ctx, cyc, " + rawV(fs) + ", " + rawV(ft) + ");";
             break;
         case 0x20: fmac("Add", "qN(vu)", false, true, true); break;
         case 0x21: fmac("Madd", "qN(vu)", true, true, true); break;
@@ -266,9 +376,12 @@ namespace
         return 3u;
     }
 
-    LowerEmit lowerEmit(uint32_t pc, uint32_t lower, uint32_t upper)
+    using BranchVi = std::function<std::string(uint32_t)>;
+
+    LowerEmit lowerEmit(uint32_t pc, uint32_t lower, uint32_t upper, const BranchVi *branchVi = nullptr)
     {
         LowerEmit e;
+        const auto br = [&](uint32_t reg) { return branchVi ? (*branchVi)(reg) : "vu.readBranchVi(" + num(reg) + "u)"; };
         if (lower == 0u || lower == 0x8000033Cu)
             return e;
         const uint32_t opHi = (lower >> 25) & 0x7Fu;
@@ -289,19 +402,19 @@ namespace
         const auto viSet = [&](uint32_t reg, const std::string &value)
         {
             if (reg != 0u)
-                e.code += vi(reg) + " = static_cast<int16_t>(" + value + ");";
+                e.code += viW(reg) + " = static_cast<int16_t>(" + value + ");";
         };
         const auto loadVf = [&](uint32_t reg, const std::string &address)
         {
             if (dest == 0u)
                 return;
-            e.code += "{ const __m128 lv = ldq(mem, " + address + "); writeVf(vu, ctx, " + num(reg) + "u, lv, vnorm(lv), " + dst + "); }";
+            e.code += "{ const __m128 lv = ldq(mem, " + address + "); " + writeV(reg, "lv", "vnorm(lv)", dst) + " }";
             e.writesVf0 = e.writesVf0 || reg == 0u;
         };
         const auto storeVf = [&](uint32_t reg, const std::string &address)
         {
             if (dest != 0u)
-                e.code += "stq(vu, ctx, cyc, " + address + ", _mm_loadu_ps(" + vf(reg) + "), " + dst + ");";
+                e.code += "stq(vu, ctx, cyc, " + address + ", " + rawV(reg) + ", " + dst + ");";
         };
         const uint32_t imm12 = (((lower >> 21) & 1u) << 11) | (lower & 0x7FFu);
         const uint32_t imm24 = lower & 0xFFFFFFu;
@@ -331,20 +444,20 @@ namespace
             return e;
         }
         case 0x10:
-            e.code = "commitClip(vu, ctx, cyc); " + vi(1) + " = (vu.m_state.clip & 0xFFFFFFu) == " + hx(imm24) + " ? 1 : 0;";
+            e.code = "commitClip(vu, ctx, cyc); " + viW(1) + " = (vu.m_state.clip & 0xFFFFFFu) == " + hx(imm24) + " ? 1 : 0;";
             return e;
         case 0x11:
             e.code = "queueFcsetAt(vu, ctx, cyc, " + hx(imm24) + ");";
             return e;
         case 0x12:
-            e.code = "commitClip(vu, ctx, cyc); " + vi(1) + " = (vu.m_state.clip & " + hx(imm24) + ") != 0u ? 1 : 0;";
+            e.code = "commitClip(vu, ctx, cyc); " + viW(1) + " = (vu.m_state.clip & " + hx(imm24) + ") != 0u ? 1 : 0;";
             return e;
         case 0x13:
-            e.code = "commitClip(vu, ctx, cyc); " + vi(1) + " = (vu.m_state.clip | " + hx(imm24) + ") == 0xFFFFFFu ? 1 : 0;";
+            e.code = "commitClip(vu, ctx, cyc); " + viW(1) + " = (vu.m_state.clip | " + hx(imm24) + ") == 0xFFFFFFu ? 1 : 0;";
             return e;
         case 0x14:
             if (it != 0u)
-                e.code = "commitStatus(vu, ctx, cyc); " + vi(it) + " = " + status + " == " + hx(imm12) + " ? 1 : 0;";
+                e.code = "commitStatus(vu, ctx, cyc); " + viW(it) + " = " + status + " == " + hx(imm12) + " ? 1 : 0;";
             return e;
         case 0x15:
             e.code = "queueFssetAt(vu, ctx, cyc, " + hx(imm12) + ");";
@@ -365,7 +478,7 @@ namespace
             return e;
         case 0x18:
             if (it != 0u)
-                e.code = "commitStatus(vu, ctx, cyc); " + vi(it) + " = (vu.m_state.mac & 0xFFFFu) == static_cast<uint32_t>(static_cast<uint16_t>(" + vi(is) + ")) ? 1 : 0;";
+                e.code = "commitStatus(vu, ctx, cyc); " + viW(it) + " = (vu.m_state.mac & 0xFFFFu) == static_cast<uint32_t>(static_cast<uint16_t>(" + vi(is) + ")) ? 1 : 0;";
             return e;
         case 0x1A:
         case 0x1B:
@@ -388,16 +501,16 @@ namespace
             viSet(it, num((pc + 16u) / 8u));
             return e;
         case 0x24:
-            e.code = "jt = (static_cast<uint32_t>(static_cast<uint16_t>(vu.readBranchVi(" + num(is) + "u))) * 8u) & 0x3FFFu;";
+            e.code = "jt = (static_cast<uint32_t>(static_cast<uint16_t>(" + br(is) + ")) * 8u) & 0x3FFFu;";
             return e;
         case 0x25:
-            e.code = "jt = (static_cast<uint32_t>(static_cast<uint16_t>(vu.readBranchVi(" + num(is) + "u))) * 8u) & 0x3FFFu;";
+            e.code = "jt = (static_cast<uint32_t>(static_cast<uint16_t>(" + br(is) + ")) * 8u) & 0x3FFFu;";
             viSet(it, num((pc + 16u) / 8u));
             return e;
         case 0x28:
         case 0x29:
-            e.code = "tk = static_cast<int16_t>(vu.readBranchVi(" + num(is) + "u)) " + (opHi == 0x28u ? "==" : "!=") +
-                     " static_cast<int16_t>(vu.readBranchVi(" + num(it) + "u));";
+            e.code = "tk = static_cast<int16_t>(" + br(is) + ") " + (opHi == 0x28u ? "==" : "!=") +
+                     " static_cast<int16_t>(" + br(it) + ");";
             return e;
         case 0x2C:
         case 0x2D:
@@ -405,7 +518,7 @@ namespace
         case 0x2F:
         {
             static const char *kCompare[4] = {"< 0", "> 0", "<= 0", ">= 0"};
-            e.code = "tk = static_cast<int16_t>(vu.readBranchVi(" + num(is) + "u)) " + kCompare[opHi - 0x2Cu] + ";";
+            e.code = "tk = static_cast<int16_t>(" + br(is) + ") " + kCompare[opHi - 0x2Cu] + ";";
             return e;
         }
         case 0x40:
@@ -453,15 +566,15 @@ namespace
         case 0x30:
             if (dest != 0u)
             {
-                e.code = "writeVf(vu, ctx, " + num(ft) + "u, _mm_loadu_ps(" + vf(fs) + "), nv(ctx, " + num(fs) + "u), " + dst + ");";
+                e.code = writeV(ft, rawV(fs), normV(fs), dst);
                 e.writesVf0 = ft == 0u;
             }
             return e;
         case 0x31:
             if (dest != 0u)
             {
-                e.code = "{ const __m128 mr = _mm_loadu_ps(" + vf(fs) + "); const __m128 mn = nv(ctx, " + num(fs) + "u); writeVf(vu, ctx, " +
-                         num(ft) + "u, _mm_shuffle_ps(mr, mr, _MM_SHUFFLE(0, 3, 2, 1)), _mm_shuffle_ps(mn, mn, _MM_SHUFFLE(0, 3, 2, 1)), " + dst + "); }";
+                e.code = "{ const __m128 mr = " + rawV(fs) + "; const __m128 mn = " + normV(fs) + "; " +
+                         writeV(ft, "_mm_shuffle_ps(mr, mr, _MM_SHUFFLE(0, 3, 2, 1))", "_mm_shuffle_ps(mn, mn, _MM_SHUFFLE(0, 3, 2, 1))", dst) + " }";
                 e.writesVf0 = ft == 0u;
             }
             return e;
@@ -482,25 +595,25 @@ namespace
             storeVf(fs, "qaddr(" + vi(it) + ", 0)");
             return e;
         case 0x38:
-            e.code = "divOp(vu, ctx, cyc, " + num(fs) + "u, " + num(fsf) + "u, " + num(ft) + "u, " + num(ftf) + "u);";
+            e.code = "divOp(vu, ctx, cyc, " + laneFloat(fs, fsf) + ", " + laneFloat(ft, ftf) + ");";
             return e;
         case 0x39:
-            e.code = "sqrtOp(vu, ctx, cyc, " + num(ft) + "u, " + num(ftf) + "u);";
+            e.code = "sqrtOp(vu, ctx, cyc, " + laneFloat(ft, ftf) + ");";
             return e;
         case 0x3A:
-            e.code = "rsqrtOp(vu, ctx, cyc, " + num(fs) + "u, " + num(fsf) + "u, " + num(ft) + "u, " + num(ftf) + "u);";
+            e.code = "rsqrtOp(vu, ctx, cyc, " + laneFloat(fs, fsf) + ", " + laneFloat(ft, ftf) + ");";
             return e;
         case 0x3B:
             return e;
         case 0x3C:
             if (it != 0u)
-                viSet(it, "std::bit_cast<uint32_t>(" + vf(fs) + "[" + num(fsf) + "]) & 0xFFFFu");
+                viSet(it, laneBits(fs, fsf) + " & 0xFFFFu");
             return e;
         case 0x3D:
             if (dest != 0u)
             {
                 e.code = "{ const __m128 mv = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int16_t>(" + vi(is) +
-                         " & 0xFFFF))); writeVf(vu, ctx, " + num(ft) + "u, mv, vnorm(mv), " + dst + "); }";
+                         " & 0xFFFF))); " + writeV(ft, "mv", "vnorm(mv)", dst) + " }";
                 e.writesVf0 = ft == 0u;
             }
             return e;
@@ -515,7 +628,7 @@ namespace
         case 0x64:
             if (dest != 0u)
             {
-                e.code = "commitEfu(vu, cyc); { const __m128 pv = _mm_set1_ps(vu.m_state.p); writeVf(vu, ctx, " + num(ft) + "u, pv, vnorm(pv), " + dst + "); }";
+                e.code = "commitEfu(vu, cyc); { const __m128 pv = _mm_set1_ps(vu.m_state.p); " + writeV(ft, "pv", "vnorm(pv)", dst) + " }";
                 e.writesVf0 = ft == 0u;
             }
             return e;
@@ -563,6 +676,13 @@ namespace
         std::set<std::string> checked;
         bool fdivChecked = false;
         uint32_t fdivK = 0;
+        std::vector<uint32_t> off;
+        std::vector<uint32_t> fmacPos;
+        bool readsStatus = false;
+        std::set<uint32_t> collapsed;
+        uint32_t lastCollapsed = ~0u;
+        int backupReg = -1;
+        std::string backupVar;
     };
 
     std::string segLabel(uint32_t pc)
@@ -582,6 +702,8 @@ namespace
         std::set<std::string> exits;
         std::vector<bool> isTarget;
         std::set<uint32_t> segs;
+        bool aggregateFlags = true;
+        bool cacheRegisters = true;
 
         bool inBlock(uint32_t pc) const
         {
@@ -655,7 +777,7 @@ namespace
         {
             segs.clear();
             for (uint32_t index = first; index < last; ++index)
-                if (isStart(index) && segmentPositions(index) >= 3u)
+                if (isStart(index) && segmentPositions(index) >= 1u)
                     segs.insert(index);
         }
 
@@ -672,10 +794,11 @@ namespace
                 terms.push_back("s" + k.id + "_" + num(writerPos) + " + " + num(latency) + "u");
                 extra = std::max(extra, latency - distance);
             };
-            const auto external = [&](const std::string &expr)
+            const auto external = [&](const std::string &expr, uint32_t maxLatency)
             {
-                if (k.checked.insert(expr).second)
-                    k.checks[k.pos].push_back(expr);
+                if (k.pos + 1u >= maxLatency)
+                    return;
+                terms.push_back(expr);
             };
             std::set<std::pair<uint32_t, uint32_t>> lanes;
             for (const auto *usage : {&d.upperUsage, &d.lowerUsage})
@@ -694,7 +817,7 @@ namespace
                 if (it != k.vf.end())
                     internal(it->second.first, it->second.second);
                 else
-                    external("vu.m_vfReady[" + num(lane.first) + "][" + num(lane.second) + "]");
+                    external("vu.m_vfReady[" + num(lane.first) + "][" + num(lane.second) + "]", kMaxVfLatency);
             }
             const uint32_t viReads = (d.upperUsage.viRead | d.lowerUsage.viRead) & 0xFFFEu;
             for (uint32_t reg = 1; reg < 16u; ++reg)
@@ -705,7 +828,7 @@ namespace
                 if (it != k.vi.end())
                     internal(it->second.first, it->second.second);
                 else
-                    external("vu.m_viReady[" + num(reg) + "]");
+                    external("vu.m_viReady[" + num(reg) + "]", kMaxViLatency);
             }
             const uint32_t accReads = d.upperUsage.accRead | d.lowerUsage.accRead;
             for (uint32_t component = 0; component < 4u; ++component)
@@ -716,7 +839,7 @@ namespace
                 if (it != k.acc.end())
                     internal(it->second.first, it->second.second);
                 else
-                    external("vu.m_accReady[" + num(component) + "]");
+                    external("vu.m_accReady[" + num(component) + "]", kMaxAccLatency);
             }
             if (!d.iBit && (A::pipeline(d.lowerUsage) == A::kPipeFdiv || d.lowerUsage.waitQ))
             {
@@ -729,6 +852,7 @@ namespace
                 }
             }
             k.bound += 1u + extra;
+            k.off.push_back(static_cast<uint32_t>(k.bound - 1u));
             if (terms.empty())
                 return "";
             std::string out = "        { uint64_t r = cyc;";
@@ -790,7 +914,7 @@ namespace
             addReads(d.upperUsage);
             addReads(d.lowerUsage);
             const uint32_t viReads = (d.upperUsage.viRead | d.lowerUsage.viRead) & 0xFFFEu;
-            const uint32_t accReads = d.upperUsage.accRead | d.lowerUsage.accRead;
+            const uint32_t accReads = 0u;
             const unsigned lowerPipe = A::pipeline(d.lowerUsage);
             const bool fdiv = lowerPipe == A::kPipeFdiv || d.lowerUsage.waitQ;
             const bool efu = lowerPipe == A::kPipeEfu;
@@ -804,9 +928,6 @@ namespace
             for (uint32_t reg = 1; reg < 16u; ++reg)
                 if (viReads & (1u << reg))
                     out += " r = rmax(r, vu.m_viReady[" + num(reg) + "]);";
-            for (uint32_t component = 0; component < 4u; ++component)
-                if (accReads & laneBit(component))
-                    out += " r = rmax(r, vu.m_accReady[" + num(component) + "]);";
             if (fdiv)
                 out += " if (vu.m_fdiv.valid) r = rmax(r, vu.m_fdiv.readyCycle);";
             if (efu)
@@ -824,10 +945,42 @@ namespace
         {
             const auto &d = p.d;
             std::string out;
+            const uint32_t viWrites = d.lowerUsage.viWrite & 0xFFFEu;
+            const uint32_t writtenVi = viWrites != 0u ? static_cast<uint32_t>(std::countr_zero(viWrites)) : 0u;
+            const bool recordBackup = writtenVi != 0u && d.lowerUsage.delaysNextBranchRead;
+            std::string backupVar = "oldVi";
+            gView.record = known != nullptr;
+            BranchVi branchVi;
+            const BranchVi *branchViPtr = nullptr;
             if (known)
             {
                 out += knownStall(p, *known);
                 out += "        s" + known->id + "_" + num(known->pos) + " = cyc;\n";
+                if (recordBackup)
+                {
+                    backupVar = "bk" + known->id + "_" + num(known->pos);
+                    out += "        const int32_t " + backupVar + " = " + vi(writtenVi) + ";\n";
+                }
+                if (known->backupReg >= 0)
+                {
+                    const int reg = known->backupReg;
+                    const std::string var = known->backupVar;
+                    branchVi = [reg, var](uint32_t r)
+                    {
+                        if (r == 0u)
+                            return std::string("0");
+                        if (static_cast<int>(r) == reg)
+                            return var;
+                        return vi(r);
+                    };
+                    branchViPtr = &branchVi;
+                }
+                if (!d.iBit)
+                {
+                    const uint32_t opHi = (d.lower >> 25) & 0x7Fu;
+                    if ((opHi >= 0x14u && opHi <= 0x18u) || opHi == 0x1Au || opHi == 0x1Bu)
+                        known->readsStatus = true;
+                }
             }
             else
             {
@@ -835,13 +988,25 @@ namespace
                 out += stall(p, stub);
             }
             out += "        {\n";
-            const uint32_t viWrites = d.lowerUsage.viWrite & 0xFFFEu;
-            const uint32_t writtenVi = viWrites != 0u ? static_cast<uint32_t>(std::countr_zero(viWrites)) : 0u;
-            const bool recordBackup = writtenVi != 0u && d.lowerUsage.delaysNextBranchRead;
-            if (recordBackup)
+            if (recordBackup && !known)
                 out += "            const int32_t oldVi = " + vi(writtenVi) + ";\n";
             const UpperEmit up = upperEmit(d.upper);
-            const LowerEmit low = d.iBit ? LowerEmit{} : lowerEmit(p.pc, d.lower, d.upper);
+            const LowerEmit low = d.iBit ? LowerEmit{} : lowerEmit(p.pc, d.lower, d.upper, branchViPtr);
+            std::string fmacValue = up.value;
+            std::string fmacDecl = "__m128 un;";
+            std::string fmacAfter;
+            if (known && up.isFmac)
+            {
+                known->fmacPos.push_back(known->pos);
+                if (known->pos == known->lastCollapsed)
+                {
+                    fmacValue = "fmacF" + up.fmacCall + ", fl)";
+                    fmacDecl = "__m128 un; FmacFlags fl;";
+                    fmacAfter = " pushFmacFlags(vu, ctx, cyc, fl.mac, fl.status, fl.status | fl.extra | fAccScalar | stickyOf(fAccZ, fAccS));";
+                }
+                else if (known->collapsed.count(known->pos))
+                    fmacValue = "fmacV" + up.fmacCall + ", fAccZ, fAccS, fAccScalar)";
+            }
             if (up.readsQ || up.generic)
                 out += "            syncQ(vu, ctx, cyc);\n";
             std::string lowerCode = low.code.empty() ? "" : "            " + low.code + "\n";
@@ -854,9 +1019,10 @@ namespace
                 if (!up.statement.empty())
                     return "            " + up.statement + "\n";
                 if (up.isFmac)
-                    return "            { __m128 un; const __m128 uv = " + up.value + "; writeVf(vu, ctx, " + num(up.reg) + "u, uv, un, " + hx(up.dest) + "); }\n";
-                return "            { const __m128 uv = " + up.value + "; writeVf(vu, ctx, " + num(up.reg) + "u, uv, " +
-                       (up.normalize ? std::string("vnorm(uv)") : std::string("uv")) + ", " + hx(up.dest) + "); }\n";
+                    return "            { " + fmacDecl + " const __m128 uv = " + fmacValue + ";" + fmacAfter + " " + writeV(up.reg, "uv", "un", hx(up.dest)) +
+                           " }\n";
+                return "            { const __m128 uv = " + up.value + "; " +
+                       writeV(up.reg, "uv", up.normalize ? std::string("vnorm(uv)") : std::string("uv"), hx(up.dest)) + " }\n";
             };
             if (d.iBit)
             {
@@ -882,16 +1048,16 @@ namespace
                 }
                 else
                 {
-                    out += "            const __m128 shadowOld = _mm_loadu_ps(" + reg + ");\n";
-                    out += "            const __m128 shadowOldN = nv(ctx, " + num(d.upperVfShadowReg) + "u);\n";
+                    out += "            const __m128 shadowOld = " + rawV(d.upperVfShadowReg) + ";\n";
+                    out += "            const __m128 shadowOldN = " + normV(d.upperVfShadowReg) + ";\n";
                     if (up.isFmac)
-                        out += "            __m128 un; const __m128 uv = " + up.value + ";\n";
+                        out += "            " + fmacDecl + " const __m128 uv = " + fmacValue + ";" + fmacAfter + "\n";
                     else
                         out += "            const __m128 uv = " + up.value + "; const __m128 un = " +
                                (up.normalize ? std::string("vnorm(uv)") : std::string("uv")) + ";\n";
                     out += lowerCode;
-                    out += "            writeVfFull(vu, ctx, " + num(d.upperVfShadowReg) + "u, blendDest(shadowOld, uv, " + hx(up.dest) +
-                           "), blendDest(shadowOldN, un, " + hx(up.dest) + "));\n";
+                    out += "            " + writeFullV(d.upperVfShadowReg, "blendDest(shadowOld, uv, " + hx(up.dest) + ")",
+                                                  "blendDest(shadowOldN, un, " + hx(up.dest) + ")") + "\n";
                 }
             }
             else
@@ -899,35 +1065,43 @@ namespace
                 out += upperStore();
                 out += lowerCode;
             }
-            out += "            vu.m_viBranchBackupValid = false;\n";
-            const auto markVf = [&](uint32_t reg, uint32_t lanes, uint32_t latency)
+            if (!known)
             {
+                out += "            vu.m_viBranchBackupValid = false;\n";
+                const auto markVf = [&](uint32_t reg, uint32_t lanes, uint32_t latency)
+                {
+                    for (uint32_t component = 0; component < 4u; ++component)
+                        if (lanes & laneBit(component))
+                            out += "            vu.m_vfReady[" + num(reg) + "][" + num(component) + "] = cyc + " + num(latency) + "u;\n";
+                };
+                const auto lw = d.lowerUsage.vfWrite;
+                if (lw.reg != 0u && d.suppressedLowerVf != lw.reg)
+                    markVf(lw.reg, lw.lanes, d.lowerUsage.vfLatency != 0u ? d.lowerUsage.vfLatency : d.lowerUsage.latency);
+                const auto uw = d.upperUsage.vfWrite;
+                if (uw.reg != 0u)
+                    markVf(uw.reg, uw.lanes, d.upperUsage.vfLatency != 0u ? d.upperUsage.vfLatency : d.upperUsage.latency);
+                for (uint32_t reg = 1; reg < 16u; ++reg)
+                    if (viWrites & (1u << reg))
+                        out += "            vu.m_viReady[" + num(reg) + "] = cyc + " +
+                               num(d.lowerUsage.viLatency != 0u ? d.lowerUsage.viLatency : d.lowerUsage.latency) + "u;\n";
                 for (uint32_t component = 0; component < 4u; ++component)
-                    if (lanes & laneBit(component))
-                        out += "            vu.m_vfReady[" + num(reg) + "][" + num(component) + "] = cyc + " + num(latency) + "u;\n";
-            };
-            const auto lw = d.lowerUsage.vfWrite;
-            if (lw.reg != 0u && d.suppressedLowerVf != lw.reg)
-                markVf(lw.reg, lw.lanes, d.lowerUsage.vfLatency != 0u ? d.lowerUsage.vfLatency : d.lowerUsage.latency);
-            const auto uw = d.upperUsage.vfWrite;
-            if (uw.reg != 0u)
-                markVf(uw.reg, uw.lanes, d.upperUsage.vfLatency != 0u ? d.upperUsage.vfLatency : d.upperUsage.latency);
-            for (uint32_t reg = 1; reg < 16u; ++reg)
-                if (viWrites & (1u << reg))
-                    out += "            vu.m_viReady[" + num(reg) + "] = cyc + " +
-                           num(d.lowerUsage.viLatency != 0u ? d.lowerUsage.viLatency : d.lowerUsage.latency) + "u;\n";
-            for (uint32_t component = 0; component < 4u; ++component)
-                if (d.upperUsage.accWrite & laneBit(component))
-                    out += "            vu.m_accReady[" + num(component) + "] = cyc + 1u;\n";
-            if (recordBackup)
-                out += "            vu.m_viBranchBackupValue = oldVi; vu.m_viBranchBackupReg = " + num(writtenVi) +
-                       "u; vu.m_viBranchBackupValid = true;\n";
-            if (up.writeReg == 0 || up.generic || low.writesVf0)
+                    if (d.upperUsage.accWrite & laneBit(component))
+                        out += "            vu.m_accReady[" + num(component) + "] = cyc + 1u;\n";
+                if (recordBackup)
+                    out += "            vu.m_viBranchBackupValue = oldVi; vu.m_viBranchBackupReg = " + num(writtenVi) +
+                           "u; vu.m_viBranchBackupValid = true;\n";
+            }
+            if ((up.writeReg == 0 || up.generic || low.writesVf0) && !gView.local)
                 out += "            resetVf0(vu, ctx);\n";
             out += "        }\n";
             out += "        ++cyc;\n";
+            gView.record = false;
             if (known)
+            {
+                known->backupReg = recordBackup ? static_cast<int>(writtenVi) : 0;
+                known->backupVar = recordBackup ? backupVar : std::string();
                 recordWrites(p, *known);
+            }
             return out;
         }
 
@@ -945,10 +1119,8 @@ namespace
             return "        " + jumpTo(p.target) + "\n";
         }
 
-        std::string emitSegment(uint32_t start)
+        std::pair<std::string, std::string> walkSegment(uint32_t start, Known &k)
         {
-            Known k;
-            k.id = hexPcId(start);
             std::string code;
             std::string tail;
             for (uint32_t index = start;;)
@@ -958,7 +1130,7 @@ namespace
                     tail = "        " + jumpTo(index * 8u) + "\n";
                     break;
                 }
-                if ((index != start && isStart(index)) || breaker(index))
+                if ((index != start && isStart(index) && k.pos >= kSegmentJoinLimit) || breaker(index))
                 {
                     tail = "        " + jumpTo(index * 8u) + "\n";
                     if (breaker(index))
@@ -993,9 +1165,83 @@ namespace
                 }
                 index = next / 8u;
             }
+            return {code, tail};
+        }
+
+        std::string readyStores(const Known &k)
+        {
+            std::string out;
+            const auto at = [&](const std::pair<uint32_t, uint32_t> &write)
+            {
+                return "s" + k.id + "_" + num(write.first) + " + " + num(write.second) + "u";
+            };
+            for (uint32_t reg = 1; reg < 32u; ++reg)
+            {
+                std::vector<std::pair<uint32_t, uint32_t>> lanes;
+                for (uint32_t component = 0; component < 4u; ++component)
+                {
+                    const auto it = k.vf.find({reg, component});
+                    if (it != k.vf.end())
+                        lanes.push_back(it->second);
+                }
+                if (lanes.empty())
+                    continue;
+                if (lanes.size() == 4u && std::all_of(lanes.begin(), lanes.end(), [&](const auto &w) { return w == lanes[0]; }))
+                {
+                    out += "        setReady4(vu.m_vfReady[" + num(reg) + "].data(), " + at(lanes[0]) + ");\n";
+                    continue;
+                }
+                for (uint32_t component = 0; component < 4u; ++component)
+                {
+                    const auto it = k.vf.find({reg, component});
+                    if (it != k.vf.end())
+                        out += "        vu.m_vfReady[" + num(reg) + "][" + num(component) + "] = " + at(it->second) + ";\n";
+                }
+            }
+            for (const auto &[reg, write] : k.vi)
+                out += "        vu.m_viReady[" + num(reg) + "] = " + at(write) + ";\n";
+            if (k.acc.size() == 4u && std::all_of(k.acc.begin(), k.acc.end(), [&](const auto &w) { return w.second == k.acc.begin()->second; }))
+                out += "        setReady4(vu.m_accReady.data(), " + at(k.acc.begin()->second) + ");\n";
+            else
+                for (const auto &[component, write] : k.acc)
+                    out += "        vu.m_accReady[" + num(component) + "] = " + at(write) + ";\n";
+            if (k.backupReg > 0)
+                out += "        vu.m_viBranchBackupValue = " + k.backupVar + "; vu.m_viBranchBackupReg = " + num(k.backupReg) +
+                       "u; vu.m_viBranchBackupValid = true;\n";
+            else if (k.backupReg == 0)
+                out += "        vu.m_viBranchBackupValid = false;\n";
+            return out;
+        }
+
+        std::string emitSegment(uint32_t start)
+        {
+            gView = RegView{};
+            gView.local = cacheRegisters;
+            Known plan;
+            plan.id = hexPcId(start);
+            walkSegment(start, plan);
+            gView.vfUsed.clear();
+            gView.vfWritten.clear();
+            gView.viUsed.clear();
+            gView.viWritten.clear();
+            Known k;
+            k.id = plan.id;
+            if (!plan.readsStatus && aggregateFlags)
+            {
+                for (const uint32_t position : plan.fmacPos)
+                    if (position + kFmacLatency <= plan.pos)
+                        k.collapsed.insert(position);
+                if (k.collapsed.size() < 2u)
+                    k.collapsed.clear();
+                else
+                    k.lastCollapsed = *k.collapsed.rbegin();
+            }
+            const auto [code, tail] = walkSegment(start, k);
+            const RegView view = gView;
+            gView = RegView{};
             std::string out = segLabel(start * 8u) + ":\n";
             const std::string fallback = " goto " + label(start * 8u) + ";\n";
-            out += "        if (cyc + " + num(k.bound) + "u > budget)" + fallback;
+            out += "        if (cyc + " + num(k.bound + kMaxVfLatency - 1u) + "u > budget)" + fallback;
             for (const auto &[position, exprs] : k.checks)
             {
                 std::string max = exprs[0];
@@ -1009,7 +1255,20 @@ namespace
             for (uint32_t i = 0; i < k.pos; ++i)
                 out += (i ? ", s" : "s") + k.id + "_" + num(i) + " = 0u";
             out += ";\n";
+            if (!k.collapsed.empty())
+                out += "        __m128 fAccZ = _mm_setzero_ps(), fAccS = _mm_setzero_ps(); uint32_t fAccScalar = 0u;\n";
+            const auto memRaw = [](uint32_t reg) { return reg == 32u ? std::string("vu.m_state.acc") : vf(reg); };
+            for (const uint32_t reg : view.vfUsed)
+                out += "        __m128 vr" + num(reg) + " = _mm_loadu_ps(" + memRaw(reg) + "); __m128 vn" + num(reg) + " = _mm_load_ps(ctx.norm[" +
+                       num(reg) + "]);\n";
+            for (const uint32_t reg : view.viUsed)
+                out += "        int32_t vi" + num(reg) + " = vu.m_state.vi[" + num(reg) + "];\n";
             out += code;
+            for (const uint32_t reg : view.vfWritten)
+                out += "        _mm_storeu_ps(" + memRaw(reg) + ", vr" + num(reg) + "); _mm_store_ps(ctx.norm[" + num(reg) + "], vn" + num(reg) + ");\n";
+            for (const uint32_t reg : view.viWritten)
+                out += "        vu.m_state.vi[" + num(reg) + "] = vi" + num(reg) + ";\n";
+            out += readyStores(k);
             out += tail;
             out += "    }\n";
             return out;
@@ -1149,11 +1408,11 @@ namespace
             start = cut;
         }
 
-        std::ostringstream out;
-        out << "#include \"ps2_vu1_impl.inl\"\n\n";
+        std::vector<std::string> blockTexts;
         std::vector<uint32_t> blockOf(count, 0u);
         for (uint32_t block = 0; block < blocks.size(); ++block)
         {
+            std::ostringstream out;
             const auto [start, end] = blocks[block];
             emitter.first = start;
             emitter.last = end;
@@ -1190,8 +1449,33 @@ namespace
                 if (emitter.exits.count(name))
                     out << name << ":\n    ctx.cycle = cyc;\n    vu.m_state.pc = epc;\n    return StepResult::" << result << ";\n";
             out << "}\n\n";
+            blockTexts.push_back(out.str());
         }
 
+        uint32_t part = 0u;
+        for (size_t block = 0; block < blockTexts.size();)
+        {
+            std::string text = "#include \"ps2_vu1_impl.inl\"\n\n";
+            size_t size = 0u;
+            while (block < blockTexts.size() && (size == 0u || size + blockTexts[block].size() <= kPartBytes))
+            {
+                size += blockTexts[block].size();
+                text += blockTexts[block++];
+            }
+            char partName[64];
+            std::snprintf(partName, sizeof(partName), "vu1_%016" PRIx64 "_%u.cpp", hash, part++);
+            std::ofstream partFile(outDir / partName, std::ios::binary);
+            partFile << text;
+            if (!partFile)
+                return false;
+        }
+
+        std::ostringstream out;
+        out << "#include \"ps2_vu1_impl.inl\"\n\n";
+        for (uint32_t block = 0; block < blocks.size(); ++block)
+            out << "template <>\nVU1InterpreterAccess::StepResult VU1InterpreterAccess::fastBlock<" << hex64(hash) << ", " << block
+                << "u>(VU1Interpreter &vu, Vu1FastCtx &ctx);\n";
+        out << "\n";
         out << "template <>\nVU1InterpreterAccess::StepResult VU1InterpreterAccess::runImage<" << hex64(hash)
             << ">(VU1Interpreter &vu, const Vu1RunArgs &args)\n{\n    static constexpr FastBlock table[] = {\n";
         for (uint32_t index = 0; index < count; ++index)
@@ -1202,7 +1486,7 @@ namespace
         std::snprintf(name, sizeof(name), "vu1_%016" PRIx64 ".cpp", hash);
         std::ofstream file(outDir / name, std::ios::binary);
         file << out.str();
-        std::cout << name << ": " << count << " pairs, " << blocks.size() << " blocks\n";
+        std::cout << name << ": " << count << " pairs, " << blocks.size() << " blocks, " << part << " parts\n";
         return static_cast<bool>(file);
     }
 }
@@ -1218,6 +1502,12 @@ int main(int argc, char **argv)
     const std::filesystem::path outDir = argv[2];
     const uint32_t blockPairs = argc > 3 ? static_cast<uint32_t>(std::stoul(argv[3])) : kDefaultBlockPairs;
     std::filesystem::create_directories(outDir);
+    for (const auto &entry : std::filesystem::directory_iterator(outDir))
+    {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("vu1_", 0) == 0 && entry.path().extension() == ".cpp")
+            std::filesystem::remove(entry.path());
+    }
 
     std::vector<std::filesystem::path> images;
     for (const auto &entry : std::filesystem::directory_iterator(captureDir))

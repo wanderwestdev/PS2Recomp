@@ -380,6 +380,7 @@ public:
     {
         return m_eeCycle;
     }
+    uint64_t consumeCycles(uint64_t cycles) noexcept;
 
     [[nodiscard]] GuestThread *thread(int id);
     [[nodiscard]] const GuestThread *thread(int id) const;

@@ -2385,12 +2385,12 @@ struct Vu1FlagRecord
     static constexpr uint32_t kSticky = 4u;
     static constexpr uint32_t kClip = 8u;
 
-    uint64_t ready = 0;
-    uint32_t mac = 0;
-    uint32_t status = 0;
-    uint32_t extra = 0;
-    uint32_t clip = 0;
-    uint32_t writes = 0;
+    uint64_t ready;
+    uint32_t mac;
+    uint32_t status;
+    uint32_t extra;
+    uint32_t clip;
+    uint32_t writes;
 };
 
 struct Vu1FastCtx
@@ -2483,9 +2483,74 @@ struct VU1InterpreterAccess
 
     static bool runLoop(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
                         GS &gs, PS2Memory *memory, uint32_t maxCycles, bool allowCompiled);
+    static bool runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
+                            GS &gs, PS2Memory *memory, uint32_t maxCycles, CompiledProgram compiled);
     static void runVerified(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
                             GS &gs, PS2Memory *memory, uint32_t maxCycles);
+    static bool runVerifiedWith(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
+                                GS &gs, PS2Memory *memory, uint32_t maxCycles, CompiledProgram compiled, bool forward);
     static VU1State effectiveState(const VU1Interpreter &vu);
+
+    struct TraceState
+    {
+        VU1State state{};
+        uint64_t cycle = 0;
+        std::array<std::array<uint64_t, 4>, 32> vfReady{};
+        std::array<uint64_t, 16> viReady{};
+        std::array<uint64_t, 4> accReady{};
+        std::array<VU1Interpreter::FlagPipelineEntry, VU1Interpreter::kMaxFlagEntries> flagPipeline{};
+        uint32_t flagValid = 0;
+        VU1Interpreter::ScalarPipelineEntry fdiv{};
+        std::array<VU1Interpreter::ScalarPipelineEntry, 2> efu{};
+        uint64_t efuResourceReady = 0;
+        uint64_t nextCommitCycle = 0;
+        uint32_t workingClip = 0;
+        int32_t viBranchBackupValue = 0;
+        uint8_t viBranchBackupReg = 0;
+        bool viBranchBackupValid = false;
+    };
+
+    static bool traceCapture(const VU1Interpreter &vu, TraceState &out)
+    {
+        if ((vu.m_vfWriteValid | vu.m_viWriteValid | vu.m_accWriteValid | vu.m_storeValid) != 0u || vu.m_xgkick.active)
+            return false;
+        out.state = vu.m_state;
+        out.cycle = vu.m_cycle;
+        out.vfReady = vu.m_vfReady;
+        out.viReady = vu.m_viReady;
+        out.accReady = vu.m_accReady;
+        out.flagPipeline = vu.m_flagPipeline;
+        out.flagValid = vu.m_flagValid;
+        out.fdiv = vu.m_fdiv;
+        out.efu = vu.m_efu;
+        out.efuResourceReady = vu.m_efuResourceReady;
+        out.nextCommitCycle = vu.m_nextCommitCycle;
+        out.workingClip = vu.m_workingClip;
+        out.viBranchBackupValue = vu.m_viBranchBackupValue;
+        out.viBranchBackupReg = vu.m_viBranchBackupReg;
+        out.viBranchBackupValid = vu.m_viBranchBackupValid;
+        return true;
+    }
+
+    static void traceRestore(VU1Interpreter &vu, const TraceState &in)
+    {
+        vu.resetScheduler();
+        vu.m_state = in.state;
+        vu.m_cycle = in.cycle;
+        vu.m_vfReady = in.vfReady;
+        vu.m_viReady = in.viReady;
+        vu.m_accReady = in.accReady;
+        vu.m_flagPipeline = in.flagPipeline;
+        vu.m_flagValid = in.flagValid;
+        vu.m_fdiv = in.fdiv;
+        vu.m_efu = in.efu;
+        vu.m_efuResourceReady = in.efuResourceReady;
+        vu.m_nextCommitCycle = in.nextCommitCycle;
+        vu.m_workingClip = in.workingClip;
+        vu.m_viBranchBackupValue = in.viBranchBackupValue;
+        vu.m_viBranchBackupReg = in.viBranchBackupReg;
+        vu.m_viBranchBackupValid = in.viBranchBackupValid;
+    }
 
     alignas(16) static constexpr uint32_t kDestMaskBits[16][4] = {
         {0u, 0u, 0u, 0u},
@@ -2938,9 +3003,41 @@ struct VU1InterpreterAccess
         vu.noteReadyCycle(vu.m_fdiv.readyCycle);
     }
 
+    struct FmacFlags
+    {
+        uint32_t mac = 0;
+        uint32_t status = 0;
+        uint32_t extra = 0;
+    };
+
+    static VU1_FORCE_INLINE __m128 kVf0()
+    {
+        return _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+
+    template <uint32_t Lane>
+    static VU1_FORCE_INLINE __m128 bcast(__m128 value)
+    {
+        return _mm_shuffle_ps(value, value, _MM_SHUFFLE(Lane, Lane, Lane, Lane));
+    }
+
+    template <uint32_t Lane>
+    static VU1_FORCE_INLINE float laneF(__m128 value)
+    {
+        return _mm_cvtss_f32(_mm_shuffle_ps(value, value, _MM_SHUFFLE(Lane, Lane, Lane, Lane)));
+    }
+
+    static VU1_FORCE_INLINE void setReady4(uint64_t *ready, uint64_t value)
+    {
+        ready[0] = value;
+        ready[1] = value;
+        ready[2] = value;
+        ready[3] = value;
+    }
+
     template <FK K>
     static VU1_NOINLINE __m128 fmacExact(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t dest, __m128 s, __m128 t, __m128 a,
-                                         __m128 result, __m128 &normalized)
+                                         __m128 result, __m128 &normalized, FmacFlags &flags)
     {
         constexpr bool cross = K == FK::Opmsub || K == FK::Opmula;
         constexpr bool productSum = K == FK::Madd || K == FK::Msub || K == FK::Opmsub;
@@ -3031,7 +3128,9 @@ struct VU1InterpreterAccess
                 const uint32_t pOver = maskBits(_mm_cmpgt_pd(paLo, maxD), _mm_cmpgt_pd(paHi, maxD)) & dest;
                 extra = (pSmall ? 1u : 0u) | (pSign ? 2u : 0u) | ((pSmall & ~pZero) ? 4u : 0u) | (pOver ? 8u : 0u);
             }
-            pushFmacFlags(vu, ctx, cycle, mac, status, extra);
+            flags.mac = mac;
+            flags.status = status;
+            flags.extra = extra;
         }
         normalized = vnorm(result);
         return result;
@@ -3040,6 +3139,27 @@ struct VU1InterpreterAccess
     template <FK K>
     static VU1_FORCE_INLINE __m128 fmac(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t dest, __m128 s, __m128 t, __m128 a,
                                         __m128 &normalized)
+    {
+        FmacFlags flags;
+        const __m128 result = fmacF<K>(vu, ctx, cycle, dest, s, t, a, normalized, flags);
+        if (dest != 0u)
+            pushFmacFlags(vu, ctx, cycle, flags.mac, flags.status, flags.extra);
+        return result;
+    }
+
+    struct FmacCore
+    {
+        __m128 s;
+        __m128 t;
+        __m128 result;
+        __m128 product;
+        __m128 resultZero;
+        __m128 productZero;
+        bool safe;
+    };
+
+    template <FK K>
+    static VU1_FORCE_INLINE FmacCore fmacCore(uint32_t dest, __m128 s, __m128 t, __m128 a)
     {
         constexpr bool cross = K == FK::Opmsub || K == FK::Opmula;
         constexpr bool productSum = K == FK::Madd || K == FK::Msub || K == FK::Opmsub;
@@ -3089,29 +3209,79 @@ struct VU1InterpreterAccess
                 safe = _mm_and_ps(safe, _mm_cmpgt_ps(absResult, _mm_mul_ps(absProduct, _mm_set1_ps(1.0f / 2097152.0f))));
                 safe = _mm_and_ps(safe, _mm_and_ps(_mm_cmpge_ps(absProduct, _mm_set1_ps(std::numeric_limits<float>::min())),
                                                    _mm_cmplt_ps(absProduct, _mm_set1_ps(std::numeric_limits<float>::max()))));
-                safe = _mm_or_ps(safe, _mm_and_ps(productZero, _mm_or_ps(resultRange, _mm_and_ps(resultZero, _mm_cmpeq_ps(a, zero)))));
+                safe = _mm_or_ps(safe, productZero);
             }
             else
                 safe = _mm_or_ps(safe, _mm_and_ps(resultZero, productZero));
         }
         const uint32_t destLanes = kRev4[dest];
-        if ((static_cast<uint32_t>(_mm_movemask_ps(safe)) & destLanes) != destLanes)
-            return fmacExact<K>(vu, ctx, cycle, dest, s, t, a, result, normalized);
+        return {s, t, result, product, resultZero, productZero,
+                (static_cast<uint32_t>(_mm_movemask_ps(safe)) & destLanes) == destLanes};
+    }
+
+    template <FK K>
+    static VU1_FORCE_INLINE __m128 fmacF(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t dest, __m128 s, __m128 t, __m128 a,
+                                         __m128 &normalized, FmacFlags &flags)
+    {
+        constexpr bool productSum = K == FK::Madd || K == FK::Msub || K == FK::Opmsub;
+        const FmacCore c = fmacCore<K>(dest, s, t, a);
+        if (!c.safe)
+            return fmacExact<K>(vu, ctx, cycle, dest, c.s, c.t, a, c.result, normalized, flags);
         if (dest != 0u)
         {
-            const uint32_t sign = kRev4[_mm_movemask_ps(result)] & dest;
-            const uint32_t zeroBits = kRev4[_mm_movemask_ps(resultZero)] & dest;
+            const uint32_t destLanes = kRev4[dest];
+            const uint32_t sign = kRev4[_mm_movemask_ps(c.result)] & dest;
+            const uint32_t zeroBits = kRev4[_mm_movemask_ps(c.resultZero)] & dest;
             uint32_t extra = 0u;
             if constexpr (productSum)
             {
-                extra = (static_cast<uint32_t>(_mm_movemask_ps(product)) & destLanes) != 0u ? 2u : 0u;
-                if ((static_cast<uint32_t>(_mm_movemask_ps(productZero)) & destLanes) != 0u)
+                extra = (static_cast<uint32_t>(_mm_movemask_ps(c.product)) & destLanes) != 0u ? 2u : 0u;
+                if ((static_cast<uint32_t>(_mm_movemask_ps(c.productZero)) & destLanes) != 0u)
                     extra |= 1u;
             }
-            pushFmacFlags(vu, ctx, cycle, zeroBits | (sign << 4), (zeroBits != 0u ? 1u : 0u) | (sign != 0u ? 2u : 0u), extra);
+            flags.mac = zeroBits | (sign << 4);
+            flags.status = (zeroBits != 0u ? 1u : 0u) | (sign != 0u ? 2u : 0u);
+            flags.extra = extra;
         }
-        normalized = result;
-        return result;
+        normalized = c.result;
+        return c.result;
+    }
+
+    template <FK K>
+    static VU1_FORCE_INLINE __m128 fmacV(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t dest, __m128 s, __m128 t, __m128 a,
+                                         __m128 &normalized, __m128 &accZero, __m128 &accSign, uint32_t &accScalar)
+    {
+        constexpr bool productSum = K == FK::Madd || K == FK::Msub || K == FK::Opmsub;
+        const FmacCore c = fmacCore<K>(dest, s, t, a);
+        if (!c.safe)
+        {
+            FmacFlags flags;
+            const __m128 result = fmacExact<K>(vu, ctx, cycle, dest, c.s, c.t, a, c.result, normalized, flags);
+            accScalar |= flags.status | flags.extra;
+            return result;
+        }
+        __m128 zeroLanes = c.resultZero;
+        __m128 signLanes = c.result;
+        if constexpr (productSum)
+        {
+            zeroLanes = _mm_or_ps(zeroLanes, c.productZero);
+            signLanes = _mm_or_ps(signLanes, c.product);
+        }
+        if (dest != 0xFu)
+        {
+            const __m128 mask = destMask(dest);
+            zeroLanes = _mm_and_ps(zeroLanes, mask);
+            signLanes = _mm_and_ps(signLanes, mask);
+        }
+        accZero = _mm_or_ps(accZero, zeroLanes);
+        accSign = _mm_or_ps(accSign, signLanes);
+        normalized = c.result;
+        return c.result;
+    }
+
+    static VU1_FORCE_INLINE uint32_t stickyOf(__m128 accZero, __m128 accSign)
+    {
+        return (_mm_movemask_ps(accZero) != 0 ? 1u : 0u) | (_mm_movemask_ps(accSign) != 0 ? 2u : 0u);
     }
 
     template <uint32_t Shift>
@@ -3140,16 +3310,16 @@ struct VU1InterpreterAccess
         return _mm_andnot_ps(_mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u))), normalized);
     }
 
-    static VU1_FORCE_INLINE void clipOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t fs, uint32_t ft)
+    static VU1_FORCE_INLINE void clipOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, __m128 fsRaw, __m128 ftRaw)
     {
-        uint32_t wBits = 0u;
-        std::memcpy(&wBits, &vu.m_state.vf[ft][3], sizeof(wBits));
+        const uint32_t wBits = static_cast<uint32_t>(_mm_extract_ps(ftRaw, 3));
         const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
+        alignas(16) uint32_t lanes[4];
+        _mm_store_ps(reinterpret_cast<float *>(lanes), fsRaw);
         uint32_t flags = 0u;
         for (uint32_t component = 0; component < 3u; ++component)
         {
-            uint32_t bits = 0u;
-            std::memcpy(&bits, &vu.m_state.vf[fs][component], sizeof(bits));
+            const uint32_t bits = lanes[component];
             if (static_cast<int32_t>(bits) > limit)
                 flags |= 1u << (component * 2u);
             if (static_cast<int32_t>(bits ^ 0x80000000u) > limit)
@@ -3275,11 +3445,11 @@ struct VU1InterpreterAccess
         ctx.xgkickDone = cycle;
     }
 
-    static VU1_FORCE_INLINE void divOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t fs, uint32_t fsf, uint32_t ft, uint32_t ftf)
+    static VU1_FORCE_INLINE void divOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, float numRaw, float denRaw)
     {
         syncQ(vu, ctx, cycle);
-        const float num = vu.normalizeOperand(vu.m_state.vf[fs][fsf]);
-        const float den = vu.normalizeOperand(vu.m_state.vf[ft][ftf]);
+        const float num = vu.normalizeOperand(numRaw);
+        const float den = vu.normalizeOperand(denRaw);
         uint32_t statusDi = 0u;
         float result = 0.0f;
         if (den == 0.0f)
@@ -3298,18 +3468,18 @@ struct VU1InterpreterAccess
         queueQAt(vu, cycle, result, 7u, statusDi);
     }
 
-    static VU1_FORCE_INLINE void sqrtOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t ft, uint32_t ftf)
+    static VU1_FORCE_INLINE void sqrtOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, float raw)
     {
         syncQ(vu, ctx, cycle);
-        const float val = vu.normalizeOperand(vu.m_state.vf[ft][ftf]);
+        const float val = vu.normalizeOperand(raw);
         queueQAt(vu, cycle, std::sqrt(std::fabs(val)), 7u, val < 0.0f ? 0x10u : 0u);
     }
 
-    static VU1_FORCE_INLINE void rsqrtOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t fs, uint32_t fsf, uint32_t ft, uint32_t ftf)
+    static VU1_FORCE_INLINE void rsqrtOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, float numRaw, float radicandRaw)
     {
         syncQ(vu, ctx, cycle);
-        const float num = vu.normalizeOperand(vu.m_state.vf[fs][fsf]);
-        const float radicand = vu.normalizeOperand(vu.m_state.vf[ft][ftf]);
+        const float num = vu.normalizeOperand(numRaw);
+        const float radicand = vu.normalizeOperand(radicandRaw);
         const float den = std::sqrt(std::fabs(radicand));
         uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
         float result = 0.0f;
@@ -3640,3 +3810,4 @@ struct VU1InterpreterAccess
 };
 
 void registerVu1CompiledProgram(uint64_t imageHash, VU1InterpreterAccess::CompiledProgram program);
+VU1InterpreterAccess::CompiledProgram findCompiledVu1ProgramByHash(uint64_t imageHash);

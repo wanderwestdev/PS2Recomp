@@ -11,6 +11,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <algorithm>
 #include <xmmintrin.h>
 
 namespace ps2x::asyncvif
@@ -329,6 +330,91 @@ namespace ps2x::asyncvif
             worker->jobs.push_back(std::move(job));
         }
         worker->workCv.notify_one();
+    }
+
+    namespace
+    {
+        struct Vu1Timing
+        {
+            Vu1TimingHooks hooks;
+            bool enabled = false;
+            double scale = 1.0;
+            bool primed = false;
+            uint64_t accounted = 0;
+            uint64_t busyUntil = 0;
+            bool kickPending = false;
+            uint64_t kickCycle = 0;
+        };
+
+        Vu1Timing &vu1Timing()
+        {
+            static Vu1Timing timing;
+            return timing;
+        }
+
+        void syncVu(PS2Memory &memory)
+        {
+            if (t_onWorker)
+                return;
+            Worker *worker = s_worker;
+            if (!worker || worker->memory != &memory)
+                return;
+            std::unique_lock<std::mutex> lock(worker->mutex);
+            worker->idleCv.wait(lock, [&]
+                                { return worker->jobs.empty() && !worker->busy; });
+        }
+    }
+
+    void setVu1Timing(Vu1TimingHooks hooks)
+    {
+        Vu1Timing &timing = vu1Timing();
+        timing = Vu1Timing{};
+        timing.hooks = std::move(hooks);
+        double scale = 1.0;
+        if (const char *value = std::getenv("PS2X_VU1_TIMING"))
+            scale = std::atof(value);
+        timing.scale = scale;
+        timing.enabled = scale > 0.0 && timing.hooks.eeCycle && timing.hooks.vu1Cycles && timing.hooks.consumeEeCycles;
+    }
+
+    void vu1Kick()
+    {
+        Vu1Timing &timing = vu1Timing();
+        if (!timing.enabled || t_onWorker || timing.kickPending)
+            return;
+        timing.kickPending = true;
+        timing.kickCycle = timing.hooks.eeCycle();
+    }
+
+    bool vu1Busy(PS2Memory &memory)
+    {
+        Vu1Timing &timing = vu1Timing();
+        if (!timing.enabled || t_onWorker)
+            return false;
+        syncVu(memory);
+        const uint64_t total = timing.hooks.vu1Cycles();
+        uint64_t now = timing.hooks.eeCycle();
+        if (!timing.primed)
+        {
+            timing.primed = true;
+            timing.accounted = total;
+            timing.busyUntil = now;
+            timing.kickPending = false;
+            return false;
+        }
+        if (total > timing.accounted)
+        {
+            const uint64_t work = static_cast<uint64_t>(static_cast<double>(total - timing.accounted) * timing.scale);
+            const uint64_t start = timing.kickPending ? std::max(timing.busyUntil, timing.kickCycle) : timing.busyUntil;
+            timing.busyUntil = start + work;
+            timing.accounted = total;
+            timing.kickPending = false;
+        }
+        if (now >= timing.busyUntil)
+            return false;
+        timing.hooks.consumeEeCycles(timing.busyUntil - now);
+        now = timing.hooks.eeCycle();
+        return now < timing.busyUntil;
     }
 
     void sync(PS2Memory &memory)

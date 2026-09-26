@@ -102,6 +102,123 @@ namespace
         return registry.recent[0].program;
     }
 
+    struct Vu1Trace
+    {
+        FILE *file = nullptr;
+        std::filesystem::path directory;
+        uint64_t first = 0;
+        uint64_t last = 0;
+        const PS2Memory *memory = nullptr;
+        uint64_t generation = ~0ull;
+        uint64_t imageHash = 0;
+        std::vector<uint8_t> previous;
+        uint64_t records = 0;
+        uint64_t skipped = 0;
+    };
+
+    Vu1Trace *vu1Trace()
+    {
+        static Vu1Trace *trace = []() -> Vu1Trace *
+        {
+            const char *value = std::getenv("PS2X_VU1_TRACE");
+            if (!value || !*value)
+                return nullptr;
+            std::string spec(value);
+            const size_t second = spec.rfind(':');
+            const size_t first = second == std::string::npos || second == 0u ? std::string::npos : spec.rfind(':', second - 1u);
+            if (first == std::string::npos || first < 2u)
+                return nullptr;
+            auto *result = new Vu1Trace();
+            const std::filesystem::path path = spec.substr(0, first);
+            result->first = std::stoull(spec.substr(first + 1u, second - first - 1u));
+            result->last = result->first + std::stoull(spec.substr(second + 1u));
+            result->directory = path.parent_path();
+            result->file = std::fopen(path.string().c_str(), "wb");
+            if (!result->file)
+            {
+                delete result;
+                return nullptr;
+            }
+            return result;
+        }();
+        return trace;
+    }
+
+    void traceVu1Run(VU1Interpreter &vu, const uint8_t *vuCode, uint32_t codeSize, const uint8_t *vuData, uint32_t dataSize,
+                     PS2Memory *memory, uint32_t maxCycles)
+    {
+        Vu1Trace *trace = vu1Trace();
+        if (!trace || !memory || dataSize != 0x4000u || codeSize != 0x4000u)
+            return;
+        const uint64_t tick = memory->gs().vsyncTick.load();
+        if (tick < trace->first || tick >= trace->last)
+        {
+            if (tick >= trace->last && trace->file)
+            {
+                std::fclose(trace->file);
+                trace->file = nullptr;
+                std::fprintf(stderr, "[vu1-trace] %llu records, %llu skipped\n", static_cast<unsigned long long>(trace->records),
+                             static_cast<unsigned long long>(trace->skipped));
+                std::fflush(stderr);
+            }
+            return;
+        }
+        if (!trace->file)
+            return;
+        VU1InterpreterAccess::TraceState state;
+        if (!VU1InterpreterAccess::traceCapture(vu, state))
+        {
+            ++trace->skipped;
+            return;
+        }
+        const uint64_t generation = memory->getVU1CodeGeneration();
+        if (trace->memory != memory || trace->generation != generation)
+        {
+            trace->memory = memory;
+            trace->generation = generation;
+            trace->imageHash = fnv1a64(vuCode, codeSize);
+            char name[64];
+            std::snprintf(name, sizeof(name), "vu1_%016llx.bin", static_cast<unsigned long long>(trace->imageHash));
+            const std::filesystem::path path = trace->directory / name;
+            std::error_code error;
+            if (!std::filesystem::exists(path, error))
+                if (FILE *file = std::fopen(path.string().c_str(), "wb"))
+                {
+                    std::fwrite(vuCode, 1, codeSize, file);
+                    std::fclose(file);
+                }
+        }
+        if (trace->previous.size() != dataSize)
+            trace->previous.assign(dataSize, 0u);
+        const uint32_t magic = 0x52543156u;
+        std::fwrite(&magic, 4, 1, trace->file);
+        std::fwrite(&maxCycles, 4, 1, trace->file);
+        std::fwrite(&trace->imageHash, 8, 1, trace->file);
+        std::fwrite(&tick, 8, 1, trace->file);
+        std::fwrite(&state, sizeof(state), 1, trace->file);
+        const uint32_t qwords = dataSize / 16u;
+        for (uint32_t index = 0; index < qwords;)
+        {
+            if (std::memcmp(vuData + index * 16u, trace->previous.data() + index * 16u, 16u) == 0)
+            {
+                ++index;
+                continue;
+            }
+            uint32_t end = index + 1u;
+            while (end < qwords && end - index < 0xFFFFu &&
+                   std::memcmp(vuData + end * 16u, trace->previous.data() + end * 16u, 16u) != 0)
+                ++end;
+            const uint16_t header[2] = {static_cast<uint16_t>(index), static_cast<uint16_t>(end - index)};
+            std::fwrite(header, sizeof(header), 1, trace->file);
+            std::fwrite(vuData + index * 16u, 16u, end - index, trace->file);
+            index = end;
+        }
+        const uint16_t terminator[2] = {0xFFFFu, 0u};
+        std::fwrite(terminator, sizeof(terminator), 1, trace->file);
+        std::memcpy(trace->previous.data(), vuData, dataSize);
+        ++trace->records;
+    }
+
     bool vu1VerifyEnabled()
     {
         static const bool enabled = []
@@ -854,6 +971,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     if (m_unit == Unit::VU1)
     {
         captureVu1Program(vuCode, codeSize, memory, m_state.pc);
+        traceVu1Run(*this, vuCode, codeSize, vuData, dataSize, memory, maxCycles);
         if (vu1VerifyEnabled() && lookupCompiledVu1Program(vuCode, codeSize, memory))
         {
             VU1InterpreterAccess::runVerified(*this, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
@@ -866,6 +984,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 bool VU1InterpreterAccess::runLoop(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
                                    GS &gs, PS2Memory *memory, uint32_t maxCycles, bool allowCompiled)
 {
+    const CompiledProgram compiled =
+        allowCompiled && vu.m_unit == VU1Interpreter::Unit::VU1 ? lookupCompiledVu1Program(vuCode, codeSize, memory) : nullptr;
+    return runLoopWith(vu, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, compiled);
+}
+
+bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
+                                       GS &gs, PS2Memory *memory, uint32_t maxCycles, CompiledProgram compiled)
+{
     vu.m_activeVuData = vuData;
     vu.m_activeVuDataSize = dataSize;
     vu.m_activeGs = &gs;
@@ -877,8 +1003,6 @@ bool VU1InterpreterAccess::runLoop(VU1Interpreter &vu, uint8_t *vuCode, uint32_t
         _mm_setcsr(previousCsr | 0x6000u);
     const uint64_t budgetEnd = vu.m_cycle + maxCycles;
     bool programEnded = false;
-    const CompiledProgram compiled =
-        allowCompiled && vu.m_unit == VU1Interpreter::Unit::VU1 ? lookupCompiledVu1Program(vuCode, codeSize, memory) : nullptr;
     const Vu1RunArgs compiledArgs{vuData, dataSize, &gs, memory, codeSize, budgetEnd};
     bool interpretNextPair = false;
     while (vu.m_cycle < budgetEnd && !vu.m_stopRequested)
@@ -984,6 +1108,12 @@ namespace
 void VU1InterpreterAccess::runVerified(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
                                        GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
+    runVerifiedWith(vu, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, lookupCompiledVu1Program(vuCode, codeSize, memory), true);
+}
+
+bool VU1InterpreterAccess::runVerifiedWith(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
+                                           GS &gs, PS2Memory *memory, uint32_t maxCycles, CompiledProgram compiled, bool forward)
+{
     static std::unique_ptr<VU1Interpreter> shadow;
     static std::vector<uint8_t> shadowData;
     static Vu1VerifyStats stats;
@@ -995,13 +1125,13 @@ void VU1InterpreterAccess::runVerified(VU1Interpreter &vu, uint8_t *vuCode, uint
     const uint64_t startCycle = vu.m_cycle;
 
     Vu1PacketSink realSink;
-    realSink.forward = true;
+    realSink.forward = forward;
     packetSink = &realSink;
-    const bool realEnded = runLoop(vu, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, true);
+    const bool realEnded = runLoopWith(vu, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, compiled);
     Vu1PacketSink shadowSink;
     shadowSink.forward = false;
     packetSink = &shadowSink;
-    const bool shadowEnded = runLoop(*shadow, vuCode, codeSize, shadowData.data(), dataSize, gs, memory, maxCycles, false);
+    const bool shadowEnded = runLoopWith(*shadow, vuCode, codeSize, shadowData.data(), dataSize, gs, memory, maxCycles, nullptr);
     packetSink = nullptr;
 
     std::string diff;
@@ -1121,6 +1251,14 @@ void VU1InterpreterAccess::runVerified(VU1Interpreter &vu, uint8_t *vuCode, uint
                      static_cast<unsigned long long>(stats.mismatches));
         std::fflush(stderr);
     }
+    return diff.empty();
+}
+
+VU1InterpreterAccess::CompiledProgram findCompiledVu1ProgramByHash(uint64_t imageHash)
+{
+    const auto &programs = vu1CompiledRegistry().programs;
+    const auto it = programs.find(imageHash);
+    return it == programs.end() ? nullptr : it->second;
 }
 
 void registerVu1CompiledProgram(uint64_t imageHash, VU1InterpreterAccess::CompiledProgram program)

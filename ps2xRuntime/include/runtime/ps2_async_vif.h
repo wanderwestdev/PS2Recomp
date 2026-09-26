@@ -31,4 +31,15 @@ namespace ps2x::asyncvif
     void enqueue(PS2Memory &memory, std::vector<Item> &&items);
     void sync(PS2Memory &memory);
     void stop(PS2Memory &memory);
+
+    struct Vu1TimingHooks
+    {
+        std::function<uint64_t()> eeCycle;
+        std::function<uint64_t()> vu1Cycles;
+        std::function<uint64_t(uint64_t)> consumeEeCycles;
+    };
+
+    void setVu1Timing(Vu1TimingHooks hooks);
+    void vu1Kick();
+    bool vu1Busy(PS2Memory &memory);
 }

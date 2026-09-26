@@ -464,6 +464,34 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     }
 }
 
+uint64_t EeScheduler::consumeCycles(uint64_t cycles) noexcept
+{
+    uint64_t consumed = 0u;
+    while (consumed < cycles && !m_checkpointPending.load(std::memory_order_acquire))
+    {
+        uint64_t step = std::min<uint64_t>(cycles - consumed, kIdleSkipStepCycles * 64u);
+        const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+        if (nextEventCycle != 0u)
+        {
+            if (m_eeCycle >= nextEventCycle)
+            {
+                m_checkpointPending.store(true, std::memory_order_release);
+                break;
+            }
+            step = std::min(step, nextEventCycle - m_eeCycle);
+        }
+        step = std::min(step, m_runtime.memory().cyclesUntilNextEeTimerInterrupt());
+        if (step == 0u)
+        {
+            m_checkpointPending.store(true, std::memory_order_release);
+            break;
+        }
+        accountCycles(static_cast<uint32_t>(step));
+        consumed += step;
+    }
+    return consumed;
+}
+
 uint64_t EeScheduler::skipIdleCycles() noexcept
 {
     const GuestThread *running = currentThread();

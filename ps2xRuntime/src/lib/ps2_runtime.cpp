@@ -707,6 +707,12 @@ bool PS2Runtime::syncCoreSubsystems()
                                              (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                              (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                              (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+    ps2x::asyncvif::setVu1Timing({[this]() -> uint64_t
+                                  { return m_eeScheduler ? m_eeScheduler->currentCycle() : 0u; },
+                                  [this]() -> uint64_t
+                                  { return m_vu1.state().cycles; },
+                                  [this](uint64_t cycles) -> uint64_t
+                                  { return m_eeScheduler ? m_eeScheduler->consumeCycles(cycles) : 0u; }});
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
                                      const bool onVuThread = ps2x::asyncvif::onWorker();

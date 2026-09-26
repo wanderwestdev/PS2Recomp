@@ -1369,6 +1369,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+            if (channelBase == 0x10009000u)
+                ps2x::asyncvif::vu1Kick();
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
@@ -2399,6 +2401,8 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    if (address == 0x10009000u && ps2x::asyncvif::vu1Busy(*this))
+        return (m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u) | 0x100u;
     if (isAsyncVifRegister(address))
         ps2x::asyncvif::sync(*this);
     size_t timerIndex = 0u;
