@@ -81,6 +81,99 @@ namespace
 
         return 0u;
     }
+
+    template <uint32_t Vl, uint32_t Components, bool ZeroExtend, uint32_t Mode>
+    void unpackFast(uint8_t *vuData, uint32_t vuAddr, const uint8_t *src, uint32_t count, uint32_t cl, uint32_t wl, uint32_t *row)
+    {
+        constexpr uint32_t bytesPerComponent = Vl == 0u ? 4u : (Vl == 1u ? 2u : 1u);
+        constexpr uint32_t bytesPerVector = bytesPerComponent * Components;
+        uint32_t destVec = vuAddr;
+        uint32_t cyclePos = 0u;
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            uint8_t *dst = vuData + (destVec & 0x3FFu) * 16u;
+            const uint8_t *srcVec = src + index * bytesPerVector;
+            uint32_t v[4];
+            if constexpr (Components < 4u)
+                std::memcpy(v, dst, sizeof(v));
+            for (uint32_t c = 0; c < Components; ++c)
+            {
+                if constexpr (Vl == 0u)
+                    std::memcpy(&v[c], srcVec + c * 4u, 4u);
+                else if constexpr (Vl == 1u)
+                {
+                    uint16_t raw;
+                    std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
+                    v[c] = ZeroExtend ? static_cast<uint32_t>(raw) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+                }
+                else
+                    v[c] = ZeroExtend ? static_cast<uint32_t>(srcVec[c]) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(srcVec[c])));
+            }
+            if constexpr (Components == 1u)
+                v[1] = v[2] = v[3] = v[0];
+            if constexpr (Mode != 0u)
+            {
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    v[c] += row[c];
+                    if constexpr (Mode == 2u)
+                        row[c] = v[c];
+                }
+            }
+            std::memcpy(dst, v, sizeof(v));
+            ++destVec;
+            if (++cyclePos == wl)
+            {
+                cyclePos = 0u;
+                destVec += cl - wl;
+            }
+        }
+    }
+
+    template <uint32_t Vl, uint32_t Components>
+    void unpackFast(uint8_t *vuData, uint32_t vuAddr, const uint8_t *src, uint32_t count, bool zeroExtend, uint32_t mode, uint32_t cl,
+                    uint32_t wl, uint32_t *row)
+    {
+        if (zeroExtend)
+        {
+            if (mode == 1u)
+                unpackFast<Vl, Components, true, 1u>(vuData, vuAddr, src, count, cl, wl, row);
+            else if (mode == 2u)
+                unpackFast<Vl, Components, true, 2u>(vuData, vuAddr, src, count, cl, wl, row);
+            else
+                unpackFast<Vl, Components, true, 0u>(vuData, vuAddr, src, count, cl, wl, row);
+        }
+        else
+        {
+            if (mode == 1u)
+                unpackFast<Vl, Components, false, 1u>(vuData, vuAddr, src, count, cl, wl, row);
+            else if (mode == 2u)
+                unpackFast<Vl, Components, false, 2u>(vuData, vuAddr, src, count, cl, wl, row);
+            else
+                unpackFast<Vl, Components, false, 0u>(vuData, vuAddr, src, count, cl, wl, row);
+        }
+    }
+
+    bool tryUnpackFast(uint8_t *vuData, uint32_t vuAddr, const uint8_t *src, uint32_t count, uint32_t vl, uint32_t components, bool zeroExtend,
+                       uint32_t mode, uint32_t cl, uint32_t wl, uint32_t *row)
+    {
+        switch (vl * 4u + components - 1u)
+        {
+        case 0u: unpackFast<0u, 1u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 1u: unpackFast<0u, 2u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 2u: unpackFast<0u, 3u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 3u: unpackFast<0u, 4u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 4u: unpackFast<1u, 1u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 5u: unpackFast<1u, 2u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 6u: unpackFast<1u, 3u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 7u: unpackFast<1u, 4u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 8u: unpackFast<2u, 1u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 9u: unpackFast<2u, 2u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 10u: unpackFast<2u, 3u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 11u: unpackFast<2u, 4u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        default: return false;
+        }
+    }
 }
 
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
@@ -582,6 +675,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     std::memcpy(m_vu1Data + vuAddr * 16u, srcBase, first * 16u);
                     if (first < writeVectorCount)
                         std::memcpy(m_vu1Data, srcBase + first * 16u, (writeVectorCount - first) * 16u);
+                    firstWrite = writeVectorCount;
+                }
+                else if (vl != 3u && tryUnpackFast(m_vu1Data, vuAddr, srcBase, writeVectorCount, vl, static_cast<uint32_t>(components), zeroExtend,
+                                                   add ? mode : 0u, cl, wl, vif1_regs.row))
+                {
                     firstWrite = writeVectorCount;
                 }
                 for (uint32_t writeIndex = firstWrite; writeIndex < writeVectorCount; ++writeIndex)

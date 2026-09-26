@@ -3069,15 +3069,30 @@ struct VU1InterpreterAccess
             result = _mm_and_ps(result, destMask(0xEu));
 
         const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+        const __m128 zero = _mm_setzero_ps();
         const __m128 absResult = _mm_and_ps(result, absMask);
-        __m128 safe = _mm_and_ps(_mm_cmpge_ps(absResult, _mm_set1_ps(4.0f * std::numeric_limits<float>::min())),
-                                 _mm_cmplt_ps(absResult, _mm_set1_ps(0.5f * std::numeric_limits<float>::max())));
-        if constexpr (productSum)
+        const __m128 resultRange = _mm_and_ps(_mm_cmpge_ps(absResult, _mm_set1_ps(4.0f * std::numeric_limits<float>::min())),
+                                              _mm_cmplt_ps(absResult, _mm_set1_ps(0.5f * std::numeric_limits<float>::max())));
+        const __m128 resultZero = _mm_cmpeq_ps(result, zero);
+        __m128 safe = resultRange;
+        __m128 productZero = zero;
+        if constexpr (K == FK::Add)
+            safe = _mm_or_ps(safe, _mm_and_ps(resultZero, _mm_cmpeq_ps(s, _mm_xor_ps(t, _mm_set1_ps(-0.0f)))));
+        else if constexpr (K == FK::Sub)
+            safe = _mm_or_ps(safe, _mm_and_ps(resultZero, _mm_cmpeq_ps(s, t)));
+        else
         {
-            const __m128 absProduct = _mm_and_ps(product, absMask);
-            safe = _mm_and_ps(safe, _mm_cmpgt_ps(absResult, _mm_mul_ps(absProduct, _mm_set1_ps(1.0f / 2097152.0f))));
-            safe = _mm_and_ps(safe, _mm_and_ps(_mm_cmpge_ps(absProduct, _mm_set1_ps(std::numeric_limits<float>::min())),
-                                               _mm_cmplt_ps(absProduct, _mm_set1_ps(std::numeric_limits<float>::max()))));
+            productZero = _mm_or_ps(_mm_cmpeq_ps(s, zero), _mm_cmpeq_ps(t, zero));
+            if constexpr (productSum)
+            {
+                const __m128 absProduct = _mm_and_ps(product, absMask);
+                safe = _mm_and_ps(safe, _mm_cmpgt_ps(absResult, _mm_mul_ps(absProduct, _mm_set1_ps(1.0f / 2097152.0f))));
+                safe = _mm_and_ps(safe, _mm_and_ps(_mm_cmpge_ps(absProduct, _mm_set1_ps(std::numeric_limits<float>::min())),
+                                                   _mm_cmplt_ps(absProduct, _mm_set1_ps(std::numeric_limits<float>::max()))));
+                safe = _mm_or_ps(safe, _mm_and_ps(productZero, _mm_or_ps(resultRange, _mm_and_ps(resultZero, _mm_cmpeq_ps(a, zero)))));
+            }
+            else
+                safe = _mm_or_ps(safe, _mm_and_ps(resultZero, productZero));
         }
         const uint32_t destLanes = kRev4[dest];
         if ((static_cast<uint32_t>(_mm_movemask_ps(safe)) & destLanes) != destLanes)
@@ -3085,10 +3100,15 @@ struct VU1InterpreterAccess
         if (dest != 0u)
         {
             const uint32_t sign = kRev4[_mm_movemask_ps(result)] & dest;
+            const uint32_t zeroBits = kRev4[_mm_movemask_ps(resultZero)] & dest;
             uint32_t extra = 0u;
             if constexpr (productSum)
+            {
                 extra = (static_cast<uint32_t>(_mm_movemask_ps(product)) & destLanes) != 0u ? 2u : 0u;
-            pushFmacFlags(vu, ctx, cycle, sign << 4, sign != 0u ? 2u : 0u, extra);
+                if ((static_cast<uint32_t>(_mm_movemask_ps(productZero)) & destLanes) != 0u)
+                    extra |= 1u;
+            }
+            pushFmacFlags(vu, ctx, cycle, zeroBits | (sign << 4), (zeroBits != 0u ? 1u : 0u) | (sign != 0u ? 2u : 0u), extra);
         }
         normalized = result;
         return result;

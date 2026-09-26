@@ -60,15 +60,47 @@ namespace
         return capture;
     }
 
+    struct Vu1ImageCacheEntry
+    {
+        std::vector<uint8_t> image;
+        VU1InterpreterAccess::CompiledProgram program = nullptr;
+    };
+
     struct Vu1CompiledRegistry
     {
         std::unordered_map<uint64_t, VU1InterpreterAccess::CompiledProgram> programs;
+        std::vector<Vu1ImageCacheEntry> recent;
         const PS2Memory *memory = nullptr;
         const uint8_t *code = nullptr;
         uint64_t generation = ~0ull;
         VU1InterpreterAccess::CompiledProgram current = nullptr;
         bool enabled = true;
     };
+
+    VU1InterpreterAccess::CompiledProgram findCompiledVu1Image(Vu1CompiledRegistry &registry, const uint8_t *vuCode, uint32_t codeSize)
+    {
+        for (size_t index = 0; index < registry.recent.size(); ++index)
+        {
+            Vu1ImageCacheEntry &entry = registry.recent[index];
+            if (entry.image.size() == codeSize && std::memcmp(entry.image.data(), vuCode, codeSize) == 0)
+            {
+                if (index != 0u)
+                    std::swap(registry.recent[index], registry.recent[0]);
+                return registry.recent[0].program;
+            }
+        }
+        const auto it = registry.programs.find(fnv1a64(vuCode, codeSize));
+        Vu1ImageCacheEntry entry;
+        entry.image.assign(vuCode, vuCode + codeSize);
+        entry.program = it == registry.programs.end() ? nullptr : it->second;
+        constexpr size_t kRecentImages = 8u;
+        if (registry.recent.size() < kRecentImages)
+            registry.recent.push_back(std::move(entry));
+        else
+            registry.recent.back() = std::move(entry);
+        std::swap(registry.recent.back(), registry.recent[0]);
+        return registry.recent[0].program;
+    }
 
     bool vu1VerifyEnabled()
     {
@@ -103,8 +135,7 @@ namespace
             registry.memory = memory;
             registry.code = vuCode;
             registry.generation = generation;
-            const auto it = registry.programs.find(fnv1a64(vuCode, codeSize));
-            registry.current = it == registry.programs.end() ? nullptr : it->second;
+            registry.current = findCompiledVu1Image(registry, vuCode, codeSize);
         }
         return registry.current;
     }
