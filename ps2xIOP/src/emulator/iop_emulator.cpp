@@ -1,6 +1,7 @@
 #include "iop_emulator.h"
 #include "imports/iop_cdvd.h"
 #include "devices/iop_sio2.h"
+#include "devices/iop_spu2.h"
 #include "core/iop_cpu.h"
 #include "imports/iop_heaplib.h"
 #include "imports/iop_imports.h"
@@ -131,6 +132,8 @@ namespace ps2x::iop::detail
             ioman.reset();
             sio2.reset();
             memory.attachSio2(&sio2);
+            spu2.reset();
+            memory.attachSpu2(&spu2, &totalCycles);
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
@@ -738,6 +741,7 @@ namespace ps2x::iop::detail
         IopTimrman timrman;
         IopIoman ioman;
         IopSio2 sio2;
+        IopSpu2 spu2;
         IopCpuCore cpuCore;
         IopImportRegistry imports;
         IopLoadcore loadcore;
