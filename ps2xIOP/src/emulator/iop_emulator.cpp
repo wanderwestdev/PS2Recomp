@@ -42,6 +42,7 @@ namespace ps2x::iop::detail
         constexpr uint64_t kSifDmaBaseCycles = 64u;
         constexpr uint64_t kSifDmaBytesPerCycle = 4u;
         constexpr uint64_t kIopBatchCycles = 1024u;
+        constexpr uint64_t kServerCallMaxCycles = kIopClockHz * 2u;
 
         uint32_t physicalAddress(uint32_t address)
         {
@@ -475,25 +476,19 @@ namespace ps2x::iop::detail
             cpu.gpr[6] = a2;
             cpu.gpr[7] = a3;
             cpu.gpr[28] = gp;
-            if (depth < kCallStackCapacity)
-            {
-                const uint32_t stackTop = kCallStackLimit - depth * kCallStackSize;
-                cpu.gpr[29] = stackTop - 32u;
-            }
-            else if (activeCpu && activeCpu->gpr[29] > kCallStackBase + kStackGuardBytes)
-            {
-                // Extremely deep re-entrancy borrows unused space below the
-                // suspended caller's live frame. Stack growth remains away
-                // from the caller, so its saved registers stay intact.
-                cpu.gpr[29] = (activeCpu->gpr[29] - kStackGuardBytes) & ~15u;
-            }
-            else
-            {
-                cpu.gpr[29] = kCallStackBase - 32u;
-            }
+            cpu.gpr[29] = callStackPointer(depth);
             cpu.gpr[31] = kCallReturnSentinel;
             runCpu(cpu, budget);
             return cpu.gpr[2];
+        }
+
+        uint32_t callStackPointer(uint32_t depth) const
+        {
+            if (depth < kCallStackCapacity)
+                return kCallStackLimit - depth * kCallStackSize - 32u;
+            if (activeCpu && activeCpu->gpr[29] > kCallStackBase + kStackGuardBytes)
+                return (activeCpu->gpr[29] - kStackGuardBytes) & ~15u;
+            return kCallStackBase - 32u;
         }
 
         uint32_t executeGuestFunction(uint32_t address,
@@ -504,6 +499,73 @@ namespace ps2x::iop::detail
                                       uint32_t gp) override
         {
             return callFunction(address, a0, a1, a2, a3, gp);
+        }
+
+        uint32_t executeServerFunction(uint32_t address,
+                                       uint32_t a0,
+                                       uint32_t a1,
+                                       uint32_t a2,
+                                       uint32_t a3,
+                                       uint32_t gp,
+                                       uint32_t priority) override
+        {
+            struct CallDepthGuard
+            {
+                uint32_t &depth;
+                ~CallDepthGuard() { --depth; }
+            };
+
+            const uint32_t depth = callDepth++;
+            const CallDepthGuard depthGuard{callDepth};
+            CpuState cpu{};
+            cpu.pc = address;
+            cpu.gpr[4] = a0;
+            cpu.gpr[5] = a1;
+            cpu.gpr[6] = a2;
+            cpu.gpr[7] = a3;
+            cpu.gpr[28] = gp;
+            cpu.gpr[29] = callStackPointer(depth);
+            cpu.gpr[31] = kCallReturnSentinel;
+
+            IopThread *const previous = kernel.currentThread();
+            const int id = kernel.createCallThread(cpu, priority);
+            IopThread *thread = kernel.beginThread(id);
+            uint32_t executed = 0u;
+            bool blocked = false;
+            while (executed < kMaxCallInstructions)
+            {
+                executed += runCpu(thread->cpu, kMaxCallInstructions - executed);
+                if (thread->cpu.stopped || !thread->cpu.yielded)
+                    break;
+                if (thread->state != IopThreadState::Running)
+                {
+                    blocked = true;
+                    break;
+                }
+                thread->cpu.yielded = false;
+            }
+            kernel.setCurrentThread(previous);
+
+            if (blocked)
+            {
+                const uint64_t deadline = totalCycles + kServerCallMaxCycles;
+                while (!kernel.threadFinished(id) && totalCycles < deadline)
+                    runCycles(kDefaultSlice);
+                kernel.setCurrentThread(previous);
+                if (!kernel.threadFinished(id))
+                {
+                    std::ostringstream out;
+                    out << "[IOP] RPC server 0x" << std::hex << address << " still blocked after "
+                        << std::dec << kServerCallMaxCycles << " cycles";
+                    log(LogLevel::Warning, out.str());
+                }
+            }
+
+            thread = kernel.findThread(id);
+            const uint32_t result = thread ? thread->cpu.gpr[2] : 0u;
+            if (thread && (thread->cpu.stopped || kernel.threadFinished(id)))
+                kernel.releaseThread(id);
+            return result;
         }
 
         uint32_t executeGuestFunctionWithBudget(uint32_t address,

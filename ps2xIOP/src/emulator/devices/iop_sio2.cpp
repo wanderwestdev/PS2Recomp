@@ -158,6 +158,7 @@ namespace ps2x::iop::detail
             return false;
         request.address = IopMemory::physicalAddress(address);
         request.bytes = blockWords * blockCount * 4u;
+        request.blockBytes = blockWords * 4u;
         request.armed = false;
         return true;
     }
@@ -182,30 +183,61 @@ namespace ps2x::iop::detail
     {
         std::deque<uint8_t> input;
         input.swap(m_fifoIn);
+        std::vector<uint8_t> inputBlocks;
+        const bool blockInput = m_dmaIn.armed && m_dmaIn.blockBytes != 0u && m_dmaIn.blockBytes < m_dmaIn.bytes;
         if (m_dmaIn.armed)
         {
             std::vector<uint8_t> bytes(m_dmaIn.bytes);
             if (m_memory.readRam(m_dmaIn.address, bytes.data(), bytes.size()))
-                input.insert(input.end(), bytes.begin(), bytes.end());
+            {
+                if (blockInput)
+                    inputBlocks = std::move(bytes);
+                else
+                    input.insert(input.end(), bytes.begin(), bytes.end());
+            }
             m_dmaIn.armed = false;
         }
 
         std::vector<uint8_t> output;
+        std::vector<std::pair<size_t, size_t>> commandOutputs;
         uint32_t recv1 = kRecv1Connected;
         uint64_t cycles = kCompletionBaseCycles;
-        for (const uint32_t send3 : m_send3)
+        for (size_t index = 0; index < m_send3.size() && m_send3[index] != 0u; ++index)
         {
-            if (send3 == 0u)
-                break;
-            runCommand(send3, input, output, recv1, cycles);
+            if (blockInput)
+            {
+                const size_t begin = std::min(index * m_dmaIn.blockBytes, inputBlocks.size());
+                const size_t end = std::min(begin + m_dmaIn.blockBytes, inputBlocks.size());
+                input.assign(inputBlocks.begin() + static_cast<std::ptrdiff_t>(begin), inputBlocks.begin() + static_cast<std::ptrdiff_t>(end));
+            }
+            const size_t before = output.size();
+            runCommand(m_send3[index], input, output, recv1, cycles);
+            commandOutputs.emplace_back(before, output.size() - before);
         }
 
         size_t delivered = 0u;
         if (m_dmaOut.armed)
         {
             std::vector<uint8_t> bytes(m_dmaOut.bytes, uint8_t{0xFFu});
-            delivered = std::min(output.size(), bytes.size());
-            std::copy_n(output.begin(), delivered, bytes.begin());
+            const size_t block = m_dmaOut.blockBytes;
+            if (block != 0u && block < bytes.size() && commandOutputs.size() > 1u)
+            {
+                for (size_t index = 0; index < commandOutputs.size(); ++index)
+                {
+                    const size_t begin = index * block;
+                    if (begin >= bytes.size())
+                        break;
+                    const size_t count = std::min({commandOutputs[index].second, block, bytes.size() - begin});
+                    std::copy_n(output.begin() + static_cast<std::ptrdiff_t>(commandOutputs[index].first), count,
+                                bytes.begin() + static_cast<std::ptrdiff_t>(begin));
+                }
+                delivered = output.size();
+            }
+            else
+            {
+                delivered = std::min(output.size(), bytes.size());
+                std::copy_n(output.begin(), delivered, bytes.begin());
+            }
             (void)m_memory.writeRam(m_dmaOut.address, bytes.data(), bytes.size());
             m_dmaOut.armed = false;
         }
@@ -224,7 +256,7 @@ namespace ps2x::iop::detail
         m_cardsAttached = true;
         const std::filesystem::path root = std::filesystem::path(m_host.hostPath(HostPathKind::MemoryCardRoot));
         const char *enabled = std::getenv("PS2X_MEMCARD");
-        if (root.empty() || !enabled || !*enabled || *enabled == '0')
+        if (root.empty() || (enabled && *enabled == '0'))
             return;
         const std::filesystem::path folder = root.has_parent_path() ? root.parent_path() : root;
         m_cards[0].attach(folder / "Mcd001.ps2", true);

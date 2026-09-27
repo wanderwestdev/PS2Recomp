@@ -32,6 +32,7 @@ namespace ps2x::iop::detail
         m_nextThreadId = 1;
         m_nextSemaphoreId = 1;
         m_nextEventFlagId = 1;
+        m_nextCallThreadId = kFirstCallThreadId;
         m_currentThread = nullptr;
     }
 
@@ -706,6 +707,58 @@ namespace ps2x::iop::detail
             m_threads.erase(it);
         }
         return result;
+    }
+
+    int IopKernel::createCallThread(const IopCpuState &cpu, uint32_t priority)
+    {
+        IopThread thread;
+        thread.id = static_cast<int>(m_nextCallThreadId++);
+        if (m_nextCallThreadId >= 0x7FFFFFFFu)
+            m_nextCallThreadId = kFirstCallThreadId;
+        thread.entry = cpu.pc;
+        thread.priority = std::clamp<uint32_t>(priority, 1u, 126u);
+        thread.initialPriority = thread.priority;
+        thread.cpu = cpu;
+        thread.state = IopThreadState::Ready;
+        const int id = thread.id;
+        m_threads.insert_or_assign(id, std::move(thread));
+        return id;
+    }
+
+    IopThread *IopKernel::beginThread(int id)
+    {
+        IopThread *thread = findThread(id);
+        if (thread == nullptr)
+            return nullptr;
+        m_currentThread = thread;
+        thread->state = IopThreadState::Running;
+        thread->cpu.stopped = false;
+        thread->cpu.yielded = false;
+        return thread;
+    }
+
+    IopThread *IopKernel::findThread(int id)
+    {
+        const auto it = m_threads.find(id);
+        return it != m_threads.end() ? &it->second : nullptr;
+    }
+
+    uint32_t IopKernel::threadPriority(int id, uint32_t fallback) const
+    {
+        const auto it = m_threads.find(id);
+        return it != m_threads.end() ? it->second.priority : fallback;
+    }
+
+    void IopKernel::releaseThread(int id)
+    {
+        const auto it = m_threads.find(id);
+        if (it == m_threads.end())
+            return;
+        if (m_currentThread == &it->second)
+            m_currentThread = nullptr;
+        if (it->second.stackBase != 0u)
+            (void)m_memory.freeAllocation(it->second.stackBase);
+        m_threads.erase(it);
     }
 
     void IopKernel::yieldIfHigherPriorityReady(IopCpuState &cpu)

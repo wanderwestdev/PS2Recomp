@@ -75,6 +75,7 @@ namespace ps2x::iop::detail
         {
             uint32_t address = 0u;
             uint32_t bytes = 0u;
+            uint32_t blockBytes = 0u;
             bool armed = false;
         };
 

@@ -196,6 +196,37 @@ namespace
                expect(out == std::array<uint8_t, 8>{0xFF, 0x41, 0x5A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, "channel 12 receives the reply");
     }
 
+    bool testSio2DmaBlocks()
+    {
+        PadHost host;
+        IopMemory memory;
+        IopSio2 sio2(host, memory);
+        memory.attachSio2(&sio2);
+
+        constexpr uint32_t kIn = 0x00100000u;
+        constexpr uint32_t kOut = 0x00100100u;
+        const std::array<uint8_t, 16> commands{0x01, 0x42, 0x00, 0x00, 0x00, 0xEE, 0xEE, 0xEE,
+                                               0x01, 0x42, 0x00, 0x00, 0x00, 0xEE, 0xEE, 0xEE};
+        if (!expect(memory.writeRam(kIn, commands.data(), commands.size()), "stage block DMA input"))
+            return false;
+
+        memory.write32(0xBF808200u, send3(0u, 5u));
+        memory.write32(0xBF808204u, send3(0u, 5u));
+        memory.write32(0xBF808208u, 0u);
+        if (!expect(sio2.dmaRequest(IopSio2::kDmaIn, kIn, 2u, 2u, 1u), "channel 11 block request") ||
+            !expect(sio2.dmaRequest(IopSio2::kDmaOut, kOut, 2u, 2u, 0u), "channel 12 block request"))
+            return false;
+        (void)sio2.dmaTransfer(IopSio2::kDmaIn);
+        (void)sio2.dmaTransfer(IopSio2::kDmaOut);
+        memory.write32(0xBF808268u, 0x3B1u);
+
+        std::array<uint8_t, 16> out{};
+        const std::array<uint8_t, 16> expected{0xFF, 0x41, 0x5A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                               0xFF, 0x41, 0x5A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        return expect(memory.readRam(kOut, out.data(), out.size()), "read block DMA output") &&
+               expect(out == expected, "each SEND3 command uses its own DMA block, padding is skipped");
+    }
+
     std::vector<uint8_t> cardExchange(VirtualMemoryCard &card, std::vector<uint8_t> command)
     {
         std::vector<uint8_t> response(command.size(), 0xFFu);
@@ -237,7 +268,7 @@ namespace
 
 int main()
 {
-    if (!testDigitalPoll() || !testAnalogConfiguration() || !testSio2PioTransfer() || !testSio2DmaTransfer() || !testMemoryCard())
+    if (!testDigitalPoll() || !testAnalogConfiguration() || !testSio2PioTransfer() || !testSio2DmaTransfer() || !testSio2DmaBlocks() || !testMemoryCard())
         return 1;
     std::cout << "ps2xIOP SIO2 tests passed\n";
     return 0;

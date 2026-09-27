@@ -40,6 +40,17 @@ namespace ps2x::iop::detail
         {
             return executeGuestFunction(address, a0, a1, a2, a3, gp);
         }
+        [[nodiscard]] virtual uint32_t executeServerFunction(uint32_t address,
+                                                             uint32_t a0,
+                                                             uint32_t a1,
+                                                             uint32_t a2,
+                                                             uint32_t a3,
+                                                             uint32_t gp,
+                                                             uint32_t priority)
+        {
+            (void)priority;
+            return executeGuestFunction(address, a0, a1, a2, a3, gp);
+        }
     };
 
     class IopRpcBridge

@@ -982,10 +982,175 @@ namespace
             std::cerr << "FAIL: " << message << '\n';
         return value;
     }
+
+    void writeBlockingRpcServerIrx(TestHost &host, uint32_t address, uint32_t sid)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t helperThread = loadAddress + 0x200u;
+        constexpr uint32_t serverFunction = loadAddress + 0x300u;
+        constexpr uint32_t serverBuffer = loadAddress + 0x400u;
+        constexpr uint32_t thbaseTable = loadAddress + 0x500u;
+        constexpr uint32_t thsemapTable = loadAddress + 0x540u;
+        constexpr uint32_t sifcmdTable = loadAddress + 0x580u;
+        constexpr uint32_t semaSlot = 0x600u;
+        constexpr uint32_t markerSlot = 0x604u;
+        constexpr uint32_t serverData = loadAddress + 0x640u;
+        constexpr uint32_t queueData = loadAddress + 0x6C0u;
+        constexpr uint32_t createThreadStub = thbaseTable + 20u;
+        constexpr uint32_t startThreadStub = createThreadStub + 8u;
+        constexpr uint32_t delayThreadStub = startThreadStub + 8u;
+        constexpr uint32_t createSemaStub = thsemapTable + 20u;
+        constexpr uint32_t signalSemaStub = createSemaStub + 8u;
+        constexpr uint32_t waitSemaStub = signalSemaStub + 8u;
+        constexpr uint32_t registerRpcStub = sifcmdTable + 20u;
+
+        constexpr uint32_t zero = 0u, at = 1u, v0 = 2u, a0 = 4u, a1 = 5u, a2 = 6u, a3 = 7u, t0 = 8u, sp = 29u, ra = 31u;
+        const auto itype = [](uint32_t op, uint32_t rs, uint32_t rt, uint32_t imm)
+        { return (op << 26u) | (rs << 21u) | (rt << 16u) | (imm & 0xFFFFu); };
+        const auto addiu = [&](uint32_t rt, uint32_t rs, uint32_t imm) { return itype(0x09u, rs, rt, imm); };
+        const auto ori = [&](uint32_t rt, uint32_t rs, uint32_t imm) { return itype(0x0Du, rs, rt, imm); };
+        const auto lui = [&](uint32_t rt, uint32_t imm) { return itype(0x0Fu, 0u, rt, imm); };
+        const auto lw = [&](uint32_t rt, uint32_t base, uint32_t offset) { return itype(0x23u, base, rt, offset); };
+        const auto sw = [&](uint32_t rt, uint32_t base, uint32_t offset) { return itype(0x2Bu, base, rt, offset); };
+        const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
+        const auto move = [](uint32_t rd, uint32_t rs) { return (rs << 21u) | (rd << 11u) | 0x21u; };
+        constexpr uint32_t jrRa = 0x03E00008u;
+        constexpr uint32_t nop = 0u;
+
+        const std::vector<uint32_t> entry = {
+            addiu(sp, sp, 0xFFC0u), sw(ra, sp, 0x3Cu),
+            sw(zero, sp, 0x10u), sw(zero, sp, 0x14u), sw(zero, sp, 0x18u), addiu(t0, zero, 1u), sw(t0, sp, 0x1Cu),
+            addiu(a0, sp, 0x10u), jal(createSemaStub), nop,
+            lui(at, 1u), sw(v0, at, semaSlot),
+            sw(zero, sp, 0x10u), sw(zero, sp, 0x14u), lui(t0, 1u), ori(t0, t0, helperThread & 0xFFFFu), sw(t0, sp, 0x18u),
+            addiu(t0, zero, 0x800u), sw(t0, sp, 0x1Cu), addiu(t0, zero, 0x20u), sw(t0, sp, 0x20u),
+            addiu(a0, sp, 0x10u), jal(createThreadStub), nop,
+            move(a0, v0), jal(startThreadStub), move(a1, zero),
+            lui(a0, 1u), ori(a0, a0, serverData & 0xFFFFu),
+            lui(a1, sid >> 16u), ori(a1, a1, sid & 0xFFFFu),
+            lui(a2, 1u), ori(a2, a2, serverFunction & 0xFFFFu),
+            lui(a3, 1u), ori(a3, a3, serverBuffer & 0xFFFFu),
+            lui(t0, 1u), ori(t0, t0, queueData & 0xFFFFu),
+            sw(zero, sp, 0x10u), sw(zero, sp, 0x14u), sw(t0, sp, 0x18u),
+            jal(registerRpcStub), nop,
+            lw(ra, sp, 0x3Cu), move(v0, zero), jrRa, addiu(sp, sp, 0x40u),
+        };
+        const std::vector<uint32_t> helper = {
+            addiu(sp, sp, 0xFFE0u), sw(ra, sp, 0x1Cu),
+            addiu(a0, zero, 1000u), jal(delayThreadStub), nop,
+            addiu(t0, zero, 0x5Au), lui(at, 1u), sw(t0, at, markerSlot),
+            lui(at, 1u), lw(a0, at, semaSlot), jal(signalSemaStub), nop,
+            lw(ra, sp, 0x1Cu), move(v0, zero), jrRa, addiu(sp, sp, 0x20u),
+        };
+        const std::vector<uint32_t> server = {
+            addiu(sp, sp, 0xFFE0u), sw(ra, sp, 0x1Cu), sw(a1, sp, 0x18u),
+            lui(at, 1u), lw(a0, at, semaSlot), jal(waitSemaStub), nop,
+            lui(at, 1u), lw(t0, at, markerSlot),
+            lw(v0, sp, 0x18u), nop, sw(t0, v0, 0u),
+            lw(ra, sp, 0x1Cu), nop, jrRa, addiu(sp, sp, 0x20u),
+        };
+        const std::vector<uint32_t> thbase = {
+            0x41E00000u, 0u, 0x00000101u, 0x61626874u, 0x00006573u,
+            jrRa, 0x24000004u, jrRa, 0x24000006u, jrRa, 0x24000021u, 0u, 0u,
+        };
+        const std::vector<uint32_t> thsemap = {
+            0x41E00000u, 0u, 0x00000101u, 0x65736874u, 0x0070616Du,
+            jrRa, 0x24000004u, jrRa, 0x24000006u, jrRa, 0x24000008u, 0u, 0u,
+        };
+        const std::vector<uint32_t> sifcmd = {
+            0x41E00000u, 0u, 0x00000101u, 0x63666973u, 0x0000646Du,
+            jrRa, 0x24000011u, 0u, 0u,
+        };
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
+        header.ident[4] = 1u; header.ident[5] = 1u; header.ident[6] = 1u;
+        header.type = 2u; header.machine = 8u; header.version = 1u;
+        header.entry = loadAddress; header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
+        program.filesz = 0x700u; program.memsz = 0x700u; program.flags = 7u; program.align = 4u;
+
+        std::vector<uint8_t> segment(program.filesz, 0u);
+        const auto place = [&](uint32_t target, const std::vector<uint32_t> &words)
+        { std::memcpy(segment.data() + (target - loadAddress), words.data(), words.size() * sizeof(uint32_t)); };
+        place(loadAddress, entry);
+        place(helperThread, helper);
+        place(serverFunction, server);
+        place(thbaseTable, thbase);
+        place(thsemapTable, thsemap);
+        place(sifcmdTable, sifcmd);
+        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+    }
+
+
+    int testBlockingRpcServer()
+    {
+        TestHost host(0x20000u);
+        IopSubsystem iop(host);
+        constexpr uint32_t sid = 0xB10C0001u;
+        writeBlockingRpcServerIrx(host, 0x100u, sid);
+        const ModuleLoadResult module = iop.loadModuleBuffer(0x100u);
+        if (!expect(module.handled && module.startResult == 0, "Blocking RPC server IRX did not start")) return 1;
+        if (!expect(iop.canBindRpc(sid), "Blocking RPC server was not registered")) return 1;
+
+        std::memset(host.guest.data() + 0x800u, 0xEE, sizeof(uint32_t));
+        RpcRequest request{};
+        request.sid = sid;
+        request.receive = {0x800u, sizeof(uint32_t)};
+        const RpcResult result = iop.handleRpc(request);
+        uint32_t marker = 0u;
+        std::memcpy(&marker, host.guest.data() + 0x800u, sizeof(marker));
+        if (!expect(result.handled, "Blocking RPC was not handled")) return 1;
+        if (!expect(marker == 0x5Au, "RPC server did not wait for the semaphore another IOP thread signals")) return 1;
+        return 0;
+    }
+
+    int testUnalignedLoadPair()
+    {
+        TestHost host(0x20000u);
+        IopSubsystem iop(host);
+        constexpr uint32_t sid = 0xB10C0002u;
+        writeRpcServerIrx(host, 0x100u, sid);
+        const ModuleLoadResult module = iop.loadModuleBuffer(0x100u);
+        if (!expect(module.handled && module.startResult == 0, "Unaligned-load RPC server IRX did not start")) return 1;
+
+        const uint8_t data[8] = {0x11u, 0x22u, 0x33u, 0x44u, 0x55u, 0x66u, 0x77u, 0x88u};
+        const uint32_t handler[] = {
+            0x3C090001u, 0x35290480u,
+            0x89280006u, 0x99280003u,
+            0x3C020001u, 0x34420400u,
+            0xAC480000u,
+            0x03E00008u, 0x00000000u,
+        };
+        if (!expect(iop.writeMemory(0x00010480u, data, sizeof(data)) &&
+                        iop.writeMemory(0x00010300u, handler, sizeof(handler)),
+                    "Could not install the unaligned-load handler")) return 1;
+        RpcRequest request{};
+        request.sid = sid;
+        request.receive = {0x800u, sizeof(uint32_t)};
+        const RpcResult result = iop.handleRpc(request);
+        uint32_t value = 0u;
+        std::memcpy(&value, host.guest.data() + 0x800u, sizeof(value));
+        if (!expect(result.handled && value == 0x77665544u,
+                    "LWR right after LWL must merge with the pending LWL value")) return 1;
+        return 0;
+    }
 }
 
 int main()
 {
+    if (testUnalignedLoadPair() != 0)
+        return 1;
+    if (testBlockingRpcServer() != 0)
+        return 1;
+
     TestHost host(0x20000u);
     IopSubsystem iop(host);
 

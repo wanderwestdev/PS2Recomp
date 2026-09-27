@@ -76,6 +76,14 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool threadFinished(int id) const;
         uint32_t releaseModuleStartThread(int id);
 
+        [[nodiscard]] int createCallThread(const IopCpuState &cpu, uint32_t priority);
+        [[nodiscard]] IopThread *beginThread(int id);
+        [[nodiscard]] IopThread *findThread(int id);
+        [[nodiscard]] uint32_t threadPriority(int id, uint32_t fallback) const;
+        void releaseThread(int id);
+        [[nodiscard]] IopThread *currentThread() const noexcept { return m_currentThread; }
+        void setCurrentThread(IopThread *thread) noexcept { m_currentThread = thread; }
+
         template <typename Ar>
         void serialize(Ar &ar)
         {
@@ -119,6 +127,9 @@ namespace ps2x::iop::detail
         uint32_t m_nextThreadId = 1;
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
+        uint32_t m_nextCallThreadId = kFirstCallThreadId;
         IopThread *m_currentThread = nullptr;
+
+        static constexpr uint32_t kFirstCallThreadId = 0x40000000u;
     };
 }

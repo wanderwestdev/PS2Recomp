@@ -13,6 +13,11 @@
 
 namespace ps2x::iop::detail
 {
+    namespace
+    {
+        constexpr uint32_t kDefaultServerPriority = 0x40u;
+    }
+
     IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
         : m_host(host), m_memory(memory), m_kernel(kernel)
     {
@@ -236,6 +241,8 @@ namespace ps2x::iop::detail
             setV0(0);
             return true;
         case 19: // SetRpcQueue
+            if (cpu.gpr[4] != 0u && m_memory.ownsRamRange(cpu.gpr[4], 4u))
+                m_memory.write32(cpu.gpr[4], cpu.gpr[5]);
             setV0(cpu.gpr[4]);
             return true;
         case 20:
@@ -294,12 +301,16 @@ namespace ps2x::iop::detail
             }
         }
 
-        uint32_t returnPointer = executor.executeGuestFunction(server.function,
-                                                               request.function,
-                                                               server.buffer,
-                                                               request.send.size,
-                                                               0u,
-                                                               server.gp);
+        uint32_t priority = kDefaultServerPriority;
+        if (server.queue != 0u && m_memory.ownsRamRange(server.queue, 4u))
+            priority = m_kernel.threadPriority(static_cast<int>(m_memory.read32(server.queue)), kDefaultServerPriority);
+        uint32_t returnPointer = executor.executeServerFunction(server.function,
+                                                                request.function,
+                                                                server.buffer,
+                                                                request.send.size,
+                                                                0u,
+                                                                server.gp,
+                                                                priority);
         if (returnPointer == 0u)
             returnPointer = server.buffer;
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
