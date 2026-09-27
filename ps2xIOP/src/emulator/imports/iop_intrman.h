@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "ps2x/state_io.h"
 #include <map>
 
 namespace ps2x::iop::detail
@@ -17,6 +18,12 @@ namespace ps2x::iop::detail
         void reset();
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
         [[nodiscard]] bool dispatchInterrupt(int irq, IopGuestExecutor &executor) const;
+
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            ps2x::state::fields(ar, m_handlers, m_enabled);
+        }
 
     private:
         struct Handler

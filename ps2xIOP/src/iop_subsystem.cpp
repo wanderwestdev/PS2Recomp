@@ -258,6 +258,8 @@ namespace ps2x::iop
         snapshot.emulatorThreads = m_impl->emulator.threadCount();
         snapshot.emulatorRpcServers = m_impl->emulator.rpcServerCount();
         snapshot.diagnostics = m_impl->loadOutcomes;
+        for (std::string &line : m_impl->emulator.describeThreads())
+            snapshot.diagnostics.push_back(std::move(line));
         if (!m_impl->lastError.empty())
         {
             snapshot.diagnostics.push_back(m_impl->lastError);
@@ -273,5 +275,20 @@ namespace ps2x::iop
             snapshot.services.push_back(std::move(row));
         }
         return snapshot;
+    }
+
+    void IopSubsystem::saveState(ps2x::state::Writer &out)
+    {
+        out.section(ps2x::state::fourcc("IOPS"));
+        m_impl->moduleManager.serialize(out);
+        m_impl->emulator.saveState(out);
+    }
+
+    void IopSubsystem::loadState(ps2x::state::Reader &in)
+    {
+        in.section(ps2x::state::fourcc("IOPS"));
+        m_impl->moduleManager.serialize(in);
+        m_impl->emulator.loadState(in);
+        m_impl->rebuildRoutes();
     }
 }

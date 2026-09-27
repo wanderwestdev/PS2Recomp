@@ -4,6 +4,7 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <sstream>
 
 namespace ps2x::iop::detail
 {
@@ -809,5 +810,31 @@ namespace ps2x::iop::detail
             if (pc >= base && pc < base + size)
                 thread.state = IopThreadState::Dead;
         }
+    }
+
+    std::vector<std::string> IopKernel::describeThreads() const
+    {
+        std::vector<std::string> lines;
+        for (const auto &[id, thread] : m_threads)
+        {
+            std::ostringstream line;
+            line << "iop thread " << id << " state=" << static_cast<int>(thread.state) << " entry=0x" << std::hex << thread.entry
+                 << " pc=0x" << thread.cpu.pc << " ra=0x" << thread.cpu.gpr[31] << std::dec << " prio=" << thread.priority
+                 << " wait=" << thread.waitId << " bits=0x" << std::hex << thread.waitBits;
+            lines.push_back(line.str());
+        }
+        for (const auto &[id, flag] : m_eventFlags)
+        {
+            std::ostringstream line;
+            line << "iop eventflag " << id << " bits=0x" << std::hex << flag.bits;
+            lines.push_back(line.str());
+        }
+        for (const auto &[id, sema] : m_semaphores)
+        {
+            std::ostringstream line;
+            line << "iop sema " << id << " count=" << sema.current;
+            lines.push_back(line.str());
+        }
+        return lines;
     }
 }

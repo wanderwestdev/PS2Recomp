@@ -644,6 +644,18 @@ namespace ps2_syscalls
                     logUnhandledRpcTrace(event);
                 }
 #endif
+                static const bool logAll = []
+                {
+                    const char *value = std::getenv("PS2X_RPC_LOG");
+                    return value && *value && *value != '0';
+                }();
+                if (logAll)
+                {
+                    std::cerr << "[rpc] pc=0x" << std::hex << event.pc << " ra=0x" << event.ra << " sid=0x" << event.sid << " fn=0x" << event.rpcNum << std::dec << " send=" << event.sendSize
+                              << " recv=" << event.recvSize << " flags=0x" << std::hex << event.flags << " in=["
+                              << formatRpcTraceBytes(event.sendPreview, event.sendPreviewSize) << "] out=["
+                              << formatRpcTraceBytes(event.recvPreview, event.recvPreviewSize) << "]" << std::dec << std::endl;
+                }
                 pushSifRpcDebugEvent(event);
             };
 

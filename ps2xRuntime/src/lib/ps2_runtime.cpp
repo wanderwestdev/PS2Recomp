@@ -1,5 +1,6 @@
 #include "runtime/ps2_async_vif.h"
 #include "ps2_runtime.h"
+#include "runtime/ps2_save_state.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -2268,12 +2269,7 @@ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
     const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
     const uint64_t waitTicks = std::max<uint64_t>(1u, ticks);
-    m_eeScheduler->waitVSync(currentTick + waitTicks - 1u,
-                             0,
-                             [resumePc](R5900Context &context)
-                             {
-                                 context.pc = resumePc;
-                             });
+    m_eeScheduler->waitVSyncResume(currentTick + waitTicks - 1u, 0, resumePc);
 }
 
 void PS2Runtime::addEeExitHandler(int threadId, uint32_t function, uint32_t argument)
@@ -2526,8 +2522,23 @@ void PS2Runtime::run()
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
+        {
+            std::string stateText;
+            float stateAlpha = 0.0f;
+            if (ps2x::savestate::overlayMessage(stateText, stateAlpha))
+            {
+                const int fontSize = std::max(18, GetScreenHeight() / 30);
+                const int width = MeasureText(stateText.c_str(), fontSize);
+                DrawRectangle(12, 12, width + 24, fontSize + 16, Fade(BLACK, 0.6f * stateAlpha));
+                DrawText(stateText.c_str(), 24, 20, fontSize, Fade(RAYWHITE, stateAlpha));
+            }
+        }
         EndDrawing();
         ps2_host_input::sample();
+        if (IsKeyPressed(KEY_F5))
+            ps2x::savestate::requestQuickSave();
+        if (IsKeyPressed(KEY_F9))
+            ps2x::savestate::requestQuickLoad();
 
         if (WindowShouldClose())
         {

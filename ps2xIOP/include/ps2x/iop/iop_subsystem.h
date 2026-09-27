@@ -2,6 +2,7 @@
 
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/iop_types.h"
+#include "ps2x/state_io.h"
 
 #include <memory>
 #include <string>
@@ -42,6 +43,9 @@ namespace ps2x::iop
         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
 
         [[nodiscard]] DebugSnapshot debugSnapshot() const;
+
+        void saveState(ps2x::state::Writer &out);
+        void loadState(ps2x::state::Reader &in);
 
     private:
         class Impl;

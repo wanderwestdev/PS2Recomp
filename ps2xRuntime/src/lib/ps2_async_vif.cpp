@@ -477,4 +477,18 @@ namespace ps2x::asyncvif
             worker->gif.thread.join();
         delete worker;
     }
+
+    void saveTimingState(ps2x::state::Writer &out)
+    {
+        Vu1Timing &timing = vu1Timing();
+        ps2x::state::fields(out, timing.primed, timing.accounted, timing.busyUntil, timing.kickPending, timing.kickCycle);
+    }
+
+    void loadTimingState(ps2x::state::Reader &in)
+    {
+        Vu1Timing &timing = vu1Timing();
+        ps2x::state::fields(in, timing.primed, timing.accounted, timing.busyUntil, timing.kickPending, timing.kickCycle);
+        if (s_vu1ReaderReady.load(std::memory_order_acquire))
+            s_vu1Completed.store(s_vu1CycleReader(), std::memory_order_release);
+    }
 }

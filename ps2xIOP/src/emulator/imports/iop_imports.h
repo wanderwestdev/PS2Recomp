@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include "ps2x/state_io.h"
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -33,6 +34,12 @@ namespace ps2x::iop::detail
         [[nodiscard]] int32_t setRebootTimeLibraryHandlingMode(uint32_t address, uint32_t mode);
         void eraseRange(uint32_t base, uint32_t size);
 
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            ps2x::state::fields(ar, m_libraries);
+        }
+
     private:
         struct ExportLibrary
         {
@@ -40,6 +47,12 @@ namespace ps2x::iop::detail
             uint16_t version = 0;
             std::string name;
             std::vector<uint32_t> functions;
+
+            template <typename Ar>
+            void serialize(Ar &ar)
+            {
+                ps2x::state::fields(ar, tableAddress, version, name, functions);
+            }
         };
 
         [[nodiscard]] const ExportLibrary *findLibrary(std::string_view name, std::optional<uint16_t> version) const;

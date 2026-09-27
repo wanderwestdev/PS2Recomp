@@ -1265,3 +1265,13 @@ void registerVu1CompiledProgram(uint64_t imageHash, VU1InterpreterAccess::Compil
 {
     vu1CompiledRegistry().programs[imageHash] = program;
 }
+
+void saveVuState(VU1Interpreter &vu, ps2x::state::Writer &out)
+{
+    VU1InterpreterAccess::serializeState(vu, out);
+}
+
+void loadVuState(VU1Interpreter &vu, ps2x::state::Reader &in)
+{
+    VU1InterpreterAccess::serializeState(vu, in);
+}

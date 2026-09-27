@@ -83,6 +83,12 @@ namespace ps2x::iop::detail
             uint32_t entry = 0;
             uint32_t gp = 0;
             bool resident = false;
+
+            template <typename Ar>
+            void serialize(Ar &ar)
+            {
+                ps2x::state::fields(ar, id, path, name, base, size, entry, gp, resident);
+            }
         };
 
         struct GuestCallback
@@ -313,6 +319,9 @@ namespace ps2x::iop::detail
                 case 5: // SecrSetMcDevIDHandler
                     secrMcDevIdHandler = {a0, cpu.gpr[28]};
                     setV0(0);
+                    return ImportDisposition::Handled;
+                case 6:
+                    setV0(1);
                     return ImportDisposition::Handled;
                 default:
                     break;
@@ -727,6 +736,43 @@ namespace ps2x::iop::detail
             return true;
         }
 
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            using namespace ps2x::state;
+            ar.section(fourcc("IOPE"));
+            fields(ar, modules, pendingDmaInterrupts, pendingGuestCallbacks, nextModuleId, moduleCursor, totalCycles, totalInstructions,
+                   eeCycleCarry, secrMcCommandHandler, secrMcDevIdHandler, checkKelfPathCallback);
+            ar.section(fourcc("IMEM"));
+            memory.serialize(ar);
+            ar.section(fourcc("IKRN"));
+            kernel.serialize(ar);
+            ar.section(fourcc("ICDV"));
+            if constexpr (Ar::kLoading)
+                cdvd.loadState(ar);
+            else
+                cdvd.saveState(ar);
+            ar.section(fourcc("IRPC"));
+            rpc.serialize(ar);
+            ar.section(fourcc("IINT"));
+            intrman.serialize(ar);
+            timrman.serialize(ar);
+            ioman.serialize(ar);
+            ar.section(fourcc("ISIO"));
+            sio2.serialize(ar);
+            ar.section(fourcc("ISPU"));
+            spu2.serialize(ar);
+            ar.section(fourcc("IIMP"));
+            imports.serialize(ar);
+            if constexpr (Ar::kLoading)
+            {
+                activeCpu = nullptr;
+                servicingDmaInterrupts = false;
+                servicingGuestCallbacks = false;
+                callDepth = 0u;
+            }
+        }
+
         IopHost &host;
         IopMemory memory;
         IopSysmem sysmem;
@@ -877,9 +923,23 @@ namespace ps2x::iop::detail
         return static_cast<uint32_t>(m_impl->kernel.threadCount());
     }
 
+    std::vector<std::string> IopEmulator::describeThreads() const
+    {
+        return m_impl->kernel.describeThreads();
+    }
+
     uint32_t IopEmulator::rpcServerCount() const noexcept
     {
         return static_cast<uint32_t>(m_impl->rpc.serverCount());
     }
 
+    void IopEmulator::saveState(ps2x::state::Writer &out)
+    {
+        m_impl->serialize(out);
+    }
+
+    void IopEmulator::loadState(ps2x::state::Reader &in)
+    {
+        m_impl->serialize(in);
+    }
 }

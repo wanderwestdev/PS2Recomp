@@ -74,11 +74,20 @@ using EeWaitPayload = std::variant<std::monostate,
                                    EeVSyncWait,
                                    EeExternalWait>;
 
+struct EeResume
+{
+    bool setPc = false;
+    uint32_t pc = 0;
+    bool setResult = false;
+    int32_t result = 0;
+};
+
 struct EeWaitState
 {
     EeWaitReason reason = EeWaitReason::None;
     EeWaitPayload payload{};
     std::function<void(R5900Context &)> completion;
+    EeResume resume{};
 };
 
 enum class GuestInvocationKind : uint8_t
@@ -122,6 +131,7 @@ struct GuestThread
     uint32_t tlsBase = 0;
     EeWaitState wait{};
     std::function<void(R5900Context &)> resumeCompletion;
+    EeResume pendingResume{};
     std::vector<GuestInvocation> invocations;
 
     [[nodiscard]] R5900Context &activeContext()
@@ -376,6 +386,8 @@ public:
     void completeExternalWait(uint32_t type, uint64_t token, int result);
     [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
     [[noreturn]] void waitUntilCycle(uint64_t cycle, int result, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void waitVSyncResume(uint64_t afterTick, int fixedResult, uint32_t resumePc);
+    [[noreturn]] void waitUntilCycleResume(uint64_t cycle, int result, uint32_t resumePc);
     [[nodiscard]] uint64_t currentCycle() const noexcept
     {
         return m_eeCycle;
@@ -406,6 +418,11 @@ public:
     void publishSnapshotNow();
 
 private:
+    template <typename Ar>
+    void serializeMachine(Ar &ar);
+
+    bool serviceStateRequests();
+
     struct ScheduledEvent
     {
         uint64_t deadlineCycle = 0;

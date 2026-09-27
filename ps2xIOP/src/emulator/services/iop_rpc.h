@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps2x/iop/iop_types.h"
+#include "ps2x/state_io.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -64,6 +65,12 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
         [[nodiscard]] std::optional<DmaCallback> takeDmaCallback() noexcept;
+
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            ps2x::state::fields(ar, m_servers, m_nextDmaId, m_dmaCallback);
+        }
 
     private:
         [[nodiscard]] uint32_t setDma(uint32_t descriptorAddress, uint32_t descriptorCount, uint32_t &bytes);

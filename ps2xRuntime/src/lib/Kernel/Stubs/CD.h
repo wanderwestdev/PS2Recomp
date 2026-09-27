@@ -7,8 +7,16 @@
 #include <string>
 #include <vector>
 
+namespace ps2x::state
+{
+    class Writer;
+    class Reader;
+}
+
 namespace ps2_stubs
 {
+    void saveCdStubState(ps2x::state::Writer &out);
+    void loadCdStubState(ps2x::state::Reader &in);
 
     struct CdDebugFileEntry
     {

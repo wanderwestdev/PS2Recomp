@@ -69,6 +69,7 @@ public:
     [[nodiscard]] std::vector<PS2VfsDescriptorInfo> descriptors() const;
 
 private:
+    friend struct PS2VfsStateAccess;
     struct OpenDescriptor
     {
         std::unique_ptr<IPS2OpenFile> file;

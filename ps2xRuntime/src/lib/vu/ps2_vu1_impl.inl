@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ps2x/state_io.h"
 #include "runtime/ps2_vu1.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
@@ -2427,6 +2428,23 @@ inline Vu1NormShadow vu1NormShadow;
 
 struct VU1InterpreterAccess
 {
+    template <typename Ar>
+    static void serializeState(VU1Interpreter &vu, Ar &ar)
+    {
+        ps2x::state::fields(ar, vu.m_state, vu.m_flagPipeline, vu.m_fdiv, vu.m_efu, vu.m_storePipeline, vu.m_vfWritePipeline,
+                            vu.m_viWritePipeline, vu.m_accWritePipeline, vu.m_flagValid, vu.m_storeValid, vu.m_vfWriteValid,
+                            vu.m_viWriteValid, vu.m_accWriteValid, vu.m_nextCommitCycle, vu.m_xgkick, vu.m_vfReady, vu.m_viReady,
+                            vu.m_accReady, vu.m_vfLatestWrite, vu.m_viLatestWrite, vu.m_accLatestWrite, vu.m_cycle,
+                            vu.m_nextWriteSequence, vu.m_efuResourceReady, vu.m_workingClip, vu.m_currentUpperInstruction,
+                            vu.m_viBranchBackupValue, vu.m_viBranchBackupReg, vu.m_viBranchBackupValid, vu.m_stopRequested,
+                            vu.m_pendingHaltD, vu.m_pendingHaltT);
+        if constexpr (Ar::kLoading)
+        {
+            vu.m_decodedCodeCacheValid = false;
+            vu.m_cachedVuCode = nullptr;
+        }
+    }
+
     enum class StepResult : uint8_t
     {
         Continue,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include "ps2x/state_io.h"
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -80,6 +81,13 @@ namespace ps2x::iop::detail
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            ps2x::state::fields(ar, m_ram, m_owned, m_scratch, m_hardware, m_allocations, m_heapCursor, m_interruptStatus, m_interruptMask,
+                                m_interruptControl, m_dmaStart);
+        }
 
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;

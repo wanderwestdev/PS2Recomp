@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "SIF.h"
+#include "ps2x/state_io.h"
 #include "../Syscalls/RPC.h"
 #include "../../ps2_iop_transport.h"
 #include "runtime/ps2_address.h"
@@ -843,5 +844,24 @@ namespace ps2_stubs
     void sceSifWriteBackDCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx, 0);
+    }
+
+    template <typename Ar>
+    static void serializeSifStubState(Ar &ar)
+    {
+        std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+        ps2x::state::fields(ar, g_sifRegs, g_sifSregs, g_sifCmdHandlers, g_sifCmdBuffer, g_sifSysCmdBuffer, g_sifCmdInitialized);
+        std::lock_guard<std::mutex> dmaLock(g_sifDmaTransferMutex);
+        ps2x::state::field(ar, g_nextSifDmaTransferId);
+    }
+
+    void saveSifStubState(ps2x::state::Writer &out)
+    {
+        serializeSifStubState(out);
+    }
+
+    void loadSifStubState(ps2x::state::Reader &in)
+    {
+        serializeSifStubState(in);
     }
 }

@@ -1,10 +1,12 @@
 #include "emulator/core/iop_memory.h"
 #include "emulator/devices/iop_dualshock2.h"
+#include "emulator/devices/iop_memcard.h"
 #include "emulator/devices/iop_sio2.h"
 #include "ps2x/iop/iop_host.h"
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <string_view>
 #include <vector>
@@ -193,11 +195,49 @@ namespace
         return expect(memory.readRam(kOut, out.data(), out.size()), "read DMA output") &&
                expect(out == std::array<uint8_t, 8>{0xFF, 0x41, 0x5A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, "channel 12 receives the reply");
     }
+
+    std::vector<uint8_t> cardExchange(VirtualMemoryCard &card, std::vector<uint8_t> command)
+    {
+        std::vector<uint8_t> response(command.size(), 0xFFu);
+        (void)card.transfer(command, response);
+        return response;
+    }
+
+    bool testMemoryCard()
+    {
+        const std::filesystem::path path = std::filesystem::temp_directory_path() / "ps2x_sio2_test_card.ps2";
+        std::error_code error;
+        std::filesystem::remove(path, error);
+        bool ok = true;
+        {
+            VirtualMemoryCard card;
+            card.attach(path, true);
+            ok = expect(card.present(), "card created") &&
+                 expect(std::filesystem::file_size(path) == VirtualMemoryCard::kImageSize, "card image size") &&
+                 expect(cardExchange(card, {0x81, 0x11, 0x00, 0x00}) == std::vector<uint8_t>{0x00, 0x00, 0x2B, 0x55}, "probe") &&
+                 expect(cardExchange(card, {0x81, 0x26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}) ==
+                            std::vector<uint8_t>{0x00, 0x00, 0x2B, 0x00, 0x02, 0x10, 0x00, 0x00, 0x40, 0x00, 0x00, 0x52, 0x55},
+                        "specs");
+            if (ok)
+            {
+                (void)cardExchange(card, {0x81, 0x21, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00});
+                (void)cardExchange(card, {0x81, 0x82, 0x00, 0x00});
+                (void)cardExchange(card, {0x81, 0x22, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00});
+                const auto written = cardExchange(card, {0x81, 0x42, 0x04, 0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00});
+                (void)cardExchange(card, {0x81, 0x23, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00});
+                const auto read = cardExchange(card, {0x81, 0x43, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00});
+                ok = expect(written == std::vector<uint8_t>{0x00, 0x00, 0x00, 0x2B, 0x00, 0x00, 0x00, 0x00, 0x08, 0x55}, "write reply") &&
+                     expect(read == std::vector<uint8_t>{0x00, 0x00, 0x00, 0x2B, 0x12, 0x34, 0x56, 0x78, 0x08, 0x55}, "read back");
+            }
+        }
+        std::filesystem::remove(path, error);
+        return ok;
+    }
 }
 
 int main()
 {
-    if (!testDigitalPoll() || !testAnalogConfiguration() || !testSio2PioTransfer() || !testSio2DmaTransfer())
+    if (!testDigitalPoll() || !testAnalogConfiguration() || !testSio2PioTransfer() || !testSio2DmaTransfer() || !testMemoryCard())
         return 1;
     std::cout << "ps2xIOP SIO2 tests passed\n";
     return 0;

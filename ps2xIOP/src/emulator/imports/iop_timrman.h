@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include "ps2x/state_io.h"
 #include <cstddef>
 #include <cstdint>
 
@@ -17,6 +18,12 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            ps2x::state::fields(ar, m_timers, m_holdMode);
+        }
 
     private:
         struct Callback

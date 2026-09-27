@@ -4,6 +4,8 @@
 #include "ps2x/iop/iop_host.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
 #include <sstream>
 
 namespace ps2x::iop::detail
@@ -37,6 +39,7 @@ namespace ps2x::iop::detail
         constexpr uint32_t kDmaToDevice = 1u;
         constexpr uint64_t kCompletionBaseCycles = 1'000u;
         constexpr uint64_t kCyclesPerByte = 1'200u;
+        constexpr uint64_t kCardCyclesPerByte = 150u;
     }
 
     IopSio2::IopSio2(IopHost &host, IopMemory &memory) noexcept
@@ -64,6 +67,8 @@ namespace ps2x::iop::detail
         m_smallMotor.fill(0u);
         m_largeMotor.fill(0u);
         m_reportedMode.fill(0u);
+        for (VirtualMemoryCard &card : m_cards)
+            card.reset();
         m_completion.reset();
         m_stats = {};
     }
@@ -187,11 +192,12 @@ namespace ps2x::iop::detail
 
         std::vector<uint8_t> output;
         uint32_t recv1 = kRecv1Connected;
+        uint64_t cycles = kCompletionBaseCycles;
         for (const uint32_t send3 : m_send3)
         {
             if (send3 == 0u)
                 break;
-            runCommand(send3, input, output, recv1);
+            runCommand(send3, input, output, recv1, cycles);
         }
 
         size_t delivered = 0u;
@@ -210,10 +216,26 @@ namespace ps2x::iop::detail
         m_recv3 = 0u;
         m_interruptStatus |= kInterruptTransferDone;
         ++m_stats.transfers;
-        m_completion = Completion{kCompletionBaseCycles + kCyclesPerByte * output.size()};
+        m_completion = Completion{cycles};
     }
 
-    void IopSio2::runCommand(uint32_t send3, std::deque<uint8_t> &input, std::vector<uint8_t> &output, uint32_t &recv1)
+    void IopSio2::attachCards()
+    {
+        m_cardsAttached = true;
+        const std::filesystem::path root = std::filesystem::path(m_host.hostPath(HostPathKind::MemoryCardRoot));
+        const char *enabled = std::getenv("PS2X_MEMCARD");
+        if (root.empty() || !enabled || !*enabled || *enabled == '0')
+            return;
+        const std::filesystem::path folder = root.has_parent_path() ? root.parent_path() : root;
+        m_cards[0].attach(folder / "Mcd001.ps2", true);
+        m_cards[1].attach(folder / "Mcd002.ps2", false);
+        std::ostringstream message;
+        message << "[SIO2] memory card slot 1: " << (folder / "Mcd001.ps2").string()
+                << (m_cards[0].present() ? "" : " (unavailable)");
+        m_host.log(LogLevel::Info, message.str());
+    }
+
+    void IopSio2::runCommand(uint32_t send3, std::deque<uint8_t> &input, std::vector<uint8_t> &output, uint32_t &recv1, uint64_t &cycles)
     {
         const uint32_t port = send3 & kSend3Port;
         const size_t tx = (send3 >> kSend3TxShift) & kSend3LengthMask;
@@ -260,6 +282,31 @@ namespace ps2x::iop::detail
                 m_reportedMode[port] = 0u;
             }
         }
+        else if (port - kPadPorts < kCardPorts)
+        {
+            if (!m_cardsAttached)
+                attachCards();
+            acknowledged = m_cards[port - kPadPorts].transfer(command, response);
+            if (acknowledged != 0u)
+                ++m_stats.cardCommands;
+            static const bool trace = []
+            {
+                const char *value = std::getenv("PS2X_MC_TRACE");
+                return value && *value && *value != '0';
+            }();
+            if (trace)
+            {
+                std::ostringstream message;
+                message << "[SIO2] card " << (port - kPadPorts) << " tx=" << tx << " rx=" << rx << " ack=" << acknowledged << " in=" << std::hex;
+                for (size_t i = 0; i < std::min<size_t>(command.size(), 12u); ++i)
+                    message << ' ' << static_cast<uint32_t>(command[i]);
+                message << " out=";
+                for (size_t i = 0; i < std::min<size_t>(response.size(), 12u); ++i)
+                    message << ' ' << static_cast<uint32_t>(response[i]);
+                m_host.log(LogLevel::Info, message.str());
+            }
+        }
+        cycles += rx * (port < kPadPorts ? kCyclesPerByte : kCardCyclesPerByte);
         if (acknowledged == 0u)
         {
             recv1 = kRecv1NoResponse;

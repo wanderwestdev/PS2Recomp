@@ -13,6 +13,7 @@ add_library(ps2_iop STATIC
     src/emulator/core/iop_kernel.cpp
     src/emulator/core/iop_memory.cpp
     src/emulator/devices/iop_dualshock2.cpp
+    src/emulator/devices/iop_memcard.cpp
     src/emulator/devices/iop_sio2.cpp
     src/emulator/devices/iop_spu2.cpp
     src/emulator/services/iop_module_loader.cpp

@@ -2,6 +2,7 @@
 #include "CD.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
+#include "ps2x/state_io.h"
 
 namespace ps2_stubs
 {
@@ -1001,5 +1002,15 @@ namespace ps2_stubs
             *status = 0;
         }
         setReturnS32(ctx, 1);
+    }
+
+    void saveCdStubState(ps2x::state::Writer &out)
+    {
+        ps2x::state::fields(out, g_lastCdError, g_cdMode, g_cdStreamingLbn, g_cdStreamingEndLbn, g_cdInitialized, g_cdStreamTiming);
+    }
+
+    void loadCdStubState(ps2x::state::Reader &in)
+    {
+        ps2x::state::fields(in, g_lastCdError, g_cdMode, g_cdStreamingLbn, g_cdStreamingEndLbn, g_cdInitialized, g_cdStreamTiming);
     }
 }

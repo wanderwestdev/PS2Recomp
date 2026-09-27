@@ -1,6 +1,8 @@
 #pragma once
 
 #include "iop_dualshock2.h"
+#include "iop_memcard.h"
+#include "ps2x/state_io.h"
 
 #include <array>
 #include <cstdint>
@@ -26,6 +28,7 @@ namespace ps2x::iop::detail
         static constexpr uint32_t kDmaIn = 11u;
         static constexpr uint32_t kDmaOut = 12u;
         static constexpr uint32_t kPadPorts = 2u;
+        static constexpr uint32_t kCardPorts = 2u;
 
         struct Completion
         {
@@ -36,6 +39,7 @@ namespace ps2x::iop::detail
         {
             uint64_t transfers = 0u;
             uint64_t padCommands = 0u;
+            uint64_t cardCommands = 0u;
             uint64_t unansweredCommands = 0u;
         };
 
@@ -58,6 +62,14 @@ namespace ps2x::iop::detail
         [[nodiscard]] const Stats &stats() const noexcept { return m_stats; }
         [[nodiscard]] const VirtualDualShock2 &pad(uint32_t port) const noexcept { return m_pads[port]; }
 
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            ps2x::state::fields(ar, m_send3, m_portControl, m_control, m_recv1, m_recv2, m_recv3, m_reg278, m_reg27C, m_interruptStatus,
+                                m_fifoIn, m_fifoOut, m_dmaIn, m_dmaOut, m_pads, m_smallMotor, m_largeMotor, m_reportedMode, m_completion,
+                                m_stats, m_cards);
+        }
+
     private:
         struct DmaRequest
         {
@@ -67,7 +79,8 @@ namespace ps2x::iop::detail
         };
 
         void startTransfer();
-        void runCommand(uint32_t send3, std::deque<uint8_t> &input, std::vector<uint8_t> &output, uint32_t &recv1);
+        void runCommand(uint32_t send3, std::deque<uint8_t> &input, std::vector<uint8_t> &output, uint32_t &recv1, uint64_t &cycles);
+        void attachCards();
 
         IopHost &m_host;
         IopMemory &m_memory;
@@ -88,6 +101,8 @@ namespace ps2x::iop::detail
         std::array<uint8_t, kPadPorts> m_smallMotor{};
         std::array<uint8_t, kPadPorts> m_largeMotor{};
         std::array<uint8_t, kPadPorts> m_reportedMode{};
+        std::array<VirtualMemoryCard, kCardPorts> m_cards{};
+        bool m_cardsAttached = false;
         std::optional<Completion> m_completion;
         Stats m_stats;
     };

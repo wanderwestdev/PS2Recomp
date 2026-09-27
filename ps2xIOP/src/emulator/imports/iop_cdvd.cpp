@@ -10,6 +10,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <limits>
 #include <string>
@@ -279,6 +280,23 @@ namespace ps2x::iop::detail
             case 13: // sceCdDiskReady
                 cpu.gpr[2] = kCdvdReadyComplete;
                 return true;
+
+            case 24:
+            {
+                const std::time_t jst = std::time(nullptr) + 9 * 60 * 60;
+                std::tm utc{};
+#if defined(_WIN32)
+                gmtime_s(&utc, &jst);
+#else
+                gmtime_r(&jst, &utc);
+#endif
+                auto bcd = [](int value)
+                { return static_cast<uint8_t>(((value / 10) << 4) | (value % 10)); };
+                const std::array<uint8_t, 8> clock{0u, bcd(utc.tm_sec), bcd(utc.tm_min), bcd(utc.tm_hour), 0u, bcd(utc.tm_mday),
+                                                   bcd(utc.tm_mon + 1), bcd(utc.tm_year % 100)};
+                cpu.gpr[2] = memory.writeRam(IopMemory::physicalAddress(a0), clock.data(), clock.size()) ? 1u : 0u;
+                return true;
+            }
 
             case 28: // sceCdStatus
                 cpu.gpr[2] = kCdvdStatusPause;
@@ -707,6 +725,14 @@ namespace ps2x::iop::detail
             return true;
         }
 
+    public:
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            ps2x::state::fields(ar, callback, completionCallback, initialized, mediaMode, currentLsn, lastError, streamFlag, lastReadTimeout,
+                                interruptEventFlagId);
+        }
+
         IopHost &host;
         IopMemory &memory;
         IopKernel &kernel;
@@ -747,5 +773,15 @@ namespace ps2x::iop::detail
     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
     {
         return m_impl->takeCompletionCallback();
+    }
+
+    void IopCdvd::saveState(ps2x::state::Writer &out)
+    {
+        m_impl->serialize(out);
+    }
+
+    void IopCdvd::loadState(ps2x::state::Reader &in)
+    {
+        m_impl->serialize(in);
     }
 }

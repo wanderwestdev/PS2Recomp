@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ps2x/state_io.h"
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -35,6 +37,8 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
+        void saveState(ps2x::state::Writer &out);
+        void loadState(ps2x::state::Reader &in);
 
     private:
         class Impl;

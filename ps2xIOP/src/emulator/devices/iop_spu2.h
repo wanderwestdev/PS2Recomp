@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include "ps2x/state_io.h"
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -42,6 +43,12 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t endFlags(uint32_t core) const noexcept { return m_endx[core]; }
         [[nodiscard]] uint32_t transferAddress(uint32_t core) const noexcept { return m_transferAddress[core]; }
         [[nodiscard]] std::span<const uint16_t> ram() const noexcept { return m_ram; }
+
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            ps2x::state::fields(ar, m_regs, m_ram, m_voices, m_endx, m_transferAddress, m_cycle);
+        }
 
     private:
         struct Voice

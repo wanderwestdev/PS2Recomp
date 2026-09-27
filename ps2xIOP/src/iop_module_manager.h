@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps2x/iop/iop_types.h"
+#include "ps2x/state_io.h"
 
 #include <cstdint>
 #include <span>
@@ -28,12 +29,24 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool isLoaded(std::span<const std::string_view> aliases) const;
         [[nodiscard]] bool recognizes(std::string_view path) const;
 
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            ps2x::state::fields(ar, m_records, m_hleIdsByKey, m_loadedKeyReferences, m_nextHleId);
+        }
+
     private:
         struct Record
         {
             std::string key;
             uint32_t references = 0u;
             bool physical = false;
+
+            template <typename Ar>
+            void serialize(Ar &ar)
+            {
+                ps2x::state::fields(ar, key, references, physical);
+            }
         };
 
         void addLoadedKey(std::string_view key);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ps2x/state_io.h"
+
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -42,4 +44,6 @@ namespace ps2x::asyncvif
     void setVu1Timing(Vu1TimingHooks hooks);
     void vu1Kick();
     bool vu1Busy(PS2Memory &memory);
+    void saveTimingState(ps2x::state::Writer &out);
+    void loadTimingState(ps2x::state::Reader &in);
 }

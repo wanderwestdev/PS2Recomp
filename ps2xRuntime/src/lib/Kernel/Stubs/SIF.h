@@ -2,8 +2,16 @@
 
 #include "ps2_stubs.h"
 
+namespace ps2x::state
+{
+    class Writer;
+    class Reader;
+}
+
 namespace ps2_stubs
 {
+    void saveSifStubState(ps2x::state::Writer &out);
+    void loadSifStubState(ps2x::state::Reader &in);
     bool dispatchSifCommand(uint8_t *rdram, PS2Runtime *runtime, uint32_t commandId, const void *packet, size_t packetSize) noexcept;
     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

@@ -1,10 +1,13 @@
 #pragma once
 
 #include "iop_cpu.h"
+#include "ps2x/state_io.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <string>
+#include <vector>
 
 namespace ps2x::iop::detail
 {
@@ -67,10 +70,23 @@ namespace ps2x::iop::detail
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+        [[nodiscard]] std::vector<std::string> describeThreads() const;
 
         [[nodiscard]] int createModuleStartThread(uint32_t entry, uint32_t gp, uint32_t a0, uint32_t a1, uint32_t priority, uint32_t stackSize);
         [[nodiscard]] bool threadFinished(int id) const;
         uint32_t releaseModuleStartThread(int id);
+
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            int current = m_currentThread ? m_currentThread->id : 0;
+            ps2x::state::fields(ar, m_threads, m_semaphores, m_eventFlags, m_nextThreadId, m_nextSemaphoreId, m_nextEventFlagId, current);
+            if constexpr (Ar::kLoading)
+            {
+                const auto it = m_threads.find(current);
+                m_currentThread = it != m_threads.end() ? &it->second : nullptr;
+            }
+        }
 
     private:
         struct Semaphore

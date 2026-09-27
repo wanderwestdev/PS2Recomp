@@ -217,6 +217,10 @@ void EeScheduler::run()
         {
             break;
         }
+        if (serviceStateRequests())
+        {
+            continue;
+        }
 
         if (m_currentThreadId == 0)
         {
@@ -251,6 +255,15 @@ void EeScheduler::run()
 
         GuestThread *running = currentThread();
         assert(running != nullptr);
+        if (running->pendingResume.setPc || running->pendingResume.setResult)
+        {
+            R5900Context &resumed = running->activeContext();
+            if (running->pendingResume.setResult)
+                setReturnS32(&resumed, running->pendingResume.result);
+            if (running->pendingResume.setPc)
+                resumed.pc = running->pendingResume.pc;
+            running->pendingResume = {};
+        }
         if (running->resumeCompletion)
         {
             auto completion = std::move(running->resumeCompletion);
@@ -1557,6 +1570,28 @@ void EeScheduler::completeExternalWait(uint32_t type, uint64_t token, int result
                  });
 }
 
+[[noreturn]] void EeScheduler::waitVSyncResume(uint64_t afterTick, int fixedResult, uint32_t resumePc)
+{
+    EeWaitState wait{EeWaitReason::VSync, EeVSyncWait{afterTick, fixedResult}, {}};
+    wait.resume.setPc = true;
+    wait.resume.pc = resumePc;
+    enterWait(std::move(wait));
+    throw EeDispatcherTransfer{};
+}
+
+[[noreturn]] void EeScheduler::waitUntilCycleResume(uint64_t cycle, int result, uint32_t resumePc)
+{
+    const uint64_t token = ++m_cycleWaitSequence;
+    scheduleEvent(cycle, std::chrono::steady_clock::now(), EeEvent{EeEventType::ExternalWake, kCycleWaitType, token});
+    EeWaitState wait{EeWaitReason::External, EeExternalWait{kCycleWaitType, token}, {}};
+    wait.resume.setPc = true;
+    wait.resume.pc = resumePc;
+    wait.resume.setResult = true;
+    wait.resume.result = result;
+    enterWait(std::move(wait));
+    throw EeDispatcherTransfer{};
+}
+
 [[noreturn]] void EeScheduler::waitExternal(EeWaitReason reason,
                                             uint32_t type,
                                             uint64_t token,
@@ -1894,9 +1929,11 @@ void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)
 {
     traceScheduler(m_vsyncTick, m_eeCycle, "R %d result=%d by=%d", item.id, result, m_currentThreadId);
     auto completion = std::move(item.wait.completion);
+    const EeResume resume = item.wait.resume;
     item.wait = {};
     setReturnS32(&item.activeContext(), result);
     item.resumeCompletion = std::move(completion);
+    item.pendingResume = resume;
     if (item.suspendCount != 0)
     {
         item.status = EeThreadStatus::Suspended;
