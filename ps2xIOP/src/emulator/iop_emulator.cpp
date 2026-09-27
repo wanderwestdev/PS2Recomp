@@ -41,7 +41,7 @@ namespace ps2x::iop::detail
         constexpr uint64_t kCdvdCompletionCycles = 128u;
         constexpr uint64_t kSifDmaBaseCycles = 64u;
         constexpr uint64_t kSifDmaBytesPerCycle = 4u;
-        constexpr uint64_t kIopBatchCycles = 128u;
+        constexpr uint64_t kIopBatchCycles = 1024u;
 
         uint32_t physicalAddress(uint32_t address)
         {

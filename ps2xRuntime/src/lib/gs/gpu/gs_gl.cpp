@@ -143,6 +143,7 @@ namespace GSGL
         load(a.BeginQuery, "glBeginQuery", missing);
         load(a.EndQuery, "glEndQuery", missing);
         load(a.GetQueryObjectui64v, "glGetQueryObjectui64v", missing);
+        load(a.QueryCounter, "glQueryCounter", missing);
         load(a.CreateShader, "glCreateShader", missing);
         load(a.ShaderSource, "glShaderSource", missing);
         load(a.CompileShader, "glCompileShader", missing);

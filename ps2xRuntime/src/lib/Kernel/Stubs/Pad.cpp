@@ -7,7 +7,7 @@ namespace ps2_stubs
     {
         constexpr uint8_t kPadModeDigital = 0x41;
         constexpr uint8_t kPadModeDualShock = 0x73;
-        constexpr uint8_t kPadAnalogCenter = 0x80;
+        constexpr uint8_t kPadAnalogCenter = 0x7F;
         constexpr int32_t kPadTypeDigital = 4;
         constexpr int32_t kPadTypeDualShock = 7;
         constexpr int32_t kPadStateDisconnected = 0;
@@ -70,7 +70,7 @@ namespace ps2_stubs
         uint8_t axisToByte(float axis)
         {
             axis = std::clamp(axis, -1.0f, 1.0f);
-            const float mapped = (axis + 1.0f) * 127.5f;
+            const float mapped = static_cast<float>(kPadAnalogCenter) + axis * (axis < 0.0f ? 127.0f : 128.0f);
             return static_cast<uint8_t>(std::lround(mapped));
         }
 

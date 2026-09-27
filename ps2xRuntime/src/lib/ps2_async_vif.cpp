@@ -102,6 +102,9 @@ namespace ps2x::asyncvif
         std::atomic<Worker *> s_worker{nullptr};
         std::function<uint32_t()> s_fbrstProvider;
         thread_local bool t_onWorker = false;
+        std::function<uint64_t()> s_vu1CycleReader;
+        std::atomic<bool> s_vu1ReaderReady{false};
+        std::atomic<uint64_t> s_vu1Completed{0u};
         thread_local uint32_t t_fbrst = 0u;
 
         bool enabled()
@@ -190,6 +193,8 @@ namespace ps2x::asyncvif
                 }
                 if (memory.m_gifArbiter)
                     memory.m_gifArbiter->drain();
+                if (s_vu1ReaderReady.load(std::memory_order_acquire))
+                    s_vu1Completed.store(s_vu1CycleReader(), std::memory_order_release);
                 publishGif(worker.gif);
                 if (stats)
                 {
@@ -344,6 +349,7 @@ namespace ps2x::asyncvif
             uint64_t busyUntil = 0;
             bool kickPending = false;
             uint64_t kickCycle = 0;
+            bool blocking = false;
         };
 
         Vu1Timing &vu1Timing()
@@ -375,6 +381,13 @@ namespace ps2x::asyncvif
             scale = std::atof(value);
         timing.scale = scale;
         timing.enabled = scale > 0.0 && timing.hooks.eeCycle && timing.hooks.vu1Cycles && timing.hooks.consumeEeCycles;
+        const char *blocking = std::getenv("PS2X_VU1_TIMING_SYNC");
+        timing.blocking = blocking && *blocking && *blocking != '0';
+        if (timing.enabled && !s_vu1ReaderReady.load(std::memory_order_acquire))
+        {
+            s_vu1CycleReader = timing.hooks.vu1Cycles;
+            s_vu1ReaderReady.store(true, std::memory_order_release);
+        }
     }
 
     void vu1Kick()
@@ -391,8 +404,11 @@ namespace ps2x::asyncvif
         Vu1Timing &timing = vu1Timing();
         if (!timing.enabled || t_onWorker)
             return false;
-        syncVu(memory);
-        const uint64_t total = timing.hooks.vu1Cycles();
+        Worker *worker = s_worker;
+        const bool async = !timing.blocking && timing.primed && worker && worker->memory == &memory;
+        if (!async)
+            syncVu(memory);
+        const uint64_t total = async ? std::max(timing.accounted, s_vu1Completed.load(std::memory_order_acquire)) : timing.hooks.vu1Cycles();
         uint64_t now = timing.hooks.eeCycle();
         if (!timing.primed)
         {

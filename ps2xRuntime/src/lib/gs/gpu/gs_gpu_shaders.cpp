@@ -7,6 +7,7 @@ namespace GSGpuShaders
 layout(std430, binding = 0) buffer VramBuffer { uint vram[]; };
 layout(std430, binding = 1) readonly buffer SwizzleBuffer { uint swz[]; };
 layout(std430, binding = 2) buffer ClutBuffer { uint clut[]; };
+layout(std430, binding = 9) readonly buffer PageMapBuffer { uint pageMap[]; };
 
 const uint KIND_INVALID = 0u;
 const uint KIND_32 = 1u;
@@ -127,6 +128,17 @@ void writePixelRaw(uint psm, uint base, uint bw, uint x, uint y, uint value)
     storeAt(f, locate(f, base, bw, x, y), value);
 }
 
+uint readPixelEpoch(uint psm, uint base, uint bw, uint x, uint y, uint epoch, uint finalEpoch)
+{
+    uint f = fmtOf(psm);
+    if (FMT_KIND[f] == KIND_INVALID)
+        return 0u;
+    uvec2 loc = locate(f, base, bw, x, y);
+    if (epoch < finalEpoch)
+        loc.x = (pageMap[epoch * 512u + (loc.x >> 13u)] << 13u) | (loc.x & 0x1FFFu);
+    return loadAt(f, loc);
+}
+
 uint bitsPerPixel(uint psm)
 {
     switch (psm)
@@ -183,6 +195,7 @@ layout(std430, binding = 3) readonly buffer PrimBuffer { uint prims[]; };
 layout(std430, binding = 4) readonly buffer StateBuffer { uint states[]; };
 layout(std430, binding = 5) readonly buffer TileBuffer { uvec4 tiles[]; };
 layout(std430, binding = 6) readonly buffer TileListBuffer { uint tileList[]; };
+uniform uvec4 uRaster;
 
 const uint PRIM_WORDS = 40u;
 const uint STATE_WORDS = 32u;
@@ -212,6 +225,7 @@ const uint S_FLAGS = 21u;
 const uint S_TEXA = 22u;
 const uint S_FOGCOL = 23u;
 const uint S_CLUT = 24u;
+const uint S_EPOCH = 25u;
 
 const uint F_IIP = 1u;
 const uint F_TME = 2u;
@@ -355,7 +369,16 @@ uint samplePoint(uint s, int u, int v)
     u = wrapCoordinate(u, texW, wrapU, minU, maxU);
     v = wrapCoordinate(v, texH, wrapV, minV, maxV);
     uint psm = st(s, S_TPSM);
-    uint raw = readPixel(psm, st(s, S_TBP0), st(s, S_TBW), uint(u), uint(v));
+    uint raw = 0u;
+    uint f = fmtOf(psm);
+    if (FMT_KIND[f] != KIND_INVALID)
+    {
+        uvec2 loc = locate(f, st(s, S_TBP0), st(s, S_TBW), uint(u), uint(v));
+        uint epoch = st(s, S_EPOCH);
+        if (epoch < uRaster.x)
+            loc.x = (pageMap[epoch * 512u + (loc.x >> 13u)] << 13u) | (loc.x & 0x1FFFu);
+        raw = loadAt(f, loc);
+    }
     switch (psm)
     {
     case 0x00u: case 0x30u: case 0x01u: case 0x31u:
@@ -713,23 +736,91 @@ void drawTriangle(uint p, uint s, int x, int y)
     writePixel(s, x, y, uint(zc), color, fog);
 }
 
+bool coversPixel(uint p, int x, int y)
+{
+    uint header = pw(p, 0u);
+    uint type = header & 0xFFu;
+    uint xr = pw(p, 1u);
+    uint yr = pw(p, 2u);
+    if (type == 0u)
+        return x == int(xr) && y == int(yr);
+    if (x < int(xr & 0xFFFFu) || x > int(xr >> 16u) || y < int(yr & 0xFFFFu) || y > int(yr >> 16u))
+        return false;
+    if (type != 2u)
+        return true;
+    int sgn = int(pw(p, 9u));
+    int sx = x * 16;
+    int sy = y * 16;
+    for (uint i = 0u; i < 3u; ++i)
+    {
+        uint a = (i + 1u) % 3u;
+        uint b = (i + 2u) % 3u;
+        int vxa = int(pw(p, 3u + a * 2u));
+        int vya = int(pw(p, 4u + a * 2u));
+        int vxb = int(pw(p, 3u + b * 2u));
+        int vyb = int(pw(p, 4u + b * 2u));
+        int ea = -(vyb - vya) * sgn;
+        int eb = (vxb - vxa) * sgn;
+        int hi1, lo1, hi2, lo2;
+        imulExtended(ea, sx - vxa, hi1, lo1);
+        imulExtended(eb, sy - vya, hi2, lo2);
+        uint carry;
+        uint lo = uaddCarry(uint(lo1), uint(lo2), carry);
+        int hi = hi1 + hi2 + int(carry);
+        bool bias = ea > 0 || (ea == 0 && eb > 0);
+        bool positive = hi > 0 || (hi == 0 && lo != 0u);
+        bool zero = hi == 0 && lo == 0u;
+        if (!(positive || (zero && bias)))
+            return false;
+    }
+    return true;
+}
+
+void drawPrim(uint p, int x, int y)
+{
+    uint header = pw(p, 0u);
+    uint s = header >> 8u;
+    switch (header & 0xFFu)
+    {
+    case 0u: drawPoint(p, s, x, y); break;
+    case 1u: drawSprite(p, s, x, y); break;
+    case 2u: drawTriangle(p, s, x, y); break;
+    }
+}
+
 void main()
 {
     uvec4 tile = tiles[gl_WorkGroupID.x];
     int x = int(tile.x * 16u + gl_LocalInvocationID.x);
     int y = int(tile.y * 16u + gl_LocalInvocationID.y);
-    for (uint i = 0u; i < tile.w; ++i)
+    for (uint base = 0u; base < tile.w; base += 32u)
     {
-        uint p = tileList[tile.z + i];
-        uint header = pw(p, 0u);
-        uint s = header >> 8u;
-        switch (header & 0xFFu)
+        uint count = min(32u, tile.w - base);
+        uint mask = 0u;
+        for (uint k = 0u; k < count; ++k)
+            if (coversPixel(tileList[tile.z + base + k], x, y))
+                mask |= 1u << k;
+        while (mask != 0u)
         {
-        case 0u: drawPoint(p, s, x, y); break;
-        case 1u: drawSprite(p, s, x, y); break;
-        case 2u: drawTriangle(p, s, x, y); break;
+            uint k = uint(findLSB(mask));
+            mask &= mask - 1u;
+            drawPrim(tileList[tile.z + base + k], x, y);
         }
     }
+}
+)GLSL";
+
+    const char *const kPageCopy = R"GLSL(
+layout(local_size_x = 256) in;
+layout(std430, binding = 7) readonly buffer DataBuffer { uint data[]; };
+
+void main()
+{
+    uint pair = data[gl_WorkGroupID.x];
+    uint source = (pair & 0xFFFFu) * 2048u;
+    uint target = (pair >> 16u) * 2048u;
+    for (uint i = gl_LocalInvocationID.x; i < 2048u; i += 256u)
+        vram[target + i] = vram[source + i];
 }
 )GLSL";
 
@@ -780,7 +871,7 @@ uint clutHalf(uint op, uint hw)
         sourceX = (cou << 4u) + entry;
         sourceY = cov;
     }
-    uint raw = readPixel(cpsm, cbp, sourceWidth, sourceX, sourceY);
+    uint raw = readPixelEpoch(cpsm, cbp, sourceWidth, sourceX, sourceY, clutOps[p + 7u], uClutA.y);
     return (raw >> shift) & 0xFFFFu;
 }
 
@@ -806,43 +897,45 @@ void main()
     const char *const kUpload = R"GLSL(
 layout(local_size_x = 256) in;
 layout(std430, binding = 7) readonly buffer DataBuffer { uint data[]; };
-uniform uvec4 uDst;
-uniform uvec4 uRange;
+uniform uvec4 uUpload;
 
-uint dataByte(uint index)
+uint dataByte(uint base, uint index)
 {
-    return (data[index >> 2u] >> ((index & 3u) * 8u)) & 0xFFu;
+    return (data[base + (index >> 2u)] >> ((index & 3u) * 8u)) & 0xFFu;
 }
 
 void main()
 {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= uRange.y)
+    uint entry = data[uUpload.x + gl_WorkGroupID.x];
+    uint d = (entry & 0xFFFFu) * 9u;
+    uint i = (entry >> 16u) * 256u + gl_LocalInvocationID.x;
+    if (i >= data[d + 5u])
         return;
-    uint dbp = uDst.x;
-    uint dbw = uDst.y;
-    uint dpsm = uDst.z;
-    uint rrw = uDst.w;
-    uint pixel = uRange.x + i;
-    uint x = uRange.z + pixel % rrw;
-    uint y = uRange.w + pixel / rrw;
+    uint dbp = data[d];
+    uint dbw = data[d + 1u];
+    uint dpsm = data[d + 2u];
+    uint rrw = data[d + 3u];
+    uint pixel = data[d + 4u] + i;
+    uint x = data[d + 6u] + pixel % rrw;
+    uint y = data[d + 7u] + pixel / rrw;
+    uint base = data[d + 8u];
     uint value;
     switch (dpsm)
     {
     case 0x00u: case 0x30u:
-        value = data[i];
+        value = data[base + i];
         break;
     case 0x01u: case 0x31u:
-        value = dataByte(i * 3u) | (dataByte(i * 3u + 1u) << 8u) | (dataByte(i * 3u + 2u) << 16u);
+        value = dataByte(base, i * 3u) | (dataByte(base, i * 3u + 1u) << 8u) | (dataByte(base, i * 3u + 2u) << 16u);
         break;
     case 0x02u: case 0x0Au: case 0x32u: case 0x3Au:
-        value = dataByte(i * 2u) | (dataByte(i * 2u + 1u) << 8u);
+        value = dataByte(base, i * 2u) | (dataByte(base, i * 2u + 1u) << 8u);
         break;
     case 0x13u: case 0x1Bu:
-        value = dataByte(i);
+        value = dataByte(base, i);
         break;
     default:
-        value = (dataByte(i >> 1u) >> ((i & 1u) * 4u)) & 0x0Fu;
+        value = (dataByte(base, i >> 1u) >> ((i & 1u) * 4u)) & 0x0Fu;
         break;
     }
     writePixelRaw(dpsm, dbp, dbw, x, y, value);

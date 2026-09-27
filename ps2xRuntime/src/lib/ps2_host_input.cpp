@@ -1,4 +1,5 @@
 #include "ps2_host_input.h"
+#include "runtime/ps2_input_options.h"
 #include "ps2_host_backend.h"
 
 #include <algorithm>
@@ -224,9 +225,12 @@ namespace ps2_host_input
             return state;
         }();
 
+        constexpr uint8_t kAxisNeutral = 0x7Fu;
+
         uint8_t axisToByte(float value)
         {
-            const float scaled = std::round(127.5f + std::clamp(value, -1.0f, 1.0f) * 127.5f);
+            const float clamped = std::clamp(value, -1.0f, 1.0f);
+            const float scaled = std::round(static_cast<float>(kAxisNeutral) + clamped * (clamped < 0.0f ? 127.0f : 128.0f));
             return static_cast<uint8_t>(std::clamp(scaled, 0.0f, 255.0f));
         }
 
@@ -240,6 +244,22 @@ namespace ps2_host_input
         }
 
         std::atomic<const std::atomic<uint64_t> *> g_fieldCounter{nullptr};
+        std::atomic<uint32_t> g_invertRightDefault{0u};
+
+        uint32_t rightStickInvert()
+        {
+            if (const char *value = std::getenv("PS2X_INVERT_RIGHT_STICK"))
+            {
+                const std::string_view text(value);
+                uint32_t axes = 0u;
+                if (text.find_first_of("xX") != std::string_view::npos || text == "1")
+                    axes |= kInvertRightX;
+                if (text.find_first_of("yY") != std::string_view::npos || text == "1")
+                    axes |= kInvertRightY;
+                return axes;
+            }
+            return g_invertRightDefault.load(std::memory_order_relaxed);
+        }
 
         void applyPressure(PadInputState &state)
         {
@@ -256,6 +276,10 @@ namespace ps2_host_input
             state.connected = gamepadAvailable || keyboard;
             if (!state.connected)
                 return state;
+            state.leftX = kAxisNeutral;
+            state.leftY = kAxisNeutral;
+            state.rightX = kAxisNeutral;
+            state.rightY = kAxisNeutral;
 
             for (const ButtonBinding &binding : kButtons)
             {
@@ -269,8 +293,11 @@ namespace ps2_host_input
             {
                 state.leftX = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
                 state.leftY = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y));
-                state.rightX = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X));
-                state.rightY = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
+                const uint32_t invert = rightStickInvert();
+                const float rightX = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X);
+                const float rightY = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y);
+                state.rightX = axisToByte((invert & kInvertRightX) != 0u ? -rightX : rightX);
+                state.rightY = axisToByte((invert & kInvertRightY) != 0u ? -rightY : rightY);
             }
             if (keyboard)
             {
@@ -278,15 +305,21 @@ namespace ps2_host_input
                     state.leftX = x;
                 if (const uint8_t y = keyAxis(KEY_W, KEY_S); y != 0x80u)
                     state.leftY = y;
-                if (const uint8_t x = keyAxis(KEY_J, KEY_L); x != 0x80u)
+                const uint32_t invert = rightStickInvert();
+                if (const uint8_t x = (invert & kInvertRightX) != 0u ? keyAxis(KEY_L, KEY_J) : keyAxis(KEY_J, KEY_L); x != 0x80u)
                     state.rightX = x;
-                if (const uint8_t y = keyAxis(KEY_I, KEY_K); y != 0x80u)
+                if (const uint8_t y = (invert & kInvertRightY) != 0u ? keyAxis(KEY_K, KEY_I) : keyAxis(KEY_I, KEY_K); y != 0x80u)
                     state.rightY = y;
             }
 
             applyPressure(state);
             return state;
         }
+    }
+
+    void setRightStickInvertDefault(uint32_t axes)
+    {
+        g_invertRightDefault.store(axes, std::memory_order_relaxed);
     }
 
     void setFieldCounter(const std::atomic<uint64_t> *counter)

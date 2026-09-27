@@ -50,6 +50,7 @@ namespace GSGL
     constexpr GLbitfield kClientStorageBit = 0x0200;
     constexpr GLenum kTimeElapsed = 0x88BF;
     constexpr GLenum kQueryResult = 0x8866;
+    constexpr GLenum kTimestamp = 0x8E28;
 
     struct Api
     {
@@ -71,6 +72,7 @@ namespace GSGL
         void (*BeginQuery)(GLenum, GLuint) = nullptr;
         void (*EndQuery)(GLenum) = nullptr;
         void (*GetQueryObjectui64v)(GLuint, GLenum, GLuint64 *) = nullptr;
+        void (*QueryCounter)(GLuint, GLenum) = nullptr;
         GLuint (*CreateShader)(GLenum) = nullptr;
         void (*ShaderSource)(GLuint, GLsizei, const GLchar *const *, const GLint *) = nullptr;
         void (*CompileShader)(GLuint) = nullptr;

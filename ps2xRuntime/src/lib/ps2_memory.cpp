@@ -1412,7 +1412,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 1 << 20;
                     static thread_local size_t chainSizeHint = 0u;
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = ps2x::asyncvif::takeBuffer();
+                    chainBuf.clear();
                     chainBuf.reserve(chainSizeHint);
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)

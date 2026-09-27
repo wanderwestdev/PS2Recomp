@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 
 using namespace GSGL;
 using namespace GSCpuInternal;
@@ -26,6 +27,8 @@ namespace
     constexpr uint32_t kTileGrid = 128u;
     constexpr uint32_t kClutSlots = 1024u;
     constexpr uint32_t kPages = 512u;
+    constexpr uint32_t kShadowPages = 512u;
+    constexpr uint32_t kMaxEpochs = 256u;
     constexpr uint32_t kMaxPresentationWidth = 2048u;
     constexpr uint32_t kMaxPresentationHeight = 2048u;
 
@@ -63,6 +66,7 @@ namespace
         STexa,
         SFogCol,
         SClut,
+        SEpoch,
     };
 
     constexpr uint32_t FIip = 1u;
@@ -97,6 +101,7 @@ namespace
         uint32_t cbw = 0;
         uint32_t cou = 0;
         uint32_t cov = 0;
+        uint32_t epoch = 0;
         std::array<uint16_t, 32> writers{};
     };
 
@@ -221,6 +226,7 @@ struct GSGpuBackend::Impl
     Program clear;
     Program poke;
     Program present;
+    Program pageCopy;
 
     std::vector<uint32_t> prims;
     uint32_t primCount = 0u;
@@ -232,6 +238,22 @@ struct GSGpuBackend::Impl
     std::vector<uint32_t> tileHeaders;
     std::vector<uint32_t> tileList;
     std::bitset<kPages> writePages;
+    std::bitset<kPages> batchClutPages;
+    bool deferUploads = true;
+    std::vector<uint32_t> pageMaps;
+    std::array<uint32_t, kPages> firstLiveEpoch{};
+    uint32_t epoch = 0u;
+    uint32_t shadowNext = 0u;
+    uint32_t batchClutLoads = 0u;
+    std::vector<uint32_t> copyPairs;
+    std::vector<uint32_t> uploadWords;
+    std::vector<uint32_t> uploadGroups;
+    std::vector<uint32_t> uploadData_;
+    uint32_t uploadCount = 0u;
+    std::bitset<kPages> pendingWritePages;
+    std::bitset<kPages> transferPages;
+    bool transferQueued = false;
+    GLuint pageMapBuffer = 0;
     std::bitset<kPages> readPages;
     uint64_t targetKey = 0u;
     bool hasTarget = false;
@@ -263,6 +285,156 @@ struct GSGpuBackend::Impl
         uint64_t transfers = 0u;
     } presentStats;
 
+    struct GpuProf
+    {
+        struct Pending
+        {
+            uint32_t kind;
+            GLuint begin;
+            GLuint end;
+            std::array<uint32_t, 8> info;
+        };
+        std::vector<std::pair<uint64_t, std::array<uint32_t, 8>>> rasterTimes;
+        std::array<uint32_t, 8> nextInfo{};
+        bool enabled = false;
+        std::vector<GLuint> freeQueries;
+        std::vector<Pending> pending;
+        std::array<uint64_t, 8> ns{};
+        std::array<uint64_t, 8> count{};
+        uint64_t pairs = 0u;
+        uint64_t tiles = 0u;
+        uint64_t maxBin = 0u;
+        uint64_t sumMaxBin = 0u;
+        uint64_t prims = 0u;
+        uint64_t frames = 0u;
+        std::array<uint64_t, 6> reasons{};
+        std::array<uint64_t, 3> uploadHazards{};
+    } prof;
+
+    void flushFor(uint32_t reason)
+    {
+        if (prof.enabled && primCount != 0u)
+            ++prof.reasons[reason];
+        flushBatch();
+    }
+
+    GLuint profQuery()
+    {
+        if (prof.freeQueries.empty())
+        {
+            prof.freeQueries.resize(256u);
+            gl().GenQueries(256, prof.freeQueries.data());
+        }
+        const GLuint query = prof.freeQueries.back();
+        prof.freeQueries.pop_back();
+        return query;
+    }
+
+    GLuint profBegin()
+    {
+        if (!prof.enabled)
+            return 0u;
+        const GLuint query = profQuery();
+        gl().QueryCounter(query, kTimestamp);
+        return query;
+    }
+
+    void profEnd(uint32_t kind, GLuint begin)
+    {
+        if (!prof.enabled)
+            return;
+        const GLuint end = profQuery();
+        gl().QueryCounter(end, kTimestamp);
+        prof.pending.push_back({kind, begin, end, prof.nextInfo});
+        prof.nextInfo = {};
+        if (prof.pending.size() >= 4096u)
+            profResolve();
+    }
+
+    void profFrame()
+    {
+        if (!prof.enabled)
+            return;
+        profResolve();
+        if (++prof.frames < 4u)
+            return;
+        profReport();
+    }
+
+    void profResolve()
+    {
+        for (const GpuProf::Pending &item : prof.pending)
+        {
+            GLuint64 a = 0u;
+            GLuint64 b = 0u;
+            gl().GetQueryObjectui64v(item.begin, kQueryResult, &a);
+            gl().GetQueryObjectui64v(item.end, kQueryResult, &b);
+            prof.ns[item.kind] += b - a;
+            if (item.kind == 0u)
+                prof.rasterTimes.push_back({b - a, item.info});
+            ++prof.count[item.kind];
+            prof.freeQueries.push_back(item.begin);
+            prof.freeQueries.push_back(item.end);
+        }
+        prof.pending.clear();
+    }
+
+    void profReport()
+    {
+        prof.frames = std::max<uint64_t>(prof.frames, 1u);
+        static const char *kNames[8] = {"raster", "clut", "upload", "copyRead", "copyWrite", "present", "clear", "other"};
+        std::fprintf(stderr, "[gs-gpu-prof] per frame:");
+        for (uint32_t kind = 0; kind < 8u; ++kind)
+            if (prof.count[kind] != 0u)
+                std::fprintf(stderr, " %s %.2f ms (%.0f)", kNames[kind], prof.ns[kind] / 1e6 / prof.frames,
+                             static_cast<double>(prof.count[kind]) / prof.frames);
+        std::fprintf(stderr, " | prims %.0f tiles %.0f pairs %.0f maxBin %llu\n", static_cast<double>(prof.prims) / prof.frames,
+                     static_cast<double>(prof.tiles) / prof.frames, static_cast<double>(prof.pairs) / prof.frames,
+                     static_cast<unsigned long long>(prof.maxBin));
+        std::fprintf(stderr, "[gs-gpu-prof] flushes: target %llu texture %llu clut %llu transfer %llu external %llu sync %llu\n",
+                     static_cast<unsigned long long>(prof.reasons[0]), static_cast<unsigned long long>(prof.reasons[1]),
+                     static_cast<unsigned long long>(prof.reasons[2]), static_cast<unsigned long long>(prof.reasons[3]),
+                     static_cast<unsigned long long>(prof.reasons[4]), static_cast<unsigned long long>(prof.reasons[5]));
+        prof.reasons = {};
+        std::fprintf(stderr, "[gs-gpu-prof] upload hazards: target %llu clut %llu texture-read %llu\n", static_cast<unsigned long long>(prof.uploadHazards[0]),
+                     static_cast<unsigned long long>(prof.uploadHazards[1]), static_cast<unsigned long long>(prof.uploadHazards[2]));
+        prof.uploadHazards = {};
+        std::fprintf(stderr, "[gs-gpu-prof] sum of per-dispatch longest bins %.0f per frame\n", static_cast<double>(prof.sumMaxBin) / prof.frames);
+        std::sort(prof.rasterTimes.begin(), prof.rasterTimes.end(), [](const auto &l, const auto &r) { return l.first > r.first; });
+        for (size_t i = 0; i < std::min<size_t>(prof.rasterTimes.size(), 15u); ++i)
+        {
+            const auto &[ns, info] = prof.rasterTimes[i];
+            std::fprintf(stderr, "[gs-gpu-prof]   %.2f ms prims %u tiles %u pairs %u maxBin %u fbp %x fpsm %x zbp %x flags %x\n", ns / 1e6, info[0], info[1],
+                         info[2], info[3], info[4], info[5], info[6], info[7]);
+        }
+        std::map<std::pair<uint32_t, uint32_t>, std::array<uint64_t, 4>> byTarget;
+        for (const auto &[ns, info] : prof.rasterTimes)
+        {
+            auto &entry = byTarget[{info[4], info[7]}];
+            entry[0] += ns;
+            entry[1] += 1u;
+            entry[2] += info[2];
+            entry[3] += info[0];
+        }
+        std::vector<std::pair<uint64_t, std::pair<uint32_t, uint32_t>>> targets;
+        for (const auto &[key, entry] : byTarget)
+            targets.push_back({entry[0], key});
+        std::sort(targets.rbegin(), targets.rend());
+        for (size_t i = 0; i < std::min<size_t>(targets.size(), 20u); ++i)
+        {
+            const auto &entry = byTarget[targets[i].second];
+            std::fprintf(stderr, "[gs-gpu-prof]   target fbp %x flags %x: %.2f ms in %llu dispatches, %llu pairs, %llu prims\n", targets[i].second.first,
+                         targets[i].second.second, entry[0] / 1e6 / prof.frames, static_cast<unsigned long long>(entry[1]),
+                         static_cast<unsigned long long>(entry[2]), static_cast<unsigned long long>(entry[3]));
+        }
+        prof.rasterTimes.clear();
+        std::fflush(stderr);
+        prof.ns = {};
+        prof.count = {};
+        prof.pairs = prof.tiles = prof.prims = prof.maxBin = prof.sumMaxBin = 0u;
+        prof.frames = 0u;
+    }
+
     GSTransferCommand transfer{};
     GSTransferSnapshot transferState{};
     std::vector<uint8_t> localToHost;
@@ -273,6 +445,10 @@ struct GSGpuBackend::Impl
     {
         const char *statsValue = std::getenv("PS2X_GS_GPU_STATS");
         presentStats.enabled = statsValue && *statsValue && *statsValue != '0';
+        const char *profValue = std::getenv("PS2X_GS_GPU_PROF");
+        prof.enabled = profValue && *profValue && *profValue != '0';
+        const char *deferValue = std::getenv("PS2X_GS_GPU_DEFER_UPLOADS");
+        deferUploads = !(deferValue && *deferValue == '0');
         bins.resize(kTileGrid * kTileGrid);
         transfer.direction = 3u;
         transferState.direction = 3u;
@@ -280,6 +456,11 @@ struct GSGpuBackend::Impl
 
     ~Impl()
     {
+        if (initialized && prof.enabled)
+        {
+            profResolve();
+            profReport();
+        }
         if (initialized)
         {
             const Api &gl = context.gl();
@@ -293,9 +474,9 @@ struct GSGpuBackend::Impl
             for (GLuint query : presentStats.queries)
                 if (query)
                     gl.DeleteQueries(1, &query);
-            const GLuint buffers[] = {vramBuffer, swizzleBuffer, clutBuffer, primBuffer, stateBuffer, tileBuffer, tileListBuffer, dataBuffer, clutOpBuffer};
+            const GLuint buffers[] = {vramBuffer, swizzleBuffer, clutBuffer, primBuffer, stateBuffer, tileBuffer, tileListBuffer, dataBuffer, clutOpBuffer, pageMapBuffer};
             gl.DeleteBuffers(static_cast<GLsizei>(std::size(buffers)), buffers);
-            for (Program *program : {&raster, &clutLoad, &upload, &copyRead, &copyWrite, &clear, &poke, &present})
+            for (Program *program : {&raster, &clutLoad, &upload, &copyRead, &copyWrite, &clear, &poke, &present, &pageCopy})
                 if (program->id)
                     gl.DeleteProgram(program->id);
         }
@@ -439,7 +620,7 @@ struct GSGpuBackend::Impl
         std::string common = GSGpuShaders::kCommon;
         (void)common;
 
-        vramBuffer = makeBuffer(GSSwizzle::kMemorySize, nullptr, 0u);
+        vramBuffer = makeBuffer(GSSwizzle::kMemorySize + static_cast<size_t>(kShadowPages) * 8192u, nullptr, 0u);
         swizzleBuffer = makeBuffer(swizzle.size() * sizeof(uint16_t), swizzle.data(), 1u);
         std::vector<uint32_t> zeros(kClutSlots * 256u, 0u);
         clutBuffer = makeBuffer(zeros.size() * sizeof(uint32_t), zeros.data(), 2u);
@@ -449,6 +630,7 @@ struct GSGpuBackend::Impl
         tileListBuffer = makeBuffer(16u, nullptr, 6u);
         dataBuffer = makeBuffer(16u, nullptr, 7u);
         clutOpBuffer = makeBuffer(16u, nullptr, 8u);
+        pageMapBuffer = makeBuffer(16u, nullptr, 9u);
         dataCapacity = 16u;
         gl().GenBuffers(1, &ringBuffer);
         gl().BindBuffer(kShaderStorageBuffer, ringBuffer);
@@ -457,9 +639,10 @@ struct GSGpuBackend::Impl
         ring = static_cast<uint8_t *>(gl().MapBufferRange(kShaderStorageBuffer, 0, static_cast<GLsizeiptr>(kRingChunk * kRingChunks),
                                                           kMapWriteBit | kMapPersistentBit | kMapCoherentBit));
 
-        const bool ok = compile(raster, prefix, GSGpuShaders::kRaster, {}) &&
+        const bool ok = compile(raster, prefix, GSGpuShaders::kRaster, {"uRaster"}) &&
+                        compile(pageCopy, prefix, GSGpuShaders::kPageCopy, {}) &&
                         compile(clutLoad, prefix, GSGpuShaders::kClutLoad, {"uClutA", "uClutB"}) &&
-                        compile(upload, prefix, GSGpuShaders::kUpload, {"uDst", "uRange"}) &&
+                        compile(upload, prefix, GSGpuShaders::kUpload, {"uUpload"}) &&
                         compile(copyRead, prefix, GSGpuShaders::kCopyRead, {"uSrc", "uSize"}) &&
                         compile(copyWrite, prefix, GSGpuShaders::kCopyWrite, {"uDst", "uSize"}) &&
                         compile(clear, prefix, GSGpuShaders::kClear, {"uFrame", "uRect"}) &&
@@ -515,19 +698,92 @@ struct GSGpuBackend::Impl
         touched.clear();
         writePages.reset();
         readPages.reset();
+        batchClutPages.reset();
         hasTarget = false;
         clutOps.clear();
+        epoch = 0u;
+        batchClutLoads = 0u;
+        copyPairs.clear();
+        uploadWords.clear();
+        uploadGroups.clear();
+        uploadData_.clear();
+        uploadCount = 0u;
+        pendingWritePages.reset();
+        shadowNext = 0u;
+        firstLiveEpoch.fill(0u);
+        pageMaps.resize(kPages);
+        for (uint32_t page = 0; page < kPages; ++page)
+            pageMaps[page] = page;
     }
 
-    void flushBatch()
+    bool copyOnWrite(const std::bitset<kPages> &pages)
     {
-        if (!initialized || (primCount == 0u && clutOps.empty()))
+        const uint32_t count = static_cast<uint32_t>(pages.count());
+        if (count == 0u)
+            return true;
+        if (shadowNext + count > kShadowPages || epoch + 1u >= kMaxEpochs)
+            return false;
+        if ((pages & pendingWritePages).any())
+            executeTransfers();
+        for (uint32_t page = 0; page < kPages; ++page)
         {
-            resetBatch();
-            return;
+            if (!pages.test(page))
+                continue;
+            const uint32_t slot = kPages + shadowNext++;
+            copyPairs.push_back(page | (slot << 16u));
+            for (uint32_t e = firstLiveEpoch[page]; e <= epoch; ++e)
+                pageMaps[static_cast<size_t>(e) * kPages + page] = slot;
+            firstLiveEpoch[page] = epoch + 1u;
         }
+        ++epoch;
+        const size_t base = pageMaps.size();
+        pageMaps.resize(base + kPages);
+        for (uint32_t page = 0; page < kPages; ++page)
+            pageMaps[base + page] = page;
+        return true;
+    }
+
+    void executeTransfers()
+    {
+        if (!copyPairs.empty())
+        {
+            uploadData(copyPairs.data(), copyPairs.size() * sizeof(uint32_t));
+            gl().UseProgram(pageCopy.id);
+            const GLuint profCopy = profBegin();
+            gl().DispatchCompute(static_cast<GLuint>(copyPairs.size()), 1u, 1u);
+            profEnd(3u, profCopy);
+            barrier();
+            copyPairs.clear();
+        }
+        if (!uploadWords.empty())
+        {
+            const uint32_t descriptors = static_cast<uint32_t>(uploadCount);
+            const uint32_t mapOffset = static_cast<uint32_t>(uploadWords.size());
+            uploadWords.insert(uploadWords.end(), uploadGroups.begin(), uploadGroups.end());
+            const uint32_t dataOffset = static_cast<uint32_t>(uploadWords.size());
+            for (uint32_t d = 0; d < descriptors; ++d)
+                uploadWords[d * 9u + 8u] += dataOffset;
+            uploadWords.insert(uploadWords.end(), uploadData_.begin(), uploadData_.end());
+            uploadData(uploadWords.data(), uploadWords.size() * sizeof(uint32_t));
+            gl().UseProgram(upload.id);
+            gl().Uniform4ui(upload.loc[0], mapOffset, 0u, 0u, 0u);
+            const GLuint profUpload = profBegin();
+            gl().DispatchCompute(static_cast<GLuint>(uploadGroups.size()), 1u, 1u);
+            profEnd(2u, profUpload);
+            barrier();
+            uploadWords.clear();
+            uploadGroups.clear();
+            uploadData_.clear();
+            uploadCount = 0u;
+        }
+        pendingWritePages.reset();
+    }
+
+    void dispatchClutOps()
+    {
         const Api &g = gl();
-        if (!clutOps.empty())
+        if (clutOps.empty())
+            return;
         {
             clutOpWords.assign(clutOps.size() * 24u, 0u);
             for (size_t i = 0; i < clutOps.size(); ++i)
@@ -541,16 +797,36 @@ struct GSGpuBackend::Impl
                 w[4] = op.cbw;
                 w[5] = op.cou;
                 w[6] = op.cov;
+                w[7] = op.epoch;
                 for (uint32_t b = 0; b < 16u; ++b)
                     w[8u + b] = static_cast<uint32_t>(op.writers[b * 2u]) | (static_cast<uint32_t>(op.writers[b * 2u + 1u]) << 16u);
             }
             bindUpload(8u, clutOpBuffer, clutOpWords.data(), clutOpWords.size() * sizeof(uint32_t));
             g.UseProgram(clutLoad.id);
-            g.Uniform4ui(clutLoad.loc[0], clutOps.front().source, 0u, 0u, 0u);
+            g.Uniform4ui(clutLoad.loc[0], clutOps.front().source, epoch, 0u, 0u);
+            const GLuint profClut = profBegin();
             g.DispatchCompute(static_cast<GLuint>(clutOps.size()), 1u, 1u);
+            profEnd(1u, profClut);
             barrier();
             stats.clutLoads += clutOps.size();
         }
+        clutOps.clear();
+        batchClutPages.reset();
+    }
+
+    void flushBatch()
+    {
+        if (initialized)
+            executeTransfers();
+        if (!initialized || (primCount == 0u && clutOps.empty()))
+        {
+            resetBatch();
+            return;
+        }
+        const Api &g = gl();
+        if (epoch != 0u)
+            bindUpload(9u, pageMapBuffer, pageMaps.data(), static_cast<size_t>(epoch) * kPages * sizeof(uint32_t));
+        dispatchClutOps();
         if (primCount != 0u)
         {
             tileHeaders.clear();
@@ -569,7 +845,26 @@ struct GSGpuBackend::Impl
             bindUpload(5u, tileBuffer, tileHeaders.data(), tileHeaders.size() * sizeof(uint32_t));
             bindUpload(6u, tileListBuffer, tileList.data(), tileList.size() * sizeof(uint32_t));
             g.UseProgram(raster.id);
+            g.Uniform4ui(raster.loc[0], epoch, 0u, 0u, 0u);
+            const GLuint profRaster = profBegin();
             g.DispatchCompute(static_cast<GLuint>(touched.size()), 1u, 1u);
+            profEnd(0u, profRaster);
+            if (prof.enabled)
+            {
+                prof.pairs += tileList.size();
+                prof.tiles += touched.size();
+                prof.prims += primCount;
+                uint64_t dispatchMax = 0u;
+                for (uint32_t tile : touched)
+                    dispatchMax = std::max<uint64_t>(dispatchMax, bins[tile].size());
+                prof.maxBin = std::max(prof.maxBin, dispatchMax);
+                const uint32_t s0 = prims.empty() ? 0u : (prims[0] >> 8u);
+                const uint32_t *st0 = states.data() + static_cast<size_t>(s0) * kStateWords;
+                if (!prof.pending.empty())
+                    prof.pending.back().info = {primCount, static_cast<uint32_t>(touched.size()), static_cast<uint32_t>(tileList.size()),
+                                            static_cast<uint32_t>(dispatchMax), st0[SFbp] >> 5u, st0[SFpsm], st0[SZbp] >> 5u, st0[SFlags]};
+                prof.sumMaxBin += dispatchMax;
+            }
             barrier();
             stats.batches += 1u;
             stats.tiles += touched.size();
@@ -608,6 +903,7 @@ struct GSGpuBackend::Impl
             s[SClampHi] = static_cast<uint32_t>(ctx.clamp >> 32u);
             s[STexa] = static_cast<uint32_t>(state.texa.ta0) | (state.texa.aem ? 0x100u : 0u) | (static_cast<uint32_t>(state.texa.ta1) << 16u);
             s[SClut] = clutSlot;
+            s[SEpoch] = epoch;
         }
         s[SAlpha] = static_cast<uint32_t>(ctx.alpha);
         s[SAlphaFix] = static_cast<uint32_t>(ctx.alpha >> 32u);
@@ -630,7 +926,7 @@ struct GSGpuBackend::Impl
         if (hasTarget && key != targetKey)
         {
             ++stats.flushTarget;
-            flushBatch();
+            flushFor(0u);
         }
 
         std::bitset<kPages> write;
@@ -653,7 +949,7 @@ struct GSGpuBackend::Impl
         if ((read & writePages).any() || (write & readPages).any())
         {
             ++stats.flushTexture;
-            flushBatch();
+            flushFor(1u);
         }
         if (clutKeyValid && (write & clutSourcePages).any())
             clutKeyValid = false;
@@ -662,6 +958,43 @@ struct GSGpuBackend::Impl
         targetKey = key;
         hasTarget = true;
         return true;
+    }
+
+    void binTriangle(uint32_t prim, const GSTriangleRaster &tri, int x0, int y0, int x1, int y1)
+    {
+        const int tile = static_cast<int>(kTileSize);
+        const int tx0 = x0 / tile;
+        const int tx1 = x1 / tile;
+        const int ty0 = y0 / tile;
+        const int ty1 = y1 / tile;
+        if ((tx1 - tx0) + (ty1 - ty0) < 2 || x0 < 0 || y0 < 0 || x1 > 2047 || y1 > 2047)
+        {
+            bin(prim, x0, y0, x1, y1);
+            return;
+        }
+        for (int ty = ty0; ty <= ty1; ++ty)
+        {
+            const int64_t py0 = static_cast<int64_t>(std::max(y0, ty * tile)) * 16;
+            const int64_t py1 = static_cast<int64_t>(std::min(y1, ty * tile + tile - 1)) * 16;
+            for (int tx = tx0; tx <= tx1; ++tx)
+            {
+                const int64_t px0 = static_cast<int64_t>(std::max(x0, tx * tile)) * 16;
+                const int64_t px1 = static_cast<int64_t>(std::min(x1, tx * tile + tile - 1)) * 16;
+                bool outside = false;
+                for (int i = 0; i < 3 && !outside; ++i)
+                {
+                    const int64_t e = tri.a[i] * (tri.a[i] > 0 ? px1 : px0) + tri.b[i] * (tri.b[i] > 0 ? py1 : py0) + tri.c[i];
+                    outside = e + tri.bias[i] <= 0;
+                }
+                if (outside)
+                    continue;
+                const uint32_t index = static_cast<uint32_t>(ty) * kTileGrid + static_cast<uint32_t>(tx);
+                std::vector<uint32_t> &b = bins[index];
+                if (b.empty())
+                    touched.push_back(index);
+                b.push_back(prim);
+            }
+        }
     }
 
     void bin(uint32_t prim, int x0, int y0, int x1, int y1)
@@ -809,7 +1142,7 @@ struct GSGpuBackend::Impl
             p[29u + i] = static_cast<uint32_t>(vs[i]->u) | (static_cast<uint32_t>(vs[i]->v) << 16u);
         }
         p[32] = static_cast<uint32_t>(v0.fog) | (static_cast<uint32_t>(v1.fog) << 8u) | (static_cast<uint32_t>(v2.fog) << 16u);
-        bin(primCount - 1u, minX, minY, maxX, maxY);
+        binTriangle(primCount - 1u, tri, minX, minY, maxX, maxY);
     }
 
     void addLine(const GSPrimitiveBatch &batch)
@@ -904,10 +1237,10 @@ struct GSGpuBackend::Impl
             const int x0 = static_cast<int>(texclut.cou) * 16;
             markPages(source, tex0.cpsm, tex0.cbp, width, x0, texclut.cov, x0 + 255, texclut.cov);
         }
-        if ((source & writePages).any() || clutOps.size() + 2u >= kClutSlots)
+        if ((source & writePages).any() || batchClutLoads + 2u >= kClutSlots)
         {
             ++stats.flushTexture;
-            flushBatch();
+            flushFor(2u);
         }
         const std::array<uint32_t, 6> key = {isFourBitIndexedPsm(tex0.psm) ? 1u : 0u, tex0.cbp,
                                              static_cast<uint32_t>(tex0.cpsm) | (static_cast<uint32_t>(tex0.csm) << 8u) | (static_cast<uint32_t>(tex0.csa) << 16u),
@@ -948,7 +1281,10 @@ struct GSGpuBackend::Impl
         op.cbw = texclut.cbw;
         op.cou = texclut.cou;
         op.cov = texclut.cov;
+        op.epoch = epoch;
         clutOps.push_back(op);
+        ++batchClutLoads;
+        batchClutPages |= source;
     }
 
     void uploadData(const void *data, size_t size)
@@ -967,9 +1303,11 @@ struct GSGpuBackend::Impl
         gl().BindBufferBase(kShaderStorageBuffer, 7u, dataBuffer);
     }
 
-    void dispatchLinear(uint32_t count)
+    void dispatchLinear(uint32_t count, uint32_t kind)
     {
+        const GLuint profLinear = profBegin();
         gl().DispatchCompute((count + 255u) / 256u, 1u, 1u);
+        profEnd(kind, profLinear);
         barrier();
     }
 
@@ -979,7 +1317,7 @@ struct GSGpuBackend::Impl
         gl().UseProgram(copyRead.id);
         gl().Uniform4ui(copyRead.loc[0], sbp, sbw, spsm, ssax | (ssay << 16u));
         gl().Uniform4ui(copyRead.loc[1], rrw, rrh, dir, 0u);
-        dispatchLinear(rrw * rrh);
+        dispatchLinear(rrw * rrh, 3u);
     }
 
     void localToLocal()
@@ -999,7 +1337,7 @@ struct GSGpuBackend::Impl
         gl().Uniform4ui(copyWrite.loc[0], b.dbp, std::max<uint32_t>(b.dbw, 1u), b.dpsm,
                         static_cast<uint32_t>(transfer.trxpos.dsax) | (static_cast<uint32_t>(transfer.trxpos.dsay) << 16u));
         gl().Uniform4ui(copyWrite.loc[1], rrw, rrh, transfer.trxpos.dir, 0u);
-        dispatchLinear(total);
+        dispatchLinear(total, 4u);
         transferState.copiedPixels = total;
         transferState.direction = 3u;
     }
@@ -1100,15 +1438,21 @@ struct GSGpuBackend::Impl
         if (count == 0u)
             return;
         const size_t bytes = (static_cast<size_t>(count) * bitsPer + 7u) / 8u;
-        scratch.assign((bytes + 3u) / 4u, 0u);
-        std::memcpy(scratch.data(), data, std::min<size_t>(bytes, sizeBytes));
-        uploadData(scratch.data(), scratch.size() * 4u);
         const uint32_t dbw = std::max<uint32_t>(transfer.bitbltbuf.dbw, 1u);
         clutKeyValid = false;
-        gl().UseProgram(upload.id);
-        gl().Uniform4ui(upload.loc[0], transfer.bitbltbuf.dbp, dbw, dpsm, transfer.trxreg.rrw);
-        gl().Uniform4ui(upload.loc[1], transferState.copiedPixels, count, transfer.trxpos.dsax, transfer.trxpos.dsay);
-        dispatchLinear(count);
+        if ((!transferQueued && (transferPages & pendingWritePages).any()) || uploadCount >= 0xFFFFu)
+            executeTransfers();
+        transferQueued = true;
+        const size_t dataStart = uploadData_.size();
+        uploadData_.resize(dataStart + (bytes + 3u) / 4u, 0u);
+        std::memcpy(uploadData_.data() + dataStart, data, std::min<size_t>(bytes, sizeBytes));
+        const uint32_t descriptor = uploadCount++;
+        const uint32_t words[9] = {transfer.bitbltbuf.dbp, dbw, dpsm, transfer.trxreg.rrw, transferState.copiedPixels, count,
+                                   transfer.trxpos.dsax, transfer.trxpos.dsay, static_cast<uint32_t>(dataStart)};
+        uploadWords.insert(uploadWords.end(), words, words + 9);
+        for (uint32_t group = 0; group < (count + 255u) / 256u; ++group)
+            uploadGroups.push_back(descriptor | (group << 16u));
+        pendingWritePages |= transferPages;
 
         transferState.copiedPixels = std::min<uint32_t>(transferState.totalPixels, transferState.copiedPixels + count);
         if (transferState.copiedPixels >= transferState.totalPixels)
@@ -1340,8 +1684,36 @@ void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
     Impl &d = *m_impl;
     if (!d.ensure())
         return;
-    ++m_stats.flushOther;
-    d.flushBatch();
+    bool flush = true;
+    d.transferPages.reset();
+    d.transferQueued = false;
+    if (command.direction == 0u)
+    {
+        const GSBitBltBuf &b = command.bitbltbuf;
+        const int x0 = static_cast<int>(command.trxpos.dsax);
+        const int y0 = static_cast<int>(command.trxpos.dsay);
+        markPages(d.transferPages, b.dpsm, b.dbp, std::max<uint32_t>(b.dbw, 1u), x0, y0, x0 + static_cast<int>(command.trxreg.rrw) - 1,
+                  y0 + static_cast<int>(command.trxreg.rrh) - 1);
+    }
+    if (command.direction == 0u && d.deferUploads)
+    {
+        const std::bitset<kPages> &destination = d.transferPages;
+        flush = (destination & d.writePages).any();
+        if (!flush && !d.copyOnWrite(destination & (d.readPages | d.batchClutPages)))
+            flush = true;
+        if (d.prof.enabled && flush && d.primCount != 0u)
+        {
+            if ((destination & d.writePages).any())
+                ++d.prof.uploadHazards[0];
+            else
+                ++d.prof.uploadHazards[2];
+        }
+    }
+    if (flush)
+    {
+        ++m_stats.flushOther;
+        d.flushFor(3u);
+    }
     d.transfer = command;
     d.transferState.x = command.trxpos.dsax;
     d.transferState.y = command.trxpos.dsay;
@@ -1360,13 +1732,12 @@ void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     Impl &d = *m_impl;
     if (!d.ensure())
         return;
-    d.flushBatch();
     d.uploadImage(data, sizeBytes);
 }
 
 void GSGpuBackend::Flush()
 {
-    m_impl->flushBatch();
+    m_impl->flushFor(4u);
 }
 
 void GSGpuBackend::TextureFlush()
@@ -1378,7 +1749,7 @@ void GSGpuBackend::Sync(GSSyncReason reason)
     Impl &d = *m_impl;
     if (!d.ensure())
         return;
-    d.flushBatch();
+    d.flushFor(5u);
     if (reason == GSSyncReason::DebugReadback && d.hostVram)
         d.downloadVram(d.hostVram, d.hostVramSize);
 }
@@ -1433,7 +1804,10 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     gl.Uniform1uiv(d.present.loc[1], 12, c1.data());
     gl.Uniform1uiv(d.present.loc[2], 12, c2.data());
     gl.Uniform4ui(d.present.loc[3], static_cast<uint32_t>(request.bgcolor & 0xFFFFFFu), (slbg ? 1u : 0u) | (mmod ? 2u : 0u), alp, 0u);
+    const GLuint profPresent = d.profBegin();
     gl.DispatchCompute((width + 15u) / 16u, (height + 15u) / 16u, 1u);
+    d.profEnd(5u, profPresent);
+    d.profFrame();
     if (s_asyncPresent.load(std::memory_order_relaxed))
         return d.presentAsync(width, height, circuits[0].enabled ? circuits[0].fbp : circuits[1].fbp);
     result.pixels.resize(static_cast<size_t>(width) * height * 4u);

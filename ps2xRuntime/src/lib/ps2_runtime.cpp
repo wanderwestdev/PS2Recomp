@@ -125,13 +125,15 @@ namespace
         bool wrapped = false;
     };
 
+    const size_t g_branchTraceSize = []() -> size_t
+    {
+        const char *value = std::getenv("PS2X_BRANCH_TRACE");
+        return value ? static_cast<size_t>(std::strtoul(value, nullptr, 10)) : 0u;
+    }();
+
     BranchTrace *branchTrace()
     {
-        static const size_t size = []() -> size_t
-        {
-            const char *value = std::getenv("PS2X_BRANCH_TRACE");
-            return value ? static_cast<size_t>(std::strtoul(value, nullptr, 10)) : 0u;
-        }();
+        const size_t size = g_branchTraceSize;
         if (size == 0u)
         {
             return nullptr;

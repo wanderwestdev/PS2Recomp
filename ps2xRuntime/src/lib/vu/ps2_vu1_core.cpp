@@ -345,13 +345,13 @@ VU1Interpreter::VU1Interpreter(Unit unit)
 
 void VU1Interpreter::resetScheduler()
 {
-    m_flagPipeline = {};
-    m_fdiv = {};
-    m_efu = {};
-    m_storePipeline = {};
-    m_vfWritePipeline = {};
-    m_viWritePipeline = {};
-    m_accWritePipeline = {};
+    std::memset(m_flagPipeline.data(), 0, sizeof(m_flagPipeline));
+    std::memset(&m_fdiv, 0, sizeof(m_fdiv));
+    std::memset(m_efu.data(), 0, sizeof(m_efu));
+    std::memset(m_storePipeline.data(), 0, sizeof(m_storePipeline));
+    std::memset(m_vfWritePipeline.data(), 0, sizeof(m_vfWritePipeline));
+    std::memset(m_viWritePipeline.data(), 0, sizeof(m_viWritePipeline));
+    std::memset(m_accWritePipeline.data(), 0, sizeof(m_accWritePipeline));
     m_flagValid = 0u;
     m_storeValid = 0u;
     m_vfWriteValid = 0u;
@@ -359,12 +359,12 @@ void VU1Interpreter::resetScheduler()
     m_accWriteValid = 0u;
     m_nextCommitCycle = std::numeric_limits<uint64_t>::max();
     resetXgkick();
-    m_vfReady = {};
-    m_viReady = {};
-    m_accReady = {};
-    m_vfLatestWrite = {};
-    m_viLatestWrite = {};
-    m_accLatestWrite = {};
+    std::memset(m_vfReady.data(), 0, sizeof(m_vfReady));
+    std::memset(m_viReady.data(), 0, sizeof(m_viReady));
+    std::memset(m_accReady.data(), 0, sizeof(m_accReady));
+    std::memset(m_vfLatestWrite.data(), 0, sizeof(m_vfLatestWrite));
+    std::memset(m_viLatestWrite.data(), 0, sizeof(m_viLatestWrite));
+    std::memset(m_accLatestWrite.data(), 0, sizeof(m_accLatestWrite));
     m_nextWriteSequence = 0;
     m_efuResourceReady = 0;
     m_workingClip = m_state.clip;

@@ -91,6 +91,8 @@ namespace
 
     std::string vf(uint32_t reg) { return "vu.m_state.vf[" + num(reg) + "]"; }
 
+    std::string vfMem(uint32_t reg) { return reg == 32u ? std::string("vu.m_state.acc") : vf(reg); }
+
     struct RegView
     {
         bool local = false;
@@ -99,9 +101,17 @@ namespace
         std::set<uint32_t> vfWritten;
         std::set<uint32_t> viUsed;
         std::set<uint32_t> viWritten;
+        std::set<uint32_t> vfClean;
+        std::set<uint32_t> vfRawStored;
     };
 
     RegView gView;
+
+    struct RegViewProbe
+    {
+        RegView saved = gView;
+        ~RegViewProbe() { gView = saved; }
+    };
 
     std::string vi(uint32_t reg)
     {
@@ -137,7 +147,9 @@ namespace
         if (reg == 0u)
             return "kVf0()";
         noteVf(reg, false);
-        return "vr" + num(reg);
+        if (gView.vfRawStored.count(reg))
+            return "_mm_loadu_ps(" + vfMem(reg) + ")";
+        return (gView.vfClean.count(reg) ? "vn" : "vr") + num(reg);
     }
 
     std::string normV(uint32_t reg)
@@ -180,7 +192,24 @@ namespace
         noteVf(reg, true);
         const std::string r = "vr" + num(reg);
         const std::string n = "vn" + num(reg);
-        return r + " = blendDest(" + r + ", " + raw + ", " + dest + "); " + n + " = blendDest(" + n + ", " + norm + ", " + dest + ");";
+        const bool full = dest == hx(0xFu);
+        const bool clean = gView.vfClean.count(reg) != 0u;
+        const bool stored = gView.vfRawStored.count(reg) != 0u;
+        if (raw == norm && (full || clean))
+        {
+            gView.vfClean.insert(reg);
+            gView.vfRawStored.erase(reg);
+            return n + " = " + (full ? raw : "blendDest(" + n + ", " + raw + ", " + dest + ")") + ";";
+        }
+        gView.vfClean.erase(reg);
+        if (full)
+        {
+            gView.vfRawStored.insert(reg);
+            return "_mm_storeu_ps(" + vfMem(reg) + ", " + raw + "); " + n + " = " + norm + ";";
+        }
+        gView.vfRawStored.erase(reg);
+        const std::string oldRaw = clean ? n : (stored ? "_mm_loadu_ps(" + vfMem(reg) + ")" : r);
+        return r + " = blendDest(" + oldRaw + ", " + raw + ", " + dest + "); " + n + " = blendDest(" + n + ", " + norm + ", " + dest + ");";
     }
 
     std::string writeFullV(uint32_t reg, const std::string &raw, const std::string &norm)
@@ -190,6 +219,14 @@ namespace
         if (reg == 0u)
             return "";
         noteVf(reg, true);
+        if (raw == norm)
+        {
+            gView.vfClean.insert(reg);
+            gView.vfRawStored.erase(reg);
+            return "vn" + num(reg) + " = " + raw + ";";
+        }
+        gView.vfClean.erase(reg);
+        gView.vfRawStored.erase(reg);
         return "vr" + num(reg) + " = " + raw + "; vn" + num(reg) + " = " + norm + ";";
     }
 
@@ -573,8 +610,11 @@ namespace
         case 0x31:
             if (dest != 0u)
             {
-                e.code = "{ const __m128 mr = " + rawV(fs) + "; const __m128 mn = " + normV(fs) + "; " +
-                         writeV(ft, "_mm_shuffle_ps(mr, mr, _MM_SHUFFLE(0, 3, 2, 1))", "_mm_shuffle_ps(mn, mn, _MM_SHUFFLE(0, 3, 2, 1))", dst) + " }";
+                const std::string source = rawV(fs);
+                const std::string sourceNorm = normV(fs);
+                const std::string write =
+                    writeV(ft, "_mm_shuffle_ps(mr, mr, _MM_SHUFFLE(0, 3, 2, 1))", "_mm_shuffle_ps(mn, mn, _MM_SHUFFLE(0, 3, 2, 1))", dst);
+                e.code = "{ const __m128 mr = " + source + "; const __m128 mn = " + sourceNorm + "; " + write + " }";
                 e.writesVf0 = ft == 0u;
             }
             return e;
@@ -728,9 +768,11 @@ namespace
                 const unsigned pipe = A::pipeline(p.d.lowerUsage);
                 if (pipe == A::kPipeXgkick || pipe == A::kPipeEfu || p.d.lowerUsage.waitP)
                     return true;
+                const RegViewProbe probe;
                 if (lowerEmit(p.pc, p.d.lower, p.d.upper).generic)
                     return true;
             }
+            const RegViewProbe probe;
             return upperEmit(p.d.upper).generic;
         }
 
@@ -991,7 +1033,6 @@ namespace
             if (recordBackup && !known)
                 out += "            const int32_t oldVi = " + vi(writtenVi) + ";\n";
             const UpperEmit up = upperEmit(d.upper);
-            const LowerEmit low = d.iBit ? LowerEmit{} : lowerEmit(p.pc, d.lower, d.upper, branchViPtr);
             std::string fmacValue = up.value;
             std::string fmacDecl = "__m128 un;";
             std::string fmacAfter;
@@ -1009,7 +1050,6 @@ namespace
             }
             if (up.readsQ || up.generic)
                 out += "            syncQ(vu, ctx, cyc);\n";
-            std::string lowerCode = low.code.empty() ? "" : "            " + low.code + "\n";
             const auto upperStore = [&]()
             {
                 if (up.nop)
@@ -1019,11 +1059,15 @@ namespace
                 if (!up.statement.empty())
                     return "            " + up.statement + "\n";
                 if (up.isFmac)
-                    return "            { " + fmacDecl + " const __m128 uv = " + fmacValue + ";" + fmacAfter + " " + writeV(up.reg, "uv", "un", hx(up.dest)) +
+                    return "            { " + fmacDecl + " const __m128 uv = " + fmacValue + ";" + fmacAfter + " " + writeV(up.reg, "uv", "uv", hx(up.dest)) +
                            " }\n";
                 return "            { const __m128 uv = " + up.value + "; " +
                        writeV(up.reg, "uv", up.normalize ? std::string("vnorm(uv)") : std::string("uv"), hx(up.dest)) + " }\n";
             };
+            const bool upperFirst = !d.iBit && d.upperVfShadowReg == 0u;
+            const std::string earlyUpper = upperFirst ? upperStore() : std::string();
+            const LowerEmit low = d.iBit ? LowerEmit{} : lowerEmit(p.pc, d.lower, d.upper, branchViPtr);
+            std::string lowerCode = low.code.empty() ? "" : "            " + low.code + "\n";
             if (d.iBit)
             {
                 uint32_t bits = d.lower;
@@ -1062,7 +1106,7 @@ namespace
             }
             else
             {
-                out += upperStore();
+                out += earlyUpper;
                 out += lowerCode;
             }
             if (!known)
@@ -1224,6 +1268,8 @@ namespace
             gView.vfWritten.clear();
             gView.viUsed.clear();
             gView.viWritten.clear();
+            gView.vfClean.clear();
+            gView.vfRawStored.clear();
             Known k;
             k.id = plan.id;
             if (!plan.readsStatus && aggregateFlags)
@@ -1265,7 +1311,11 @@ namespace
                 out += "        int32_t vi" + num(reg) + " = vu.m_state.vi[" + num(reg) + "];\n";
             out += code;
             for (const uint32_t reg : view.vfWritten)
-                out += "        _mm_storeu_ps(" + memRaw(reg) + ", vr" + num(reg) + "); _mm_store_ps(ctx.norm[" + num(reg) + "], vn" + num(reg) + ");\n";
+            {
+                if (!view.vfRawStored.count(reg))
+                    out += "        _mm_storeu_ps(" + memRaw(reg) + ", " + (view.vfClean.count(reg) ? "vn" : "vr") + num(reg) + ");";
+                out += " _mm_store_ps(ctx.norm[" + num(reg) + "], vn" + num(reg) + ");\n";
+            }
             for (const uint32_t reg : view.viWritten)
                 out += "        vu.m_state.vi[" + num(reg) + "] = vi" + num(reg) + ";\n";
             out += readyStores(k);
