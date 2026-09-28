@@ -1051,6 +1051,18 @@ void register_ps2_vu_tests()
             t.IsTrue(nearlyEqual(out[0], 0.0f), "DropShadowMatrix point mode should subtract d before scaling by k");
         });
 
+        tc.Run("EE FPU compares extended finite values", [](TestCase &t)
+        {
+            const auto fromBits = [](uint32_t bits) { float value; std::memcpy(&value, &bits, sizeof(value)); return value; };
+            const float sentinel = fromBits(0x7FFFFFFFu);
+            const float negativeSentinel = fromBits(0xFFFFFFFFu);
+            t.IsTrue(FPU_C_EQ_S(sentinel, sentinel), "the horse steering sentinel compares equal to itself");
+            t.IsTrue(FPU_C_OLT_S(3.0f, sentinel), "the extended positive value exceeds ordinary finite values");
+            t.IsTrue(FPU_C_OLT_S(negativeSentinel, -3.0f), "the extended negative value is below ordinary finite values");
+            t.IsTrue(FPU_C_EQ_S(-0.0f, 0.0f), "signed zeros compare equal");
+            t.IsTrue(!FPU_C_UN_S(sentinel, sentinel), "the EE does not classify extended values as unordered");
+        });
+
         tc.Run("EE FPU add/sub drops operand bits shifted out of the aligned mantissa", [](TestCase &t)
         {
             const auto bits = [](float v) { uint32_t b; std::memcpy(&b, &v, sizeof(b)); return b; };
