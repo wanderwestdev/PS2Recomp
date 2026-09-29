@@ -2562,6 +2562,7 @@ void PS2Runtime::run()
     }
     if (frameTex.id != 0)
         UnloadTexture(frameTex);
+    ps2_host_input::releaseMouse();
     CloseWindow();
 
     RUNTIME_LOG("[run] exiting loop");

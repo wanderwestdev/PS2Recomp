@@ -11,5 +11,6 @@ namespace ps2_host_input
 
     void setFieldCounter(const std::atomic<uint64_t> *counter);
     void sample();
+    void releaseMouse();
     [[nodiscard]] ps2x::iop::PadInputState padState(uint32_t port);
 }

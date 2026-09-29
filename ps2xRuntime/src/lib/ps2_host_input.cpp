@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -24,32 +25,123 @@ namespace ps2_host_input
         using ps2x::iop::PadPressure;
         namespace PadButton = ps2x::iop::PadButton;
 
+        enum class BindingKind
+        {
+            None,
+            Keyboard,
+            Mouse,
+            Shift,
+            Control
+        };
+
+        struct HostBinding
+        {
+            BindingKind kind;
+            int code;
+        };
+
         struct ButtonBinding
         {
             uint16_t button;
             int gamepadButton;
-            int key;
-            int alternateKey;
+            const char *setting;
+            HostBinding defaultBinding;
         };
 
         constexpr std::array<ButtonBinding, 16> kButtons{{
-            {PadButton::Up, GAMEPAD_BUTTON_LEFT_FACE_UP, KEY_UP, KEY_NULL},
-            {PadButton::Down, GAMEPAD_BUTTON_LEFT_FACE_DOWN, KEY_DOWN, KEY_NULL},
-            {PadButton::Left, GAMEPAD_BUTTON_LEFT_FACE_LEFT, KEY_LEFT, KEY_NULL},
-            {PadButton::Right, GAMEPAD_BUTTON_LEFT_FACE_RIGHT, KEY_RIGHT, KEY_NULL},
-            {PadButton::Cross, GAMEPAD_BUTTON_RIGHT_FACE_DOWN, KEY_X, KEY_SPACE},
-            {PadButton::Circle, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, KEY_C, KEY_BACKSPACE},
-            {PadButton::Square, GAMEPAD_BUTTON_RIGHT_FACE_LEFT, KEY_Z, KEY_NULL},
-            {PadButton::Triangle, GAMEPAD_BUTTON_RIGHT_FACE_UP, KEY_V, KEY_NULL},
-            {PadButton::L1, GAMEPAD_BUTTON_LEFT_TRIGGER_1, KEY_Q, KEY_NULL},
-            {PadButton::R1, GAMEPAD_BUTTON_RIGHT_TRIGGER_1, KEY_E, KEY_NULL},
-            {PadButton::L2, GAMEPAD_BUTTON_LEFT_TRIGGER_2, KEY_LEFT_SHIFT, KEY_NULL},
-            {PadButton::R2, GAMEPAD_BUTTON_RIGHT_TRIGGER_2, KEY_RIGHT_SHIFT, KEY_NULL},
-            {PadButton::Start, GAMEPAD_BUTTON_MIDDLE_RIGHT, KEY_ENTER, KEY_NULL},
-            {PadButton::Select, GAMEPAD_BUTTON_MIDDLE_LEFT, KEY_TAB, KEY_NULL},
-            {PadButton::L3, GAMEPAD_BUTTON_LEFT_THUMB, KEY_F, KEY_NULL},
-            {PadButton::R3, GAMEPAD_BUTTON_RIGHT_THUMB, KEY_G, KEY_NULL},
+            {PadButton::Up, GAMEPAD_BUTTON_LEFT_FACE_UP, "PS2X_BIND_UP", {BindingKind::Keyboard, KEY_UP}},
+            {PadButton::Down, GAMEPAD_BUTTON_LEFT_FACE_DOWN, "PS2X_BIND_DOWN", {BindingKind::Keyboard, KEY_DOWN}},
+            {PadButton::Left, GAMEPAD_BUTTON_LEFT_FACE_LEFT, "PS2X_BIND_LEFT", {BindingKind::Keyboard, KEY_LEFT}},
+            {PadButton::Right, GAMEPAD_BUTTON_LEFT_FACE_RIGHT, "PS2X_BIND_RIGHT", {BindingKind::Keyboard, KEY_RIGHT}},
+            {PadButton::Cross, GAMEPAD_BUTTON_RIGHT_FACE_DOWN, "PS2X_BIND_CROSS", {BindingKind::Keyboard, KEY_F}},
+            {PadButton::Circle, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, "PS2X_BIND_CIRCLE", {BindingKind::Mouse, MOUSE_BUTTON_RIGHT}},
+            {PadButton::Square, GAMEPAD_BUTTON_RIGHT_FACE_LEFT, "PS2X_BIND_SQUARE", {BindingKind::Mouse, MOUSE_BUTTON_LEFT}},
+            {PadButton::Triangle, GAMEPAD_BUTTON_RIGHT_FACE_UP, "PS2X_BIND_TRIANGLE", {BindingKind::Keyboard, KEY_SPACE}},
+            {PadButton::L1, GAMEPAD_BUTTON_LEFT_TRIGGER_1, "PS2X_BIND_L1", {BindingKind::Keyboard, KEY_Q}},
+            {PadButton::R1, GAMEPAD_BUTTON_RIGHT_TRIGGER_1, "PS2X_BIND_R1", {BindingKind::Keyboard, KEY_LEFT_SHIFT}},
+            {PadButton::L2, GAMEPAD_BUTTON_LEFT_TRIGGER_2, "PS2X_BIND_L2", {BindingKind::Keyboard, KEY_LEFT_CONTROL}},
+            {PadButton::R2, GAMEPAD_BUTTON_RIGHT_TRIGGER_2, "PS2X_BIND_R2", {BindingKind::Keyboard, KEY_RIGHT_SHIFT}},
+            {PadButton::Start, GAMEPAD_BUTTON_MIDDLE_RIGHT, "PS2X_BIND_START", {BindingKind::Keyboard, KEY_ENTER}},
+            {PadButton::Select, GAMEPAD_BUTTON_MIDDLE_LEFT, "PS2X_BIND_SELECT", {BindingKind::Keyboard, KEY_TAB}},
+            {PadButton::L3, GAMEPAD_BUTTON_LEFT_THUMB, "PS2X_BIND_L3", {BindingKind::Keyboard, KEY_H}},
+            {PadButton::R3, GAMEPAD_BUTTON_RIGHT_THUMB, "PS2X_BIND_R3", {BindingKind::Keyboard, KEY_G}},
         }};
+
+        constexpr std::array<std::pair<std::string_view, HostBinding>, 24> kNamedBindings{{
+            {"NONE", {BindingKind::None, 0}},
+            {"UP", {BindingKind::Keyboard, KEY_UP}},
+            {"DOWN", {BindingKind::Keyboard, KEY_DOWN}},
+            {"LEFT", {BindingKind::Keyboard, KEY_LEFT}},
+            {"RIGHT", {BindingKind::Keyboard, KEY_RIGHT}},
+            {"SPACE", {BindingKind::Keyboard, KEY_SPACE}},
+            {"BACKSPACE", {BindingKind::Keyboard, KEY_BACKSPACE}},
+            {"ENTER", {BindingKind::Keyboard, KEY_ENTER}},
+            {"TAB", {BindingKind::Keyboard, KEY_TAB}},
+            {"ESCAPE", {BindingKind::Keyboard, KEY_ESCAPE}},
+            {"LEFT_SHIFT", {BindingKind::Keyboard, KEY_LEFT_SHIFT}},
+            {"RIGHT_SHIFT", {BindingKind::Keyboard, KEY_RIGHT_SHIFT}},
+            {"SHIFT", {BindingKind::Shift, 0}},
+            {"LEFT_CTRL", {BindingKind::Keyboard, KEY_LEFT_CONTROL}},
+            {"RIGHT_CTRL", {BindingKind::Keyboard, KEY_RIGHT_CONTROL}},
+            {"LEFT_CONTROL", {BindingKind::Keyboard, KEY_LEFT_CONTROL}},
+            {"RIGHT_CONTROL", {BindingKind::Keyboard, KEY_RIGHT_CONTROL}},
+            {"CTRL", {BindingKind::Control, 0}},
+            {"CONTROL", {BindingKind::Control, 0}},
+            {"MOUSE_LEFT", {BindingKind::Mouse, MOUSE_BUTTON_LEFT}},
+            {"MOUSE_RIGHT", {BindingKind::Mouse, MOUSE_BUTTON_RIGHT}},
+            {"MOUSE_MIDDLE", {BindingKind::Mouse, MOUSE_BUTTON_MIDDLE}},
+            {"LMB", {BindingKind::Mouse, MOUSE_BUTTON_LEFT}},
+            {"RMB", {BindingKind::Mouse, MOUSE_BUTTON_RIGHT}},
+        }};
+
+        std::optional<HostBinding> parseBinding(std::string_view value)
+        {
+            std::string name(value);
+            for (char &ch : name)
+            {
+                if (ch == ' ' || ch == '-')
+                    ch = '_';
+                else
+                    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            }
+            if (name.size() == 1u)
+            {
+                if (name[0] >= 'A' && name[0] <= 'Z')
+                    return HostBinding{BindingKind::Keyboard, KEY_A + name[0] - 'A'};
+                if (name[0] >= '0' && name[0] <= '9')
+                    return HostBinding{BindingKind::Keyboard, KEY_ZERO + name[0] - '0'};
+            }
+            for (const auto &[key, binding] : kNamedBindings)
+            {
+                if (name == key)
+                    return binding;
+            }
+            if (name.size() >= 2u && name[0] == 'F')
+            {
+                char *end = nullptr;
+                const long number = std::strtol(name.c_str() + 1, &end, 10);
+                if (*end == '\0' && number >= 1 && number <= 12)
+                    return HostBinding{BindingKind::Keyboard, static_cast<int>(KEY_F1 + number - 1)};
+            }
+            return std::nullopt;
+        }
+
+        std::array<HostBinding, kButtons.size()> loadBindings()
+        {
+            std::array<HostBinding, kButtons.size()> bindings{};
+            for (size_t i = 0; i < kButtons.size(); ++i)
+            {
+                bindings[i] = kButtons[i].defaultBinding;
+                if (const char *value = std::getenv(kButtons[i].setting))
+                {
+                    if (const auto parsed = parseBinding(value))
+                        bindings[i] = *parsed;
+                    else
+                        std::cerr << "[input] invalid " << kButtons[i].setting << "='" << value << "', using default" << std::endl;
+                }
+            }
+            return bindings;
+        }
 
         constexpr std::array<std::pair<PadPressure, uint16_t>, static_cast<size_t>(PadPressure::Count)> kPressureButtons{{
             {PadPressure::Right, PadButton::Right},
@@ -245,6 +337,118 @@ namespace ps2_host_input
 
         std::atomic<const std::atomic<uint64_t> *> g_fieldCounter{nullptr};
         std::atomic<uint32_t> g_invertRightDefault{0u};
+        std::atomic<bool> g_mouseCameraEnabled{false};
+        bool g_mouseLocked = false;
+        int g_ignoredMouseButton = -1;
+        bool g_skipMouseDelta = false;
+        bool g_mouseMoved = false;
+        float g_mouseRightX = 0.0f;
+        float g_mouseRightY = 0.0f;
+
+        bool isHostBindingDown(const HostBinding &binding)
+        {
+            switch (binding.kind)
+            {
+            case BindingKind::Keyboard:
+                return IsKeyDown(binding.code);
+            case BindingKind::Mouse:
+                return g_mouseLocked && binding.code != g_ignoredMouseButton && IsMouseButtonDown(binding.code);
+            case BindingKind::Shift:
+                return IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+            case BindingKind::Control:
+                return IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+            default:
+                return false;
+            }
+        }
+
+        float positiveSetting(const char *name, float fallback)
+        {
+            if (const char *value = std::getenv(name))
+            {
+                char *end = nullptr;
+                const float parsed = std::strtof(value, &end);
+                if (end != value && *end == '\0' && std::isfinite(parsed) && parsed > 0.0f)
+                    return parsed;
+            }
+            return fallback;
+        }
+
+        float mouseSensitivity()
+        {
+            static const float sensitivity = positiveSetting("PS2X_MOUSE_SENSITIVITY", 1.0f);
+            return sensitivity;
+        }
+
+        float mouseVerticalSensitivity()
+        {
+            static const float sensitivity = positiveSetting("PS2X_MOUSE_VERTICAL_SENSITIVITY", 1.5f);
+            return sensitivity;
+        }
+
+        float mouseStickAxis(float desired)
+        {
+            if (desired == 0.0f)
+                return 0.0f;
+            const float magnitude = 0.42f + 0.58f * std::clamp(std::abs(desired), 0.0f, 1.0f);
+            return std::copysign(magnitude, desired);
+        }
+
+        void sampleMouse()
+        {
+            g_mouseMoved = false;
+            if (!g_mouseCameraEnabled.load(std::memory_order_relaxed))
+            {
+                if (g_mouseLocked)
+                    EnableCursor();
+                g_mouseLocked = false;
+                g_ignoredMouseButton = -1;
+                return;
+            }
+            if (!IsWindowFocused() || IsKeyPressed(KEY_ESCAPE))
+            {
+                if (g_mouseLocked)
+                    EnableCursor();
+                g_mouseLocked = false;
+                g_ignoredMouseButton = -1;
+                return;
+            }
+            if (!g_mouseLocked)
+            {
+                int button = -1;
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                    button = MOUSE_BUTTON_LEFT;
+                else if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT))
+                    button = MOUSE_BUTTON_RIGHT;
+                else if (IsMouseButtonPressed(MOUSE_BUTTON_MIDDLE))
+                    button = MOUSE_BUTTON_MIDDLE;
+                if (button != -1)
+                {
+                    DisableCursor();
+                    g_mouseLocked = true;
+                    g_ignoredMouseButton = button;
+                    g_skipMouseDelta = true;
+                }
+                return;
+            }
+            if (g_ignoredMouseButton != -1 && !IsMouseButtonDown(g_ignoredMouseButton))
+                g_ignoredMouseButton = -1;
+            if (g_skipMouseDelta)
+            {
+                g_skipMouseDelta = false;
+                return;
+            }
+
+            const Vector2 delta = GetMouseDelta();
+            const float distance = std::hypot(delta.x, delta.y);
+            if (distance <= 0.0f)
+                return;
+            const float frameTime = std::max(GetFrameTime(), 1.0f / 240.0f);
+            const float scale = mouseSensitivity() / (frameTime * 900.0f);
+            g_mouseRightX = mouseStickAxis(delta.x * scale);
+            g_mouseRightY = mouseStickAxis(delta.y * scale * mouseVerticalSensitivity());
+            g_mouseMoved = true;
+        }
 
         uint32_t rightStickInvert()
         {
@@ -281,11 +485,12 @@ namespace ps2_host_input
             state.rightX = kAxisNeutral;
             state.rightY = kAxisNeutral;
 
-            for (const ButtonBinding &binding : kButtons)
+            static const auto hostBindings = loadBindings();
+            for (size_t i = 0; i < kButtons.size(); ++i)
             {
+                const ButtonBinding &binding = kButtons[i];
                 const bool padDown = gamepadAvailable && IsGamepadButtonDown(gamepad, binding.gamepadButton);
-                const bool keyDown = keyboard && (IsKeyDown(binding.key) ||
-                                                  (binding.alternateKey != KEY_NULL && IsKeyDown(binding.alternateKey)));
+                const bool keyDown = keyboard && isHostBindingDown(hostBindings[i]);
                 if (padDown || keyDown)
                     state.buttons |= binding.button;
             }
@@ -305,11 +510,12 @@ namespace ps2_host_input
                     state.leftX = x;
                 if (const uint8_t y = keyAxis(KEY_W, KEY_S); y != 0x80u)
                     state.leftY = y;
-                const uint32_t invert = rightStickInvert();
-                if (const uint8_t x = (invert & kInvertRightX) != 0u ? keyAxis(KEY_L, KEY_J) : keyAxis(KEY_J, KEY_L); x != 0x80u)
-                    state.rightX = x;
-                if (const uint8_t y = (invert & kInvertRightY) != 0u ? keyAxis(KEY_K, KEY_I) : keyAxis(KEY_I, KEY_K); y != 0x80u)
-                    state.rightY = y;
+                if (g_mouseMoved)
+                {
+                    const uint32_t invert = rightStickInvert();
+                    state.rightX = axisToByte((invert & kInvertRightX) != 0u ? -g_mouseRightX : g_mouseRightX);
+                    state.rightY = axisToByte((invert & kInvertRightY) != 0u ? -g_mouseRightY : g_mouseRightY);
+                }
             }
 
             applyPressure(state);
@@ -322,6 +528,11 @@ namespace ps2_host_input
         g_invertRightDefault.store(axes, std::memory_order_relaxed);
     }
 
+    void setMouseCameraEnabled(bool enabled)
+    {
+        g_mouseCameraEnabled.store(enabled, std::memory_order_relaxed);
+    }
+
     void setFieldCounter(const std::atomic<uint64_t> *counter)
     {
         g_fieldCounter.store(counter);
@@ -329,11 +540,21 @@ namespace ps2_host_input
 
     void sample()
     {
+        sampleMouse();
         std::array<PadInputState, kPadPorts> state{};
         for (uint32_t port = 0; port < kPadPorts; ++port)
             state[port] = readPort(port);
         std::lock_guard<std::mutex> lock(g_mutex);
         g_state = state;
+    }
+
+    void releaseMouse()
+    {
+        if (g_mouseLocked)
+            EnableCursor();
+        g_mouseLocked = false;
+        g_ignoredMouseButton = -1;
+        g_mouseMoved = false;
     }
 
     ps2x::iop::PadInputState padState(uint32_t port)
