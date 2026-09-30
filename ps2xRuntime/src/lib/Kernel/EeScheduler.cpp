@@ -2,6 +2,7 @@
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ps2_async_vif.h"
 
 #include <algorithm>
 #include <cassert>
@@ -41,6 +42,8 @@ namespace
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
     constexpr int kMaxVBlankCatchUpFields = 2;
+    constexpr uint64_t kHostPacingCheckCycles = 65536u;
+    std::atomic<bool> s_hostPacingDefault{false};
 
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
     {
@@ -131,9 +134,41 @@ EeScheduler::~EeScheduler()
     requestStop();
 }
 
+void EeScheduler::setHostPacingDefault(bool enabled) noexcept
+{
+    s_hostPacingDefault.store(enabled, std::memory_order_relaxed);
+}
+
+void EeScheduler::hostCatchUp() noexcept
+{
+    m_pacingCheckCycle = m_eeCycle + kHostPacingCheckCycles;
+    if (m_pacingRefTime == std::chrono::steady_clock::time_point{} || !ps2x::asyncvif::active(m_runtime.memory()))
+        return;
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_pacingRefTime).count();
+    if (elapsed <= 0.0)
+        return;
+    const uint64_t expected = m_pacingRefCycle + static_cast<uint64_t>(elapsed * static_cast<double>(kEeClockHz));
+    const uint64_t field = vblankPeriodCycles();
+    if (expected <= m_eeCycle + field / 2u)
+        return;
+    const uint64_t lag = expected - m_eeCycle;
+    if (lag > field * 8u)
+    {
+        m_pacingRefTime = {};
+        return;
+    }
+    consumeCycles(std::min<uint64_t>(lag - field / 4u, field));
+}
+
 void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
 {
     m_executorThread = std::this_thread::get_id();
+    {
+        const char *pacing = std::getenv("PS2X_EE_HOST_PACING");
+        m_hostPacing = pacing && *pacing ? *pacing != '0' : s_hostPacingDefault.load(std::memory_order_relaxed);
+    }
+    m_pacingCheckCycle = 0;
+    m_pacingRefTime = {};
     m_rdram = rdram;
     m_readyQueues = {};
     m_threads.clear();
@@ -431,6 +466,8 @@ void EeScheduler::postEvent(EeEvent event)
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
+    if (m_hostPacing && m_eeCycle >= m_pacingCheckCycle)
+        hostCatchUp();
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
@@ -2098,6 +2135,8 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + vblankPeriodCycles(),
                               hostStart + vblankPeriod(),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
+                m_pacingRefCycle = scheduled.deadlineCycle;
+                m_pacingRefTime = hostStart;
             }
             processEvent(scheduled.event);
         }

@@ -1179,6 +1179,32 @@ int main()
     if (!expect(iop.canBindRpc(rpcSid),
                 "Emulator did not expose the SID registered by the IRX")) return 1;
 
+    const uint32_t clockHandler[] = {0x3C020001u, 0x34420400u, 0x03E00008u, 0u};
+    if (!expect(iop.writeMemory(0x00010300u, clockHandler, sizeof(clockHandler)),
+                "Could not install the clock workload RPC handler")) return 1;
+    iop.runEeCycles(8u * 65536u);
+    const uint64_t rpcClockStart = iop.debugSnapshot().emulatorCycles;
+    RpcRequest clockRequest{};
+    clockRequest.sid = rpcSid;
+    for (uint32_t batch = 0u; batch < 10000u; ++batch)
+    {
+        if (!expect(iop.handleRpc(clockRequest).handled, "Clock workload RPC was not handled")) return 1;
+        if (batch == 5000u)
+        {
+            ps2x::state::Writer saved;
+            iop.saveState(saved);
+            iop.runEeCycles(8u * 100000u);
+            ps2x::state::Reader restored(saved.data().data(), saved.data().size());
+            iop.loadState(restored);
+            if (!expect(restored.remaining() == 0u, "IOP clock state did not round trip")) return 1;
+        }
+        iop.runEeCycles(8u * 1025u);
+    }
+    const uint64_t rpcClockElapsed = iop.debugSnapshot().emulatorCycles - rpcClockStart;
+    constexpr uint64_t rpcClockBudget = 10000u * 1025u;
+    if (!expect(rpcClockElapsed + 1024u >= rpcClockBudget && rpcClockElapsed <= rpcClockBudget + 8u,
+                "IOP RPC work advanced audio outside the EE clock budget")) return 1;
+
     iop.reset();
     if (!expect(!iop.canBindRpc(rpcSid),
                 "IOP reset did not remove the registered RPC server")) return 1;

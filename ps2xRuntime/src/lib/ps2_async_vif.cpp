@@ -1,5 +1,6 @@
 #include "runtime/ps2_async_vif.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ee_scheduler.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "ThreadNaming.h"
 
@@ -98,6 +99,7 @@ namespace ps2x::asyncvif
         thread_local bool t_onGifStage = false;
 
         std::atomic<bool> s_defaultEnabled{false};
+        std::atomic<bool> s_hostPacingDefault{false};
         std::mutex s_bindMutex;
         std::atomic<Worker *> s_worker{nullptr};
         std::function<uint32_t()> s_fbrstProvider;
@@ -164,6 +166,7 @@ namespace ps2x::asyncvif
             Clock::duration busyTime{};
             Clock::time_point windowStart = Clock::now();
             uint64_t windowField = worker.memory->gs().vsyncTick.load();
+            uint64_t windowCycles = 0u;
             for (;;)
             {
                 Job job;
@@ -206,12 +209,15 @@ namespace ps2x::asyncvif
                         const double window = std::chrono::duration<double>(now - windowStart).count();
                         const double busy = std::chrono::duration<double>(busyTime).count();
                         const uint64_t fields = field > windowField ? field - windowField : 1u;
-                        std::fprintf(stderr, "[mtvu] field %llu: %.1f fields/s, VU busy %.0f%%, %.2f ms VU work per field\n",
-                                     static_cast<unsigned long long>(field), fields / window, 100.0 * busy / window, 1000.0 * busy / fields);
+                        const uint64_t cycles = s_vu1Completed.load(std::memory_order_acquire);
+                        std::fprintf(stderr, "[mtvu] field %llu: %.1f fields/s, VU busy %.0f%%, %.2f ms VU work per field, %.2f M VU cycles per field\n",
+                                     static_cast<unsigned long long>(field), fields / window, 100.0 * busy / window, 1000.0 * busy / fields,
+                                     static_cast<double>(cycles >= windowCycles ? cycles - windowCycles : cycles) / fields / 1000000.0);
                         std::fflush(stderr);
                         busyTime = {};
                         windowStart = now;
                         windowField = field;
+                        windowCycles = cycles;
                     }
                 }
                 {
@@ -234,6 +240,11 @@ namespace ps2x::asyncvif
     void setDefaultEnabled(bool value)
     {
         s_defaultEnabled.store(value, std::memory_order_relaxed);
+    }
+
+    void setHostPacingDefault(bool value)
+    {
+        s_hostPacingDefault.store(value, std::memory_order_relaxed);
     }
 
     void setFbrstProvider(std::function<uint32_t()> provider)
@@ -350,6 +361,9 @@ namespace ps2x::asyncvif
             bool kickPending = false;
             uint64_t kickCycle = 0;
             bool blocking = false;
+            bool hostPacing = false;
+            uint64_t hostKickCycle = 0u;
+            std::chrono::steady_clock::time_point hostKickTime{};
         };
 
         Vu1Timing &vu1Timing()
@@ -383,6 +397,8 @@ namespace ps2x::asyncvif
         timing.enabled = scale > 0.0 && timing.hooks.eeCycle && timing.hooks.vu1Cycles && timing.hooks.consumeEeCycles;
         const char *blocking = std::getenv("PS2X_VU1_TIMING_SYNC");
         timing.blocking = blocking && *blocking && *blocking != '0';
+        const char *hostPacing = std::getenv("PS2X_VU1_HOST_PACING");
+        timing.hostPacing = hostPacing && *hostPacing ? *hostPacing != '0' : s_hostPacingDefault.load(std::memory_order_relaxed);
         if (timing.enabled && !s_vu1ReaderReady.load(std::memory_order_acquire))
         {
             s_vu1CycleReader = timing.hooks.vu1Cycles;
@@ -393,7 +409,14 @@ namespace ps2x::asyncvif
     void vu1Kick()
     {
         Vu1Timing &timing = vu1Timing();
-        if (!timing.enabled || t_onWorker || timing.kickPending)
+        if (!timing.enabled || t_onWorker)
+            return;
+        if (timing.hostPacing)
+        {
+            timing.hostKickCycle = timing.hooks.eeCycle();
+            timing.hostKickTime = std::chrono::steady_clock::now();
+        }
+        if (timing.kickPending)
             return;
         timing.kickPending = true;
         timing.kickCycle = timing.hooks.eeCycle();
@@ -405,6 +428,27 @@ namespace ps2x::asyncvif
         if (!timing.enabled || t_onWorker)
             return false;
         Worker *worker = s_worker;
+        if (timing.hostPacing && timing.primed && timing.hostKickTime != std::chrono::steady_clock::time_point{} &&
+            worker && worker->memory == &memory)
+        {
+            bool pending;
+            {
+                std::lock_guard<std::mutex> lock(worker->mutex);
+                pending = worker->busy || !worker->jobs.empty();
+            }
+            if (pending)
+            {
+                const auto elapsed = std::chrono::steady_clock::now() - timing.hostKickTime;
+                const uint64_t elapsedCycles = static_cast<uint64_t>(std::chrono::duration<double>(elapsed).count() * EeScheduler::kEeClockHz);
+                const uint64_t target = timing.hostKickCycle + elapsedCycles;
+                const uint64_t now = timing.hooks.eeCycle();
+                if (target > now)
+                    timing.hooks.consumeEeCycles(std::min<uint64_t>(target - now, 65536u));
+                else
+                    std::this_thread::yield();
+                return true;
+            }
+        }
         const bool async = !timing.blocking && timing.primed && worker && worker->memory == &memory;
         if (!async)
             syncVu(memory);
@@ -488,6 +532,8 @@ namespace ps2x::asyncvif
     {
         Vu1Timing &timing = vu1Timing();
         ps2x::state::fields(in, timing.primed, timing.accounted, timing.busyUntil, timing.kickPending, timing.kickCycle);
+        timing.hostKickCycle = timing.hooks.eeCycle ? timing.hooks.eeCycle() : 0u;
+        timing.hostKickTime = std::chrono::steady_clock::now();
         if (s_vu1ReaderReady.load(std::memory_order_acquire))
             s_vu1Completed.store(s_vu1CycleReader(), std::memory_order_release);
     }

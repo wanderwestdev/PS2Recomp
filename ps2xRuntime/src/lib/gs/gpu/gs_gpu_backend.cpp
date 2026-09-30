@@ -283,6 +283,8 @@ struct GSGpuBackend::Impl
         uint64_t batches = 0u;
         uint64_t clutLoads = 0u;
         uint64_t transfers = 0u;
+        uint64_t lastPrims = 0u;
+        uint32_t drawn = 0u;
     } presentStats;
 
     struct GpuProf
@@ -1550,21 +1552,25 @@ struct GSGpuBackend::Impl
     {
         PresentStats &s = presentStats;
         ++s.frames;
+        if (stats.prims != s.lastPrims)
+            ++s.drawn;
+        s.lastPrims = stats.prims;
         const auto now = std::chrono::steady_clock::now();
         const double window = std::chrono::duration<double>(now - s.windowStart).count();
         if (window < 2.0)
             return;
         const double frames = s.frames;
         std::fprintf(stderr,
-                     "[gs-gpu] %.1f presents/s, GPU %.2f ms/frame, wait %.2f ms/frame, flush %.2f ms/frame, "
+                     "[gs-gpu] %.1f presents/s, %.1f drawn/s, GPU %.2f ms/frame, wait %.2f ms/frame, flush %.2f ms/frame, "
                      "%.1f batches, %.1f clut loads, %.1f transfers per frame\n",
-                     frames / window, s.gpuFrames ? s.gpuNs / 1e6 / s.gpuFrames : 0.0,
+                     frames / window, s.drawn / window, s.gpuFrames ? s.gpuNs / 1e6 / s.gpuFrames : 0.0,
                      std::chrono::duration<double, std::milli>(s.wait).count() / frames,
                      std::chrono::duration<double, std::milli>(s.submit).count() / frames,
                      (stats.batches - s.batches) / frames, (stats.clutLoads - s.clutLoads) / frames,
                      (stats.flushOther - s.transfers) / frames);
         std::fflush(stderr);
         s.frames = 0u;
+        s.drawn = 0u;
         s.gpuNs = 0u;
         s.gpuFrames = 0u;
         s.wait = {};

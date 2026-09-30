@@ -150,6 +150,7 @@ namespace ps2x::iop::detail
             totalCycles = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            eeSyncCycle = 0;
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -801,10 +802,18 @@ namespace ps2x::iop::detail
             return true;
         }
 
+        void accountEeCycles()
+        {
+            eeCycleCarry -= static_cast<int64_t>((totalCycles - eeSyncCycle) * 8u);
+            eeSyncCycle = totalCycles;
+        }
+
         template <typename Ar>
         void serialize(Ar &ar)
         {
             using namespace ps2x::state;
+            if constexpr (!Ar::kLoading)
+                accountEeCycles();
             ar.section(fourcc("IOPE"));
             fields(ar, modules, pendingDmaInterrupts, pendingGuestCallbacks, nextModuleId, moduleCursor, totalCycles, totalInstructions,
                    eeCycleCarry, secrMcCommandHandler, secrMcDevIdHandler, checkKelfPathCallback);
@@ -831,6 +840,7 @@ namespace ps2x::iop::detail
             imports.serialize(ar);
             if constexpr (Ar::kLoading)
             {
+                eeSyncCycle = totalCycles;
                 host.resetAudio();
                 activeCpu = nullptr;
                 servicingDmaInterrupts = false;
@@ -864,7 +874,8 @@ namespace ps2x::iop::detail
         uint32_t moduleCursor = kModuleLoadBase;
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
-        uint64_t eeCycleCarry = 0;
+        int64_t eeCycleCarry = 0;
+        uint64_t eeSyncCycle = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -904,15 +915,12 @@ namespace ps2x::iop::detail
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
-        const uint64_t total = m_impl->eeCycleCarry + eeCycles;
-        const uint64_t iopCycles = total / 8u;
-        if (iopCycles < kIopBatchCycles)
-        {
-            m_impl->eeCycleCarry = total;
+        m_impl->accountEeCycles();
+        m_impl->eeCycleCarry += static_cast<int64_t>(eeCycles);
+        if (m_impl->eeCycleCarry < static_cast<int64_t>(kIopBatchCycles * 8u))
             return;
-        }
-        m_impl->eeCycleCarry = total % 8u;
-        m_impl->runCycles(iopCycles);
+        m_impl->runCycles(static_cast<uint64_t>(m_impl->eeCycleCarry) / 8u);
+        m_impl->accountEeCycles();
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
@@ -967,6 +975,12 @@ namespace ps2x::iop::detail
             return false;
         const uint32_t physical = IopMemory::physicalAddress(address);
         return physical <= IopMemory::RamSize && size <= IopMemory::RamSize - physical;
+    }
+
+    uint64_t IopEmulator::eeCyclesUntilBatch() const noexcept
+    {
+        const int64_t threshold = static_cast<int64_t>(kIopBatchCycles * 8u);
+        return m_impl->eeCycleCarry < threshold ? static_cast<uint64_t>(threshold - m_impl->eeCycleCarry) : 0u;
     }
 
     uint64_t IopEmulator::cycles() const noexcept

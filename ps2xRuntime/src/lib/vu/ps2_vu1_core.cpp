@@ -384,7 +384,8 @@ void VU1Interpreter::reset()
     m_state.r = 0x3F800000u;
     m_cycle = 0;
     resetScheduler();
-    vu1NormShadow.valid = false;
+    if (m_unit == Unit::VU1)
+        vu1NormShadow.valid = false;
 }
 
 bool VU1Interpreter::pipelinesPending() const
@@ -1021,7 +1022,8 @@ bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint
             continue;
         }
         interpretNextPair = false;
-        vu1NormShadow.valid = false;
+        if (vu.m_unit == VU1Interpreter::Unit::VU1)
+            vu1NormShadow.valid = false;
 
         vu.commitReadyPipelines();
         if (vu.m_state.pc + 8u > codeSize)

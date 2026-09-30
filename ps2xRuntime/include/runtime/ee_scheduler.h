@@ -283,6 +283,8 @@ public:
     explicit EeScheduler(PS2Runtime &runtime);
     ~EeScheduler();
 
+    static void setHostPacingDefault(bool enabled) noexcept;
+
     EeScheduler(const EeScheduler &) = delete;
     EeScheduler &operator=(const EeScheduler &) = delete;
 
@@ -463,6 +465,7 @@ private:
     void publishIdleDebugContext();
     void loadSharedVu0Random(R5900Context &context);
     void saveSharedVu0Random(const R5900Context &context);
+    void hostCatchUp() noexcept;
 
     PS2Runtime &m_runtime;
     uint8_t *m_rdram = nullptr;
@@ -523,6 +526,10 @@ private:
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+    bool m_hostPacing = false;
+    uint64_t m_pacingCheckCycle = 0;
+    uint64_t m_pacingRefCycle = 0;
+    std::chrono::steady_clock::time_point m_pacingRefTime{};
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;

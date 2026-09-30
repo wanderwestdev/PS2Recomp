@@ -4,6 +4,7 @@
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
+#include "vu/ps2_vu1_impl.inl"
 
 #include <cmath>
 #include <cstdint>
@@ -1688,6 +1689,30 @@ void register_ps2_vu1_tests()
                      "MAC flags should describe the final accumulated value");
             t.Equals(vu1.state().status, 0x140u,
                      "the underflowing product should set sticky Z and U");
+        });
+
+        tc.Run("VU0 execution preserves the VU1 normalized register cache", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+            writeVuInstructionPair(fx.code, 0u, 0u, kVuUpperNop);
+            VU1Interpreter vu0(VU1Interpreter::Unit::VU0);
+            VU1Interpreter vu1(VU1Interpreter::Unit::VU1);
+            vu1NormShadow.owner = &vu1;
+            vu1NormShadow.valid = true;
+            vu1NormShadow.norm[1][0] = 17.0f;
+            vu0.reset();
+            t.IsTrue(vu1NormShadow.valid, "VU0 reset should preserve the VU1 cache");
+            VU1InterpreterAccess::runLoopWith(vu0, fx.code, PS2_VU1_CODE_SIZE, fx.data,
+                                             PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 1u, nullptr);
+            t.IsTrue(vu1NormShadow.valid, "interpreted VU0 execution should preserve the VU1 cache");
+            t.Equals(vu1NormShadow.norm[1][0], 17.0f, "VU0 should preserve cached VU1 register values");
+            vu1.reset();
+            t.IsTrue(!vu1NormShadow.valid, "VU1 reset should invalidate its cache");
+            vu1NormShadow.valid = true;
+            VU1InterpreterAccess::runLoopWith(vu1, fx.code, PS2_VU1_CODE_SIZE, fx.data,
+                                             PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 1u, nullptr);
+            t.IsTrue(!vu1NormShadow.valid, "interpreted VU1 execution should invalidate its cache");
         });
 
         tc.Run("reserved opcodes stop before executing or corrupting state", [](TestCase &t)

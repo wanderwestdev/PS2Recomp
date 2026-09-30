@@ -3,6 +3,7 @@
 #include "ps2_host_backend.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -99,6 +100,14 @@ struct PS2AudioBackend::Impl
     bool streamReady = false;
     std::FILE *dump = nullptr;
     uint32_t dumpBytes = 0u;
+    bool statsEnabled = false;
+    bool everPrimed = false;
+    uint64_t producedFrames = 0u;
+    uint64_t requestedFrames = 0u;
+    uint64_t missingFrames = 0u;
+    uint64_t underruns = 0u;
+    uint64_t droppedFrames = 0u;
+    std::chrono::steady_clock::time_point statsStart = std::chrono::steady_clock::now();
     static Impl *streamOwner;
 
     static void audioCallback(void *buffer, unsigned int frames)
@@ -110,9 +119,11 @@ struct PS2AudioBackend::Impl
         if (!owner)
             return;
         std::lock_guard<std::mutex> lock(owner->pcmMutex);
+        owner->requestedFrames += frames;
         if (!owner->primed && owner->queued >= kPrimeSamples)
         {
             owner->primed = true;
+            owner->everPrimed = true;
             owner->fadePosition = 0;
             owner->fadeSource = owner->lastOutput;
         }
@@ -121,6 +132,7 @@ struct PS2AudioBackend::Impl
             if (owner->primed && owner->queued < 2u)
             {
                 owner->primed = false;
+                ++owner->underruns;
                 owner->gapRemaining = kFadeFrames;
                 owner->gapSource = owner->lastOutput;
             }
@@ -138,6 +150,7 @@ struct PS2AudioBackend::Impl
             }
             else
             {
+                owner->missingFrames += owner->everPrimed ? 1u : 0u;
                 owner->gapRemaining = std::max(owner->gapRemaining - 1, 0);
                 for (size_t channel = 0u; channel < 2u; ++channel)
                     owner->lastOutput[channel] = static_cast<int16_t>(owner->gapSource[channel] * owner->gapRemaining / kFadeFrames);
@@ -194,6 +207,12 @@ void PS2AudioBackend::setAudioReady(bool ready)
 #if !defined(PLATFORM_VITA)
     if (ready)
     {
+        const char *audioStats = std::getenv("PS2X_AUDIO_STATS");
+        m_impl->statsEnabled = audioStats && *audioStats && *audioStats != '0';
+        m_impl->statsStart = std::chrono::steady_clock::now();
+        const char *audioMute = std::getenv("PS2X_AUDIO_MUTE");
+        if (audioMute && *audioMute && *audioMute != '0')
+            SetMasterVolume(0.0f);
         SetAudioStreamBufferSizeDefault(512);
         m_impl->stream = LoadAudioStream(48000, 16, 2);
         m_impl->streamReady = m_impl->stream.buffer != nullptr;
@@ -241,6 +260,13 @@ void PS2AudioBackend::resetPcm()
     m_impl->lastOutput = {};
     m_impl->fadeSource = {};
     m_impl->gapSource = {};
+    m_impl->everPrimed = false;
+    m_impl->producedFrames = 0u;
+    m_impl->requestedFrames = 0u;
+    m_impl->missingFrames = 0u;
+    m_impl->underruns = 0u;
+    m_impl->droppedFrames = 0u;
+    m_impl->statsStart = std::chrono::steady_clock::now();
 }
 
 void PS2AudioBackend::submitPcm(std::span<const int16_t> samples)
@@ -253,6 +279,7 @@ void PS2AudioBackend::submitPcm(std::span<const int16_t> samples)
     }
     if (!m_impl->streamReady)
         return;
+    m_impl->producedFrames += samples.size() / 2u;
     if (samples.size() > Impl::kRingSamples)
         samples = samples.last(Impl::kRingSamples);
     if (m_impl->queued + samples.size() > Impl::kRingSamples)
@@ -261,6 +288,7 @@ void PS2AudioBackend::submitPcm(std::span<const int16_t> samples)
                                                           m_impl->queued > 4096u ? m_impl->queued - 4096u : 0u));
         m_impl->read = (m_impl->read + drop) % Impl::kRingSamples;
         m_impl->queued -= drop;
+        m_impl->droppedFrames += drop / 2u;
         m_impl->fadePosition = 0;
         m_impl->fadeSource = m_impl->lastOutput;
     }
@@ -268,6 +296,24 @@ void PS2AudioBackend::submitPcm(std::span<const int16_t> samples)
     for (size_t i = 0u; i < samples.size(); ++i)
         m_impl->ring[(write + i) % Impl::kRingSamples] = samples[i];
     m_impl->queued += samples.size();
+    if (m_impl->statsEnabled)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(now - m_impl->statsStart).count();
+        if (elapsed >= 2.0)
+        {
+            std::fprintf(stderr, "[audio] %.0f produced/s, %.0f requested/s, %.2f ms queued, %llu missing frames, %llu underruns, %llu dropped frames\n",
+                         m_impl->producedFrames / elapsed, m_impl->requestedFrames / elapsed,
+                         m_impl->queued / 96.0, static_cast<unsigned long long>(m_impl->missingFrames),
+                         static_cast<unsigned long long>(m_impl->underruns), static_cast<unsigned long long>(m_impl->droppedFrames));
+            m_impl->producedFrames = 0u;
+            m_impl->requestedFrames = 0u;
+            m_impl->missingFrames = 0u;
+            m_impl->underruns = 0u;
+            m_impl->droppedFrames = 0u;
+            m_impl->statsStart = now;
+        }
+    }
 }
 
 void PS2AudioBackend::onVagTransfer(const uint8_t *rdram, uint32_t srcAddr, uint32_t sizeBytes)

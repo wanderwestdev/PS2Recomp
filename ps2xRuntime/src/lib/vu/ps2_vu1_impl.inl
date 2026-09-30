@@ -3309,7 +3309,7 @@ struct VU1InterpreterAccess
         if constexpr (Shift == 0u)
             return value;
         else
-            return _mm_div_ps(value, _mm_set1_ps(static_cast<float>(1u << Shift)));
+            return _mm_mul_ps(value, _mm_set1_ps(1.0f / static_cast<float>(1u << Shift)));
     }
 
     template <uint32_t Shift>

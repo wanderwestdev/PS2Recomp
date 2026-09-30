@@ -78,7 +78,20 @@ namespace ps2x::iop
             host.log(hle ? LogLevel::Info : LogLevel::Warning, message);
         }
 
+        void flushEeCycles() noexcept
+        {
+            if (pendingEeCycles != 0u)
+            {
+                const uint64_t cycles = pendingEeCycles;
+                pendingEeCycles = 0u;
+                emulator.runEeCycles(cycles);
+            }
+            eeCycleBudget = emulator.eeCyclesUntilBatch();
+        }
+
         IopHost &host;
+        uint64_t pendingEeCycles = 0u;
+        uint64_t eeCycleBudget = 0u;
         detail::ServiceList coreServices;
         std::unordered_map<uint32_t, detail::IopService *> routes;
         std::vector<std::string> loadOutcomes;
@@ -99,6 +112,8 @@ namespace ps2x::iop
 
     void IopSubsystem::reset()
     {
+        m_impl->pendingEeCycles = 0u;
+        m_impl->eeCycleBudget = 0u;
         m_impl->moduleManager.reset();
         m_impl->loadOutcomes.clear();
         m_impl->loggedLoadPaths.clear();
@@ -116,6 +131,7 @@ namespace ps2x::iop
 
     ModuleLoadResult IopSubsystem::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->flushEeCycles();
         const ParsedPs2Path parsed = parsePs2Path(path);
         if (!parsed)
             return {true, -1, -1};
@@ -147,11 +163,13 @@ namespace ps2x::iop
 
     ModuleLoadResult IopSubsystem::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->flushEeCycles();
         return m_impl->emulator.loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
     bool IopSubsystem::stopModule(int32_t moduleId, int32_t *result)
     {
+        m_impl->flushEeCycles();
         if (m_impl->moduleManager.stopHle(moduleId, result))
         {
             m_impl->rebuildRoutes();
@@ -166,7 +184,9 @@ namespace ps2x::iop
 
     void IopSubsystem::runEeCycles(uint64_t eeCycles) noexcept
     {
-        m_impl->emulator.runEeCycles(eeCycles);
+        m_impl->pendingEeCycles += eeCycles;
+        if (m_impl->pendingEeCycles >= m_impl->eeCycleBudget)
+            m_impl->flushEeCycles();
     }
 
     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
@@ -196,6 +216,7 @@ namespace ps2x::iop
 
     RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
     {
+        m_impl->flushEeCycles();
         const auto route = m_impl->routes.find(request.sid);
         detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
 
@@ -209,6 +230,7 @@ namespace ps2x::iop
 
     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
     {
+        m_impl->flushEeCycles();
         for (auto &service : m_impl->coreServices)
         {
             if (service && m_impl->serviceActive(*service))
@@ -251,6 +273,7 @@ namespace ps2x::iop
 
     DebugSnapshot IopSubsystem::debugSnapshot() const
     {
+        m_impl->flushEeCycles();
         DebugSnapshot snapshot;
         snapshot.emulatorCycles = m_impl->emulator.cycles();
         snapshot.emulatorInstructions = m_impl->emulator.instructions();
@@ -279,6 +302,7 @@ namespace ps2x::iop
 
     void IopSubsystem::saveState(ps2x::state::Writer &out)
     {
+        m_impl->flushEeCycles();
         out.section(ps2x::state::fourcc("IOPS"));
         m_impl->moduleManager.serialize(out);
         m_impl->emulator.saveState(out);
@@ -289,6 +313,8 @@ namespace ps2x::iop
         in.section(ps2x::state::fourcc("IOPS"));
         m_impl->moduleManager.serialize(in);
         m_impl->emulator.loadState(in);
+        m_impl->pendingEeCycles = 0u;
+        m_impl->eeCycleBudget = 0u;
         m_impl->rebuildRoutes();
     }
 }

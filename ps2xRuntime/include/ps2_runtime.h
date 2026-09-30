@@ -238,7 +238,7 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
-inline void ps2TraceGuestWrite(uint8_t *rdram,
+PS2_FORCEINLINE void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
                                uint64_t valueLo,
@@ -256,7 +256,7 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     // TODO we dont need this anymore so on next release it will be deleted
 }
 
-inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
+PS2_FORCEINLINE void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     uint32_t guestAddr,
                                     uint32_t size,
                                     const char *op,
@@ -427,7 +427,7 @@ public:
                                  uint32_t tadr,
                                  uint32_t chcr);
 
-    static inline bool isSpecialAddress(uint32_t addr)
+    static PS2_FORCEINLINE bool isSpecialAddress(uint32_t addr)
     {
         return Ps2IsSpecialAddress(addr);
     }

@@ -23,6 +23,7 @@ namespace ps2x::asyncvif
     };
 
     void setDefaultEnabled(bool enabled);
+    void setHostPacingDefault(bool enabled);
     void setFbrstProvider(std::function<uint32_t()> provider);
     void setGifProcessor(std::function<void(const uint8_t *, uint32_t)> processor);
     bool submitGif(const uint8_t *data, uint32_t sizeBytes);

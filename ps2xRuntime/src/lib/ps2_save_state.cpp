@@ -487,6 +487,8 @@ void EeScheduler::serializeMachine(Ar &ar)
            m_rescheduleRequested, m_sharedVu0RandomValid, m_sharedVu0Random, m_timeSliceExpired, m_pendingEeTimerInterrupts,
            m_gsInterruptLatched, m_eeCycle, m_sliceEndCycle, m_eventSequence, m_cycleWaitSequence, m_invocationSequence, m_vsyncTick,
            m_vsyncFlagAddress, m_vsyncTickAddress, m_gsVSyncCallback, m_gsVSyncCallbackGp, m_gsVSyncCallbackSp, m_invocationStackTops);
+    m_pacingRefTime = {};
+    m_pacingCheckCycle = 0;
     {
         std::lock_guard lock(m_eventMutex);
         const auto now = std::chrono::steady_clock::now();
