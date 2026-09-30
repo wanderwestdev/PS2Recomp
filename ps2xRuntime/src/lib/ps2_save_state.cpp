@@ -7,6 +7,7 @@
 #include "runtime/ps2_async_vif.h"
 #include "Kernel/Stubs/CD.h"
 #include "Kernel/Stubs/SIF.h"
+#include "GuestKernelMemory.h"
 
 #include <atomic>
 #include <chrono>
@@ -21,7 +22,7 @@
 void saveVuState(VU1Interpreter &vu, ps2x::state::Writer &out);
 void loadVuState(VU1Interpreter &vu, ps2x::state::Reader &in);
 void saveSyscallHostState(ps2x::state::Writer &out);
-void loadSyscallHostState(ps2x::state::Reader &in);
+void loadSyscallHostState(ps2x::state::Reader &in, uint8_t *rdram);
 
 namespace ps2x::savestate
 {
@@ -515,6 +516,21 @@ void EeScheduler::serializeMachine(Ar &ar)
     }
     if constexpr (Ar::kLoading)
     {
+        bool legacyCallbackStacks = rt.m_asyncCallbackStackTop > ps2x::kernel_memory::kCallbackStackTop;
+        for (const auto &[key, top] : m_invocationStackTops)
+            legacyCallbackStacks = legacyCallbackStacks || top > ps2x::kernel_memory::kCallbackStackTop;
+        if (legacyCallbackStacks)
+        {
+            m_invocationStackTops.clear();
+            std::lock_guard lock(rt.m_asyncCallbackStackMutex);
+            rt.m_asyncCallbackStackFloor = ps2x::kernel_memory::kCallbackStackFloor;
+            rt.m_asyncCallbackStackTop = ps2x::kernel_memory::kCallbackStackTop;
+        }
+        for (auto &[id, item] : m_threads)
+        {
+            if (ps2x::kernel_memory::inLegacyPool(item.tlsBase, ps2x::kernel_memory::kLegacyTlsPoolBase))
+                item.tlsBase = 0;
+        }
         m_unwinding = false;
         m_insideInterrupt = false;
         m_deferTransfers = false;
@@ -552,7 +568,7 @@ void EeScheduler::serializeMachine(Ar &ar)
     {
         ps2_stubs::loadCdStubState(ar);
         ps2_stubs::loadSifStubState(ar);
-        loadSyscallHostState(ar);
+        loadSyscallHostState(ar, mem.m_rdram);
     }
     else
     {

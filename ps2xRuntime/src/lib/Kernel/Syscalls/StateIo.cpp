@@ -41,7 +41,50 @@ void saveSyscallHostState(ps2x::state::Writer &out)
     serializeSyscallHostState(out);
 }
 
-void loadSyscallHostState(ps2x::state::Reader &in)
+namespace
+{
+    void relocateLegacyReservedMemory(uint8_t *rdram)
+    {
+        using namespace ps2x::kernel_memory;
+        if (!rdram)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(g_rpc_mutex);
+            for (auto &[sid, server] : g_rpc_servers)
+            {
+                if (!inLegacyPool(server.sd_ptr, kLegacyRpcServerPoolBase))
+                    continue;
+                const uint32_t oldPtr = server.sd_ptr;
+                const uint32_t newPtr = rpcAllocServerAddr(rdram);
+                if (auto *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, newPtr)))
+                    sd->sid = static_cast<int>(sid);
+                server.sd_ptr = newPtr;
+                for (const auto &[clientPtr, clientState] : g_rpc_clients)
+                {
+                    auto *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
+                    if (client && clientState.sid == sid && client->server == oldPtr)
+                        client->server = newPtr;
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_bootmode_mutex);
+            for (const auto &[id, address] : g_bootmode_addresses)
+            {
+                if (inLegacyPool(address, kLegacyBootModePoolBase))
+                {
+                    g_bootmode_initialized = false;
+                    g_bootmode_pool_offset = 0;
+                    g_bootmode_addresses.clear();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void loadSyscallHostState(ps2x::state::Reader &in, uint8_t *rdram)
 {
     serializeSyscallHostState(in);
+    relocateLegacyReservedMemory(rdram);
 }

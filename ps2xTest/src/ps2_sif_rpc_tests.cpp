@@ -5,6 +5,7 @@
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
 #include "runtime/ee_scheduler.h"
+#include "GuestKernelMemory.h"
 
 #include <array>
 #include <cstdint>
@@ -465,6 +466,69 @@ void register_ps2_sif_rpc_tests()
                 t.Equals(env.rdram[kRecvAddr + index], static_cast<uint8_t>(0xA5),
                          "LIBSD should preserve the backend-owned response buffer");
             }
+        });
+
+        tc.Run("IOP server descriptors live in kernel RAM and calls leave game memory alone", [](TestCase &t)
+        {
+            TestEnv env;
+            const auto libsdModule = env.runtime.loadIopModule("rom0:LIBSD");
+            t.IsTrue(libsdModule.moduleId > 0, "LIBSD test should load its IOP module first");
+
+            constexpr uint32_t kClientAddr = 0x00022200u;
+            constexpr uint32_t kSendAddr = 0x00035B00u;
+            constexpr uint32_t kRecvAddr = 0x00035C00u;
+            constexpr uint32_t kGameHeapBase = 0x01F00000u;
+            constexpr uint32_t kGameHeapEnd = 0x01F40000u;
+            constexpr uint32_t kGamePointer = 0x00123400u;
+
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, IOP_SID_LIBSD);
+            setRegU32(env.ctx, 6, 0u);
+            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifBindRpc should succeed");
+
+            const SifRpcClientData client = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr);
+            t.IsTrue(client.server >= ps2x::kernel_memory::kRpcServerPoolBase &&
+                         client.server < ps2x::kernel_memory::kRpcServerPoolBase + ps2x::kernel_memory::kRpcServerPoolBytes,
+                     "the placeholder server descriptor must be allocated in kernel RAM");
+
+            for (uint32_t address = kGameHeapBase; address < kGameHeapEnd; address += 4u)
+            {
+                writeGuestU32(env.rdram.data(), address, kGamePointer);
+            }
+
+            std::array<uint32_t, 5> command{};
+            command[0] = 3u;
+            command[2] = 0x1000u;
+            command[3] = 0x00120000u;
+            writeGuestStruct(env.rdram.data(), kSendAddr, command);
+
+            setRegU32(env.ctx, 29, K_STACK_ADDR);
+            writeGuestU32(env.rdram.data(), K_STACK_ADDR, 0u);
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, 0x8010u);
+            setRegU32(env.ctx, 6, 0u);
+            setRegU32(env.ctx, 7, kSendAddr);
+            setRegU32(env.ctx, 8, static_cast<uint32_t>(sizeof(command)));
+            setRegU32(env.ctx, 9, kRecvAddr);
+            setRegU32(env.ctx, 10, 16u);
+            setRegU32(env.ctx, 11, 0u);
+            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifCallRpc should succeed");
+
+            bool heapIntact = true;
+            for (uint32_t address = kGameHeapBase; address < kGameHeapEnd && heapIntact; address += 4u)
+            {
+                heapIntact = readGuestStruct<uint32_t>(env.rdram.data(), address) == kGamePointer;
+            }
+            t.IsTrue(heapIntact, "SifCallRpc must not write into game memory at the old placeholder pool");
+            bool pointeeIntact = true;
+            for (uint32_t offset = 0u; offset < sizeof(command) && pointeeIntact; ++offset)
+            {
+                pointeeIntact = env.rdram[kGamePointer + offset] == 0u;
+            }
+            t.IsTrue(pointeeIntact, "SifCallRpc must not copy the request through pointers found in game memory");
         });
 
         tc.Run("hybrid bind before register waits then remaps", [](TestCase &t)

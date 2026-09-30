@@ -3,6 +3,7 @@
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_async_vif.h"
+#include "GuestKernelMemory.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1345,8 +1346,7 @@ uint32_t EeScheduler::invocationStackTop()
     {
         return existing->second;
     }
-    constexpr uint32_t kInvocationStackSize = 0x4000u;
-    const uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
+    const uint32_t top = m_runtime.reserveAsyncCallbackStack(ps2x::kernel_memory::kCallbackStackSize, 16u);
     if (top == 0u)
     {
         throw std::runtime_error("EE invocation stack space exhausted");

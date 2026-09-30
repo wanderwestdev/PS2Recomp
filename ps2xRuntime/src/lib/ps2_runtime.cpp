@@ -9,6 +9,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
+#include "GuestKernelMemory.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
@@ -516,8 +517,8 @@ PS2Runtime::PS2Runtime()
     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackFloor = ps2x::kernel_memory::kCallbackStackFloor;
+    m_asyncCallbackStackTop = ps2x::kernel_memory::kCallbackStackTop;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -1006,9 +1007,8 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     }
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackFloor = ps2x::kernel_memory::kCallbackStackFloor;
+        m_asyncCallbackStackTop = ps2x::kernel_memory::kCallbackStackTop;
     }
 
     LoadedModule module;

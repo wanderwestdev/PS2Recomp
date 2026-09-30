@@ -11,6 +11,7 @@
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "Stubs/Helpers/Support.h"
 #include "Stubs/GS.h"
+#include "GuestKernelMemory.h"
 
 #include <atomic>
 #include <chrono>
@@ -4100,7 +4101,9 @@ void register_ps2_gs_tests()
                      "VSync callback should receive a positive tick value");
             t.Equals(g_gsSyncCallbackGp.load(std::memory_order_acquire), kGsCallbackGp,
                      "callback invocation should preserve the registered GP");
-            t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) >= 0x01F00000u,
+            const uint32_t callbackSp = g_gsSyncCallbackSp.load(std::memory_order_acquire);
+            t.IsTrue(callbackSp >= ps2x::kernel_memory::kCallbackStackFloor &&
+                         callbackSp < ps2x::kernel_memory::kCallbackStackTop,
                      "callback invocation should use the reserved async stack pool");
             t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) != kGsCallbackCallerSp,
                      "callback invocation must not reuse the caller stack");
