@@ -81,6 +81,15 @@ namespace ps2x::state
 
         [[nodiscard]] size_t remaining() const noexcept { return m_size - m_position; }
 
+        [[nodiscard]] bool nextSectionIs(uint32_t tag) const noexcept
+        {
+            uint32_t actual = 0u;
+            if (remaining() < sizeof(actual))
+                return false;
+            std::memcpy(&actual, m_data + m_position, sizeof(actual));
+            return actual == tag;
+        }
+
     private:
         const uint8_t *m_data = nullptr;
         size_t m_size = 0u;

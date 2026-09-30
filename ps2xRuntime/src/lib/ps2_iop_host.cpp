@@ -269,6 +269,16 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
                                             receive.size);
 }
 
+void PS2IopHostAdapter::submitAudio(std::span<const int16_t> samples)
+{
+    m_runtime.audioBackend().submitPcm(samples);
+}
+
+void PS2IopHostAdapter::resetAudio()
+{
+    m_runtime.audioBackend().resetPcm();
+}
+
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
 {
     const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();

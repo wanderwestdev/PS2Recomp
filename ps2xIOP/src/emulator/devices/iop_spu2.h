@@ -3,6 +3,7 @@
 #include <array>
 #include "ps2x/state_io.h"
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -36,6 +37,8 @@ namespace ps2x::iop::detail
         void dmaRead(uint32_t core, uint8_t *destination, size_t bytes, uint64_t cycle);
 
         void advanceTo(uint64_t cycle);
+        void setAudioSink(std::function<void(std::span<const int16_t>)> sink) { m_audioSink = std::move(sink); }
+        void flushAudio();
 
         [[nodiscard]] uint32_t nextAddress(uint32_t core, uint32_t voice) const noexcept { return m_voices[core][voice].nextA; }
         [[nodiscard]] uint32_t loopAddress(uint32_t core, uint32_t voice) const noexcept { return m_voices[core][voice].loopStartA; }
@@ -48,6 +51,32 @@ namespace ps2x::iop::detail
         void serialize(Ar &ar)
         {
             ps2x::state::fields(ar, m_regs, m_ram, m_voices, m_endx, m_transferAddress, m_cycle);
+            constexpr uint32_t tag = ps2x::state::fourcc("SPCM");
+            if constexpr (Ar::kLoading)
+            {
+                for (auto &core : m_decoders)
+                    core.fill(Decoder{});
+                m_interpolation = {};
+                m_audioFrames = 0u;
+                if (!ar.nextSectionIs(tag))
+                    return;
+            }
+            ar.section(tag);
+            ps2x::state::fields(ar, m_decoders);
+            constexpr uint32_t interpolationTag = ps2x::state::fourcc("SINT");
+            if constexpr (Ar::kLoading)
+            {
+                for (uint32_t core = 0u; core < kCores; ++core)
+                    for (uint32_t voice = 0u; voice < kVoices; ++voice)
+                    {
+                        m_interpolation[core][voice].fill(m_decoders[core][voice].previous);
+                        m_interpolation[core][voice][3] = m_decoders[core][voice].current;
+                    }
+                if (!ar.nextSectionIs(interpolationTag))
+                    return;
+            }
+            ar.section(interpolationTag);
+            ps2x::state::fields(ar, m_interpolation);
         }
 
     private:
@@ -64,14 +93,25 @@ namespace ps2x::iop::detail
             uint8_t phase = 0u;
         };
 
+        struct Decoder
+        {
+            std::array<int16_t, 28> pcm{};
+            int32_t history1 = 0;
+            int32_t history2 = 0;
+            int32_t previous = 0;
+            int32_t current = 0;
+        };
+
         [[nodiscard]] uint16_t &reg(uint32_t offset) noexcept { return m_regs[(offset & 0x7FEu) >> 1u]; }
         [[nodiscard]] uint16_t reg(uint32_t offset) const noexcept { return m_regs[(offset & 0x7FEu) >> 1u]; }
 
         void keyOn(uint32_t core, uint32_t voice);
         void keyOff(uint32_t core, uint32_t voice);
-        void runVoice(uint32_t core, uint32_t voice, uint64_t samples);
+        int32_t runVoice(uint32_t core, uint32_t voice);
         void stepAddress(uint32_t core, uint32_t voice);
         void stepEnvelope(Voice &voice, uint16_t adsr1, uint16_t adsr2);
+        void decodeBlock(uint32_t core, uint32_t voice, uint32_t address);
+        std::array<int32_t, 2> mixCore(uint32_t core, const std::array<int32_t, 2> &external);
 
         std::array<uint16_t, 0x400> m_regs{};
         std::vector<uint16_t> m_ram;
@@ -79,5 +119,10 @@ namespace ps2x::iop::detail
         std::array<uint32_t, kCores> m_endx{};
         std::array<uint32_t, kCores> m_transferAddress{};
         uint64_t m_cycle = 0u;
+        std::array<std::array<Decoder, kVoices>, kCores> m_decoders{};
+        std::array<std::array<std::array<int16_t, 4>, kVoices>, kCores> m_interpolation{};
+        std::array<int16_t, 1024> m_audioBuffer{};
+        size_t m_audioFrames = 0u;
+        std::function<void(std::span<const int16_t>)> m_audioSink;
     };
 }

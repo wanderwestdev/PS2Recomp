@@ -550,8 +550,9 @@ PS2Runtime::~PS2Runtime()
 #else
         if (IsAudioDeviceReady())
         {
-            CloseAudioDevice();
+            m_audioBackend.stopAll();
             m_audioBackend.setAudioReady(false);
+            CloseAudioDevice();
         }
 #endif
         if (m_debugUiInitialized && m_debugUiShutdownCallback)

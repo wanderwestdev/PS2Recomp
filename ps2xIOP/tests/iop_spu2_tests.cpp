@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <iostream>
 #include <string_view>
+#include <vector>
 
 namespace
 {
@@ -147,6 +148,66 @@ namespace
         const auto dma = rig.memory.takeDmaStart();
         expect(dma.has_value() && dma->irq == 0x24, "DMA completion interrupt is scheduled");
     }
+
+    void testStereoPcmAndState()
+    {
+        Rig rig;
+        std::vector<int16_t> output;
+        rig.spu2.setAudioSink([&](std::span<const int16_t> samples) { output.insert(output.end(), samples.begin(), samples.end()); });
+        const uint8_t flags[2] = {0x4, 0x3};
+        rig.uploadBlocks(0x5000u, flags, 2u);
+        rig.setupVoice(0u, 0x5000u, 0x1000u);
+        rig.write(0u, 0x3FFFu);
+        rig.write(2u, 0x2000u);
+        rig.write(0x188u, 1u);
+        rig.write(0x190u, 1u);
+        rig.write(0x198u, 0xC00u);
+        rig.write(0x19Au, 0x4000u);
+        rig.write(0x760u, 0x3FFFu);
+        rig.write(0x762u, 0x3FFFu);
+        rig.write(0x598u, 0xC0u);
+        rig.write(0x59Au, 0x4000u);
+        rig.write(0x788u, 0x3FFFu);
+        rig.write(0x78Au, 0x3FFFu);
+        rig.write(0x790u, 0x7FFFu);
+        rig.write(0x792u, 0x7FFFu);
+        rig.write(0x1A0u, 1u);
+        rig.write(0xAu, 0x7FFFu);
+        rig.samples(8u);
+        rig.spu2.advanceTo(rig.clock);
+        rig.spu2.flushAudio();
+        expect(output.size() == 16u && output[14] >= 4000 && output[14] < 4096 && output[15] >= 2000 && output[15] < 2048,
+               "Gaussian interpolation preserves steady ADPCM levels and stereo balance through both cores");
+        rig.write(4u, 0x1234u);
+        rig.samples(17u);
+        rig.spu2.advanceTo(rig.clock);
+        rig.spu2.flushAudio();
+        ps2x::state::Writer saved;
+        rig.spu2.serialize(saved);
+        output.clear();
+        rig.samples(87u);
+        rig.spu2.advanceTo(rig.clock);
+        rig.spu2.flushAudio();
+        const auto expected = output;
+        output.clear();
+        ps2x::state::Reader reader(saved.data().data(), saved.data().size());
+        rig.spu2.serialize(reader);
+        rig.spu2.advanceTo(rig.clock);
+        rig.spu2.flushAudio();
+        expect(output == expected && reader.remaining() == 0u, "save state restores decoder history and fractional pitch exactly");
+        output.clear();
+        rig.write(0x190u, 0u);
+        rig.samples(4u);
+        rig.spu2.advanceTo(rig.clock);
+        rig.spu2.flushAudio();
+        expect(output.size() == 8u && output[0] > 0 && output[1] == 0, "voice mixer masks silence one stereo channel");
+        output.clear();
+        rig.write(0x1A4u, 1u);
+        rig.samples(200u);
+        rig.spu2.advanceTo(rig.clock);
+        rig.spu2.flushAudio();
+        expect(output.size() == 400u && output[398] == 0 && output[399] == 0, "key off releases audible PCM to silence");
+    }
 }
 
 int main()
@@ -156,6 +217,7 @@ int main()
     testHalfPitch();
     testCore1AndKeyOnIsolation();
     testDmaCopiesIntoSpuRam();
+    testStereoPcmAndState();
     if (g_failures == 0)
         std::cout << "iop_spu2_tests: all passed\n";
     return g_failures == 0 ? 0 : 1;

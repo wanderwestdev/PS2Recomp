@@ -140,6 +140,8 @@ namespace ps2x::iop::detail
             sio2.reset();
             memory.attachSio2(&sio2);
             spu2.reset();
+            spu2.setAudioSink([this](std::span<const int16_t> samples) { host.submitAudio(samples); });
+            host.resetAudio();
             memory.attachSpu2(&spu2, &totalCycles);
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
@@ -680,6 +682,7 @@ namespace ps2x::iop::detail
                     if (totalCycles == before)
                         ++totalCycles;
                 }
+                spu2.advanceTo(totalCycles);
             }
             catch (...)
             {
@@ -828,6 +831,7 @@ namespace ps2x::iop::detail
             imports.serialize(ar);
             if constexpr (Ar::kLoading)
             {
+                host.resetAudio();
                 activeCpu = nullptr;
                 servicingDmaInterrupts = false;
                 servicingGuestCallbacks = false;

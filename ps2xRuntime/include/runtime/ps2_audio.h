@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -23,7 +24,9 @@ public:
               uint32_t voiceIndex = 0xFFFFFFFFu);
     void stop(uint32_t voiceId);
     void stopAll();
-    void setAudioReady(bool ready) { m_audioReady = ready; }
+    void setAudioReady(bool ready);
+    void submitPcm(std::span<const int16_t> samples);
+    void resetPcm();
 
 private:
     struct DecodedSample

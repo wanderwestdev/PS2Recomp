@@ -1,6 +1,8 @@
 #include "iop_spu2.h"
 
 #include <algorithm>
+#include <cmath>
+#include <numbers>
 
 namespace ps2x::iop::detail
 {
@@ -58,6 +60,55 @@ namespace ps2x::iop::detail
                 rate <<= std::min(shift, 40);
             return std::min<int64_t>(rate, 0x3FFFFFFF);
         }
+
+        int32_t volume(uint16_t value)
+        {
+            if (value & 0x8000u)
+                return 0;
+            return static_cast<int16_t>(value << 1u);
+        }
+
+        int32_t scale(int32_t sample, int32_t gain)
+        {
+            return static_cast<int32_t>((static_cast<int64_t>(sample) * gain) >> 15);
+        }
+
+        int32_t saturate(int32_t sample)
+        {
+            return std::clamp(sample, -32768, 32767);
+        }
+
+        const std::array<std::array<int16_t, 4>, 256> &interpolationWeights()
+        {
+            static const auto weights = []
+            {
+                std::array<double, 512> kernel{};
+                double total = 0.0;
+                for (size_t index = 0u; index < kernel.size(); ++index)
+                {
+                    const double position = static_cast<double>(index) + 0.5;
+                    const double window = 1.0 + (std::cos(std::numbers::pi * position / 511.5) - 1.0) * 0.5
+                                              + (std::cos(std::numbers::pi * position / 255.75) - 1.0) * 0.08;
+                    const double value = std::sin(std::numbers::pi * position / 500.0) * window / position;
+                    kernel[511u - index] = value;
+                    total += value;
+                }
+                const double normalization = 32640.0 * 128.0 / total;
+                std::array<std::array<int16_t, 4>, 256> result{};
+                for (size_t phase = 0u; phase < result.size(); ++phase)
+                {
+                    const std::array<size_t, 4> indices{255u - phase, 511u - phase, phase + 256u, phase};
+                    double sum = 0.0;
+                    for (const size_t index : indices)
+                        sum += kernel[index] * normalization;
+                    const double correction = (sum - 32640.0) / 4.0;
+                    for (size_t tap = 0u; tap < indices.size(); ++tap)
+                        result[phase][tap] = static_cast<int16_t>(std::lround(kernel[indices[tap]] * normalization - correction));
+                }
+                return result;
+            }();
+            return weights;
+        }
     }
 
     IopSpu2::IopSpu2()
@@ -75,6 +126,10 @@ namespace ps2x::iop::detail
         m_endx.fill(0u);
         m_transferAddress.fill(0u);
         m_cycle = 0u;
+        for (auto &core : m_decoders)
+            core.fill(Decoder{});
+        m_interpolation = {};
+        m_audioFrames = 0u;
     }
 
     uint16_t IopSpu2::read16(uint32_t physicalAddress, uint64_t cycle)
@@ -132,12 +187,22 @@ namespace ps2x::iop::detail
         const uint32_t offset = (physicalAddress - kBase) & 0x7FEu;
         reg(offset) = value;
         if (offset >= kSharedBase)
+        {
+            for (uint32_t sharedCore = 0u; sharedCore < kCores; ++sharedCore)
+            {
+                const uint32_t shared = kSharedBase + sharedCore * 0x28u;
+                if (offset == shared || offset == shared + 2u)
+                    reg(offset + 0x10u) = static_cast<uint16_t>(volume(value));
+            }
             return;
+        }
         const uint32_t core = offset / kCoreStride;
         const uint32_t local = offset % kCoreStride;
         if (local < kVoiceParamsEnd)
         {
             const uint32_t voice = local >> 4u;
+            if ((local & 0xFu) <= 2u && voice < kVoices)
+                reg(offset + 0xCu) = static_cast<uint16_t>(volume(value));
             if (((local & 0xFu) >> 1u) == kParamEnvelope && voice < kVoices)
                 m_voices[core][voice].envelope = static_cast<int32_t>((static_cast<uint32_t>(value) << 16) | value) & 0x7FFFFFFF;
             return;
@@ -257,9 +322,57 @@ namespace ps2x::iop::detail
         if (samples == 0u)
             return;
         m_cycle += samples * kCyclesPerSample;
-        for (uint32_t core = 0; core < kCores; ++core)
-            for (uint32_t voice = 0; voice < kVoices; ++voice)
-                runVoice(core, voice, samples);
+        for (uint64_t sample = 0; sample < samples; ++sample)
+        {
+            const auto core0 = mixCore(0u, {});
+            const auto output = mixCore(1u, core0);
+            m_audioBuffer[m_audioFrames * 2u] = static_cast<int16_t>(output[0]);
+            m_audioBuffer[m_audioFrames * 2u + 1u] = static_cast<int16_t>(output[1]);
+            if (++m_audioFrames == m_audioBuffer.size() / 2u)
+                flushAudio();
+        }
+    }
+
+    void IopSpu2::flushAudio()
+    {
+        if (m_audioFrames != 0u && m_audioSink)
+            m_audioSink(std::span<const int16_t>(m_audioBuffer.data(), m_audioFrames * 2u));
+        m_audioFrames = 0u;
+    }
+
+    std::array<int32_t, 2> IopSpu2::mixCore(uint32_t core, const std::array<int32_t, 2> &external)
+    {
+        const uint32_t base = core * kCoreStride;
+        const uint32_t leftMask = reg(base + 0x188u) | (static_cast<uint32_t>(reg(base + 0x18Au)) << 16u);
+        const uint32_t rightMask = reg(base + 0x190u) | (static_cast<uint32_t>(reg(base + 0x192u)) << 16u);
+        std::array<int32_t, 2> output{};
+        for (uint32_t index = 0u; index < kVoices; ++index)
+        {
+            const int32_t sample = runVoice(core, index);
+            if (sample == 0)
+                continue;
+            const uint32_t params = base + index * 0x10u;
+            const int32_t left = volume(reg(params));
+            const int32_t right = volume(reg(params + 2u));
+            if (leftMask & (1u << index))
+                output[0] += scale(sample, left);
+            if (rightMask & (1u << index))
+                output[1] += scale(sample, right);
+        }
+        const uint16_t mixer = reg(base + 0x198u);
+        const uint32_t shared = kSharedBase + core * 0x28u;
+        for (uint32_t channel = 0u; channel < 2u; ++channel)
+        {
+            if (!(mixer & (0x800u >> channel)))
+                output[channel] = 0;
+            if (mixer & (0x80u >> channel))
+                output[channel] += scale(external[channel], static_cast<int16_t>(reg(shared + 8u + channel * 2u)));
+            const int32_t master = volume(reg(shared + channel * 2u));
+            output[channel] = scale(saturate(output[channel]), master);
+            if (!(reg(base + 0x19Au) & 0x4000u))
+                output[channel] = 0;
+        }
+        return output;
     }
 
     void IopSpu2::keyOn(uint32_t core, uint32_t index)
@@ -274,6 +387,8 @@ namespace ps2x::iop::detail
         voice.manualLoop = false;
         voice.envelope = 0;
         voice.phase = kPhaseAttack;
+        m_decoders[core][index] = {};
+        m_interpolation[core][index] = {};
         m_endx[core] &= ~(1u << index);
     }
 
@@ -284,25 +399,55 @@ namespace ps2x::iop::detail
             voice.phase = kPhaseRelease;
     }
 
-    void IopSpu2::runVoice(uint32_t core, uint32_t index, uint64_t samples)
+    int32_t IopSpu2::runVoice(uint32_t core, uint32_t index)
     {
         Voice &voice = m_voices[core][index];
         const uint32_t params = core * kCoreStride + index * 0x10u;
         const int32_t pitch = std::min<int32_t>(reg(params + kParamPitch * 2u), kMaxPitch);
         if (voice.phase == kPhaseOff && pitch == 0)
-            return;
+            return 0;
         const uint16_t adsr1 = reg(params + kParamAdsr1 * 2u);
         const uint16_t adsr2 = reg(params + kParamAdsr2 * 2u);
-        for (uint64_t sample = 0; sample < samples; ++sample)
+        if (voice.phase != kPhaseOff)
+            stepEnvelope(voice, adsr1, adsr2);
+        voice.counter += pitch;
+        while (voice.counter > 0)
         {
-            if (voice.phase != kPhaseOff)
-                stepEnvelope(voice, adsr1, adsr2);
-            voice.counter += pitch;
-            while (voice.counter > 0)
-            {
-                stepAddress(core, index);
-                voice.counter -= kPitchStep;
-            }
+            stepAddress(core, index);
+            voice.counter -= kPitchStep;
+        }
+        if (voice.phase == kPhaseOff || voice.envelope == 0)
+            return 0;
+        const int32_t fraction = voice.counter + kPitchStep;
+        const auto &weights = interpolationWeights()[std::min(fraction >> 4, 255)];
+        const auto &history = m_interpolation[core][index];
+        int32_t pcm = 0;
+        for (size_t tap = 0u; tap < history.size(); ++tap)
+            pcm += scale(history[tap], weights[tap]);
+        return scale(saturate(pcm), voice.envelope >> 16);
+    }
+
+    void IopSpu2::decodeBlock(uint32_t core, uint32_t index, uint32_t address)
+    {
+        Decoder &decoder = m_decoders[core][index];
+        constexpr std::array<int32_t, 5> first{0, 60, 115, 98, 122};
+        constexpr std::array<int32_t, 5> second{0, 0, -52, -55, -60};
+        const uint16_t header = m_ram[address];
+        const uint32_t predictor = (header >> 4u) & 0xFu;
+        const int32_t c1 = predictor < first.size() ? first[predictor] : 0;
+        const int32_t c2 = predictor < second.size() ? second[predictor] : 0;
+        const uint32_t shift = header & 0xFu;
+        for (uint32_t sample = 0u; sample < kSamplesPerBlock; ++sample)
+        {
+            const uint16_t packed = m_ram[(address + 1u + sample / 4u) & kAddressMask];
+            const int32_t nibble = (packed >> ((sample % 4u) * 4u)) & 0xFu;
+            const int32_t signedNibble = nibble >= 8 ? nibble - 16 : nibble;
+            const int32_t raw = (signedNibble * 4096) >> shift;
+            const int32_t filtered = raw + ((decoder.history1 * c1 + decoder.history2 * c2 + 32) >> 6);
+            const int32_t decoded = saturate(filtered);
+            decoder.pcm[sample] = static_cast<int16_t>(decoded);
+            decoder.history2 = decoder.history1;
+            decoder.history1 = decoded;
         }
     }
 
@@ -312,11 +457,24 @@ namespace ps2x::iop::detail
         if (voice.sampleIndex >= kSamplesPerBlock)
         {
             const uint32_t block = voice.nextA & ~7u & kAddressMask;
+            if (voice.phase != kPhaseOff)
+                decodeBlock(core, index, block);
             voice.loopFlags = static_cast<uint8_t>(m_ram[block] >> 8);
             if ((voice.loopFlags & kLoopStart) && !voice.manualLoop)
                 voice.loopStartA = block;
             voice.sampleIndex = 0u;
             voice.nextA = (block + 1u) & kAddressMask;
+        }
+        if (voice.phase != kPhaseOff)
+        {
+            Decoder &decoder = m_decoders[core][index];
+            decoder.previous = decoder.current;
+            decoder.current = decoder.pcm[voice.sampleIndex];
+            auto &history = m_interpolation[core][index];
+            history[0] = history[1];
+            history[1] = history[2];
+            history[2] = history[3];
+            history[3] = static_cast<int16_t>(decoder.current);
         }
         ++voice.sampleIndex;
         if ((voice.sampleIndex & 3u) != 0u)
