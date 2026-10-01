@@ -1,6 +1,7 @@
 #include "runtime/ps2_async_vif.h"
 #include "ps2_runtime.h"
 #include "runtime/ps2_save_state.h"
+#include "runtime/ps2_display_options.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -36,12 +37,49 @@ namespace ps2_stubs
     void resetSifState();
 }
 
+namespace ps2_host_display
+{
+    std::atomic<float> displayAspect{4.0f / 3.0f};
+    std::atomic<float> windowAspect{4.0f / 3.0f};
+    std::atomic<bool> fitWindow{false};
+    bool startMaximized = false;
+
+    void setAspect(float aspect)
+    {
+        displayAspect.store(aspect, std::memory_order_relaxed);
+    }
+
+    float aspect()
+    {
+        return fitWindow.load(std::memory_order_relaxed)
+                   ? windowAspect.load(std::memory_order_relaxed)
+                   : displayAspect.load(std::memory_order_relaxed);
+    }
+
+    void setFitWindow(bool enabled)
+    {
+        fitWindow.store(enabled, std::memory_order_relaxed);
+    }
+
+    void updateWindowAspect()
+    {
+        const int width = GetScreenWidth();
+        const int height = GetScreenHeight();
+        if (width > 0 && height > 0)
+            windowAspect.store(static_cast<float>(width) / static_cast<float>(height), std::memory_order_relaxed);
+    }
+
+    void setStartMaximized(bool enabled)
+    {
+        startMaximized = enabled;
+    }
+}
+
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
 #define ET_EXEC 2            // Executable file
 #define EM_MIPS 8            // MIPS architecture
 #define PT_LOAD 1            // Loadable segment
 
-static constexpr float kDisplayAspect = 4.0f / 3.0f;
 #if defined(PLATFORM_VITA)
 static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
@@ -768,6 +806,8 @@ bool PS2Runtime::initialize(const char *title)
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        if (ps2_host_display::startMaximized)
+            MaximizeWindow();
         SetExitKey(KEY_NULL);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
@@ -2438,6 +2478,7 @@ void PS2Runtime::run()
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
     Texture2D frameTex{};
+    ps2_host_display::updateWindowAspect();
 
     std::atomic<bool> gameThreadFinished{false};
     ps2_host_input::setFieldCounter(&m_memory.gs().vsyncTick);
@@ -2464,6 +2505,7 @@ void PS2Runtime::run()
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
+    bool restoreMaximized = false;
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
@@ -2499,6 +2541,7 @@ void PS2Runtime::run()
 
             }
         });
+        ps2_host_display::updateWindowAspect();
         uint32_t presentWidth = 0u;
         uint32_t presentHeight = 0u;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
@@ -2509,12 +2552,17 @@ void PS2Runtime::run()
         {
             const float screenWidth = static_cast<float>(GetScreenWidth());
             const float screenHeight = static_cast<float>(GetScreenHeight());
+            const float displayAspect = ps2_host_display::aspect();
             float dstWidth = screenWidth;
-            float dstHeight = screenWidth / kDisplayAspect;
-            if (dstHeight > screenHeight)
+            float dstHeight = screenHeight;
+            if (!ps2_host_display::fitWindow.load(std::memory_order_relaxed))
             {
-                dstHeight = screenHeight;
-                dstWidth = screenHeight * kDisplayAspect;
+                dstHeight = screenWidth / displayAspect;
+                if (dstHeight > screenHeight)
+                {
+                    dstHeight = screenHeight;
+                    dstWidth = screenHeight * displayAspect;
+                }
             }
             const Rectangle srcRect{0.0f, 0.0f, static_cast<float>(presentWidth), static_cast<float>(presentHeight)};
             const Rectangle dstRect{(screenWidth - dstWidth) * 0.5f, (screenHeight - dstHeight) * 0.5f, dstWidth, dstHeight};
@@ -2536,6 +2584,18 @@ void PS2Runtime::run()
             }
         }
         EndDrawing();
+#if !defined(PLATFORM_VITA)
+        if (IsKeyPressed(KEY_F11))
+        {
+            ps2_host_input::releaseMouse();
+            const bool leavingFullscreen = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE);
+            if (!leavingFullscreen)
+                restoreMaximized = IsWindowMaximized();
+            ToggleBorderlessWindowed();
+            if (leavingFullscreen && restoreMaximized)
+                MaximizeWindow();
+        }
+#endif
         ps2_host_input::sample();
         if (IsKeyPressed(KEY_F5))
             ps2x::savestate::requestQuickSave();
