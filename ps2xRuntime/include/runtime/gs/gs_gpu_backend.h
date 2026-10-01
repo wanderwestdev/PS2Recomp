@@ -53,6 +53,9 @@ public:
     const Stats &GetStats() const { return m_stats; }
 
     static void SetAsyncPresentDefault(bool enabled);
+    void SetTexturePageCacheEnabled(bool enabled);
+    void SetFastTriangleSetupEnabled(bool enabled);
+    void SetHardwareRasterAllowed(bool allowed);
 
 private:
     struct Impl;

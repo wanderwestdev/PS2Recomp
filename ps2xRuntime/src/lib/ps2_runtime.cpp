@@ -10,6 +10,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_shared_present.h"
 #include "runtime/ee_scheduler.h"
+#include "ThreadPriority.h"
 #include "ThreadNaming.h"
 #include "GuestKernelMemory.h"
 #include "Kernel/Stubs/Audio.h"
@@ -1503,7 +1504,20 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (!hasFunction(targetPc))
+    static const bool singleLookup = [] {
+        const char *setting = std::getenv("PS2X_EE_SINGLE_LOOKUP");
+        return !setting || std::string_view(setting) != "0";
+    }();
+    RecompiledFunction targetFn = nullptr;
+    if (singleLookup)
+    {
+        uint32_t slot = 0u;
+        if (generatedFunctionTableSlot(targetPc, slot))
+            targetFn = g_ps2RecompiledFunctionTable[slot];
+    }
+    else if (hasFunction(targetPc))
+        targetFn = lookupFunction(targetPc);
+    if (!targetFn)
     {
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
 
@@ -1525,7 +1539,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    RecompiledFunction targetFn = lookupFunction(targetPc);
+    if (singleLookup)
+        pushDispatchPc(targetPc);
     const uint32_t entryPc = ctx->pc;
     const uint64_t jumpSerial = g_guestJumpSerial;
     pushBranchEvent(0u, sourcePc, targetPc, ctx, fallthroughPc);
@@ -2527,6 +2542,7 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        ThreadPriority::RaiseCurrentThread(ThreadPriority::Level::Highest);
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
@@ -2545,6 +2561,7 @@ void PS2Runtime::run()
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
+    ThreadPriority::RaiseCurrentThread(ThreadPriority::Level::AboveNormal);
     bool restoreMaximized = false;
     uint64_t tick = 0;
     std::ofstream frameTimes;

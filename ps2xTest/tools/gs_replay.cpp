@@ -36,8 +36,34 @@ namespace
             return std::make_unique<GSThreadedBackend>(std::make_unique<GSCpuBackend>());
         if (name == "gpu")
             return std::make_unique<GSGpuBackend>();
+        if (name == "gpuuncached")
+        {
+            auto backend = std::make_unique<GSGpuBackend>();
+            backend->SetTexturePageCacheEnabled(false);
+            return backend;
+        }
+        if (name == "gpuoriginal")
+        {
+            auto backend = std::make_unique<GSGpuBackend>();
+            backend->SetTexturePageCacheEnabled(false);
+            backend->SetFastTriangleSetupEnabled(false);
+            return backend;
+        }
+        if (name == "gputhreadoriginal")
+        {
+            auto backend = std::make_unique<GSGpuBackend>();
+            backend->SetTexturePageCacheEnabled(false);
+            backend->SetFastTriangleSetupEnabled(false);
+            return std::make_unique<GSThreadedBackend>(std::move(backend));
+        }
         if (name == "gputhread")
             return std::make_unique<GSThreadedBackend>(std::make_unique<GSGpuBackend>());
+        if (name == "gputhreadcompute")
+        {
+            auto backend = std::make_unique<GSGpuBackend>();
+            backend->SetHardwareRasterAllowed(false);
+            return std::make_unique<GSThreadedBackend>(std::move(backend));
+        }
         return nullptr;
     }
 
@@ -167,6 +193,7 @@ namespace
                 access->ImportState(recording.initial.state);
         }
         uint32_t field = 0u;
+        int status = 0;
         for (const GSRecording::Record &record : recording.records)
         {
             if (record.op == GSRecording::Op::Hash)
@@ -229,8 +256,13 @@ namespace
                             vramDiff);
             }
             else
+            {
                 std::printf("field %u: frame size mismatch %ux%u vs %ux%u; VRAM bytes differing %zu\n", field, frames[0].width, frames[0].height,
                             frames[1].width, frames[1].height, vramDiff);
+                status = 1;
+            }
+            if (vramDiff || pixelDiff)
+                status = 1;
             if (!dumpDir.empty())
             {
                 const std::string base = dumpDir + "/field" + std::to_string(field);
@@ -251,7 +283,7 @@ namespace
                         (unsigned long long)s.prims, (unsigned long long)s.batches, (unsigned long long)s.tiles, (unsigned long long)s.clutLoads,
                         (unsigned long long)s.flushTarget, (unsigned long long)s.flushTexture, (unsigned long long)s.flushOther);
         }
-        return 0;
+        return status;
     }
 
     void writeDraw(std::FILE *file, const GSPrimitiveBatch &batch)
@@ -554,6 +586,7 @@ namespace
 
 int main(int argc, char **argv)
 {
+    bool reuse = false;
     if (argc == 2 && std::string(argv[1]) == "--check-lround")
         return checkLround();
     if (argc >= 3 && std::string(argv[1]) == "--gsdump")
@@ -595,6 +628,8 @@ int main(int argc, char **argv)
             backendName = argv[++i];
         else if (arg == "--repeat" && i + 1 < argc)
             repeat = std::max(1, std::atoi(argv[++i]));
+        else if (arg == "--reuse")
+            reuse = true;
         else if (arg == "--no-compare")
             compare = false;
         else if (arg == "--lockstep")
@@ -659,9 +694,10 @@ int main(int argc, char **argv)
 
     int status = 0;
     double best = 1e30;
+    std::unique_ptr<GSRasterBackend> shared = reuse ? makeBackend(backendName) : nullptr;
     for (int run = 0; run < repeat; ++run)
     {
-        auto backend = makeBackend(backendName);
+        auto backend = reuse ? std::move(shared) : makeBackend(backendName);
         if (!backend)
         {
             std::cerr << "unknown backend " << backendName << "\n";
@@ -674,6 +710,8 @@ int main(int argc, char **argv)
                     compare ? (report.ok ? "bit-exact" : "MISMATCH: ") : "", report.ok ? "" : report.message.c_str());
         if (!report.ok)
             status = 1;
+        if (reuse)
+            shared = std::move(backend);
     }
     std::printf("best: %.3f s\n", best);
     return status;

@@ -232,6 +232,33 @@ struct GSGpuBackend::Impl
     Program present;
     Program presentHash;
     Program pageCopy;
+    Program hwRaster;
+    GLuint hwFramebuffer = 0;
+    GLuint hwVertexArray = 0;
+    bool hwEnabled = false;
+    bool hwAllowed = true;
+    bool hwConservative = false;
+    GLuint hwVertexShader = 0;
+    std::string hwFragmentHead;
+    std::string hwFragmentBody;
+    using HwKey = std::array<uint32_t, 11>;
+    std::map<HwKey, Program> hwVariants;
+    struct PendingVariant
+    {
+        GLuint program = 0;
+        GLuint fragment = 0;
+        std::string cacheKey;
+        std::filesystem::path cachePath;
+    };
+    struct HwRun
+    {
+        const Program *program;
+        uint32_t first;
+        uint32_t last;
+    };
+    std::vector<HwRun> hwRuns;
+    std::string hwVertexSource;
+    std::map<HwKey, PendingVariant> hwPending;
 
     std::vector<uint32_t> prims;
     uint32_t primCount = 0u;
@@ -260,6 +287,11 @@ struct GSGpuBackend::Impl
     bool transferQueued = false;
     GLuint pageMapBuffer = 0;
     std::bitset<kPages> readPages;
+    bool cacheTexturePages = true;
+    bool fastTriangleSetup = true;
+    bool texturePagesValid = false;
+    std::array<uint32_t, 6> texturePagesKey{};
+    std::bitset<kPages> texturePages;
     uint64_t targetKey = 0u;
     bool hasTarget = false;
     std::vector<ClutOp> clutOps;
@@ -494,9 +526,18 @@ struct GSGpuBackend::Impl
                     gl.DeleteQueries(1, &query);
             const GLuint buffers[] = {vramBuffer, swizzleBuffer, clutBuffer, primBuffer, stateBuffer, tileBuffer, tileListBuffer, dataBuffer, clutOpBuffer, pageMapBuffer};
             gl.DeleteBuffers(static_cast<GLsizei>(std::size(buffers)), buffers);
-            for (Program *program : {&raster, &clutLoad, &upload, &copyRead, &copyWrite, &clear, &poke, &present, &presentHash, &pageCopy})
+            for (Program *program : {&raster, &clutLoad, &upload, &copyRead, &copyWrite, &clear, &poke, &present, &presentHash, &pageCopy, &hwRaster})
                 if (program->id)
                     gl.DeleteProgram(program->id);
+            if (hwFramebuffer)
+                gl.DeleteFramebuffers(1, &hwFramebuffer);
+            if (hwVertexArray)
+                gl.DeleteVertexArrays(1, &hwVertexArray);
+            for (auto &[key, program] : hwVariants)
+                if (program.id)
+                    gl.DeleteProgram(program.id);
+            if (hwVertexShader)
+                gl.DeleteShader(hwVertexShader);
         }
     }
 
@@ -692,6 +733,312 @@ struct GSGpuBackend::Impl
         return true;
     }
 
+    GLuint compileStage(GLenum kind, const std::string &source)
+    {
+        const char *text = source.c_str();
+        const GLuint shader = gl().CreateShader(kind);
+        gl().ShaderSource(shader, 1, &text, nullptr);
+        gl().CompileShader(shader);
+        GLint ok = 0;
+        gl().GetShaderiv(shader, kCompileStatus, &ok);
+        if (ok)
+            return shader;
+        GLint length = 0;
+        gl().GetShaderiv(shader, kInfoLogLength, &length);
+        std::string log(static_cast<size_t>(std::max(length, 1)), '\0');
+        gl().GetShaderInfoLog(shader, length, nullptr, log.data());
+        std::fprintf(stderr, "[gs-gpu] hardware raster shader compile failed:\n%s\n", log.c_str());
+        std::fflush(stderr);
+        gl().DeleteShader(shader);
+        return 0u;
+    }
+
+    HwKey hardwareKey(uint32_t prim) const
+    {
+        const uint32_t header = prims[static_cast<size_t>(prim) * kPrimWords];
+        const uint32_t *s = states.data() + static_cast<size_t>(header >> 8u) * kStateWords;
+        return {header & 0xFFu, s[SFlags], s[SFpsm], s[SZpsm], s[SZmask], s[STpsm], s[STexMode], s[SAlpha], s[STest] & ~0xFF0u,
+                s[SClampLo] & 0xFu, s[SFba]};
+    }
+
+    std::filesystem::path hardwareCachePath(const std::string &key) const
+    {
+        const char *cache = std::getenv("PS2X_GS_SHADER_CACHE");
+        const char *directory = std::getenv("PS2X_GS_SHADER_CACHE_DIR");
+        if ((cache && *cache == '0') || !directory)
+            return {};
+        uint64_t value = 14695981039346656037ull;
+        for (unsigned char c : key)
+            value = (value ^ c) * 1099511628211ull;
+        char name[40];
+        std::snprintf(name, sizeof(name), "hw_%016llx.glbin", static_cast<unsigned long long>(value));
+        return std::filesystem::path(directory) / name;
+    }
+
+    static uint64_t binaryChecksum(const std::vector<uint8_t> &data)
+    {
+        uint64_t value = 14695981039346656037ull;
+        for (uint8_t c : data)
+            value = (value ^ c) * 1099511628211ull;
+        return value;
+    }
+
+    GLuint loadHardwareBinary(const std::filesystem::path &path, const std::string &key)
+    {
+        if (path.empty())
+            return 0u;
+        std::ifstream input(path, std::ios::binary);
+        std::array<uint32_t, 4> header{};
+        uint64_t checksum = 0u;
+        input.read(reinterpret_cast<char *>(header.data()), sizeof(header));
+        input.read(reinterpret_cast<char *>(&checksum), sizeof(checksum));
+        if (!input || header[0] != 0x31574853u || header[2] != key.size() || header[3] == 0u || header[3] > 64u * 1024u * 1024u)
+            return 0u;
+        std::string storedKey(key.size(), '\0');
+        std::vector<uint8_t> binary(header[3]);
+        input.read(storedKey.data(), storedKey.size());
+        input.read(reinterpret_cast<char *>(binary.data()), binary.size());
+        if (!input || storedKey != key || binaryChecksum(binary) != checksum)
+            return 0u;
+        const GLuint program = gl().CreateProgram();
+        gl().ProgramBinary(program, header[1], binary.data(), static_cast<GLsizei>(binary.size()));
+        GLint linked = 0;
+        gl().GetProgramiv(program, kLinkStatus, &linked);
+        if (linked)
+            return program;
+        gl().DeleteProgram(program);
+        return 0u;
+    }
+
+    void storeHardwareBinary(const std::filesystem::path &path, const std::string &key, GLuint program)
+    {
+        if (path.empty())
+            return;
+        GLint length = 0;
+        gl().GetProgramiv(program, kProgramBinaryLength, &length);
+        if (length <= 0 || length > 64 * 1024 * 1024)
+            return;
+        std::vector<uint8_t> binary(static_cast<size_t>(length));
+        GLsizei written = 0;
+        GLenum format = 0u;
+        gl().GetProgramBinary(program, length, &written, &format, binary.data());
+        if (written <= 0)
+            return;
+        binary.resize(static_cast<size_t>(written));
+        const std::array<uint32_t, 4> header = {0x31574853u, format, static_cast<uint32_t>(key.size()), static_cast<uint32_t>(written)};
+        const uint64_t checksum = binaryChecksum(binary);
+        std::error_code error;
+        std::filesystem::create_directories(path.parent_path(), error);
+        const std::filesystem::path temporary = path.string() + ".tmp";
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            output.write(reinterpret_cast<const char *>(header.data()), sizeof(header));
+            output.write(reinterpret_cast<const char *>(&checksum), sizeof(checksum));
+            output.write(key.data(), key.size());
+            output.write(reinterpret_cast<const char *>(binary.data()), binary.size());
+        }
+        std::filesystem::rename(temporary, path, error);
+    }
+
+    std::string hardwareFragmentSource(const HwKey &key) const
+    {
+        static const char *const kNames[] = {"K_TYPE", "K_FLAGS", "K_FPSM", "K_ZPSM", "K_ZMASK", "K_TPSM", "K_TEXMODE", "K_ALPHA",
+                                             "K_TEST", "K_CLAMPLO", "K_FBA"};
+        std::string defines = "#define HW_SPECIALIZED 1\n#define HW_TYPE(h) K_TYPE\n";
+        for (size_t i = 0; i < key.size(); ++i)
+            defines += "#define " + std::string(kNames[i]) + " " + std::to_string(key[i]) + "u\n";
+        return hwFragmentHead + defines + hwFragmentBody;
+    }
+
+    void finishVariant(Program &program, GLuint id)
+    {
+        program.id = id;
+        program.loc[0] = gl().GetUniformLocation(id, "uRaster");
+        program.loc[1] = gl().GetUniformLocation(id, "uHw");
+    }
+
+    const Program *hardwareVariant(const HwKey &key)
+    {
+        auto found = hwVariants.find(key);
+        if (found != hwVariants.end())
+            return found->second.id ? &found->second : nullptr;
+        auto pending = hwPending.find(key);
+        if (pending != hwPending.end())
+        {
+            GLint done = 1;
+            if (gl().MaxShaderCompilerThreads)
+                gl().GetProgramiv(pending->second.program, kCompletionStatus, &done);
+            if (!done)
+                return nullptr;
+            Program &program = hwVariants[key];
+            GLint ok = 0;
+            gl().GetProgramiv(pending->second.program, kLinkStatus, &ok);
+            gl().DeleteShader(pending->second.fragment);
+            if (ok)
+            {
+                finishVariant(program, pending->second.program);
+                storeHardwareBinary(pending->second.cachePath, pending->second.cacheKey, program.id);
+            }
+            else
+            {
+                GLint length = 0;
+                gl().GetProgramiv(pending->second.program, kInfoLogLength, &length);
+                std::string log(static_cast<size_t>(std::max(length, 1)), '\0');
+                gl().GetProgramInfoLog(pending->second.program, length, nullptr, log.data());
+                std::fprintf(stderr, "[gs-gpu] hardware raster variant failed; that state keeps the compute renderer:\n%s\n", log.c_str());
+                std::fflush(stderr);
+                gl().DeleteProgram(pending->second.program);
+            }
+            hwPending.erase(pending);
+            return program.id ? &program : nullptr;
+        }
+        const std::string fragmentSource = hardwareFragmentSource(key);
+        PendingVariant variant;
+        variant.cacheKey = std::string(reinterpret_cast<const char *>(gl().GetString(kRenderer))) + "\n" +
+                           reinterpret_cast<const char *>(gl().GetString(kVersion)) + "\n" + hwVertexSource + "\n" + fragmentSource;
+        variant.cachePath = hardwareCachePath(variant.cacheKey);
+        if (const GLuint cached = loadHardwareBinary(variant.cachePath, variant.cacheKey))
+        {
+            Program &program = hwVariants[key];
+            finishVariant(program, cached);
+            return &program;
+        }
+        const char *text = fragmentSource.c_str();
+        variant.fragment = gl().CreateShader(kFragmentShader);
+        gl().ShaderSource(variant.fragment, 1, &text, nullptr);
+        gl().CompileShader(variant.fragment);
+        variant.program = gl().CreateProgram();
+        gl().ProgramParameteri(variant.program, kProgramBinaryRetrievableHint, 1);
+        gl().AttachShader(variant.program, hwVertexShader);
+        gl().AttachShader(variant.program, variant.fragment);
+        gl().LinkProgram(variant.program);
+        hwPending.emplace(key, std::move(variant));
+        return gl().MaxShaderCompilerThreads ? nullptr : hardwareVariant(key);
+    }
+
+    static std::string hardwareShadingFunctions(const std::string &body)
+    {
+        std::string out = "bool shadeOut(out uint oz, out uvec4 oc, out uint ofog, uint z, uvec4 c, uint fog)\n"
+                          "{\n    oz = z;\n    oc = c;\n    ofog = fog;\n    return true;\n}\n";
+        const char *names[] = {"drawPoint", "drawSprite", "drawTriangle"};
+        const char *shaded[] = {"shadePoint", "shadeSprite", "shadeTriangle"};
+        for (int i = 0; i < 3; ++i)
+        {
+            const std::string signature = std::string("void ") + names[i] + "(uint p, uint s, int x, int y)\n{";
+            const size_t start = body.find(signature);
+            if (start == std::string::npos)
+                return {};
+            size_t depth = 0u;
+            size_t end = body.find('{', start);
+            for (; end < body.size(); ++end)
+            {
+                if (body[end] == '{')
+                    ++depth;
+                else if (body[end] == '}' && --depth == 0u)
+                    break;
+            }
+            if (end >= body.size())
+                return {};
+            std::string function = body.substr(start, end - start + 1u);
+            function.replace(0, signature.size(), std::string("bool ") + shaded[i] +
+                                                      "(uint p, uint s, int x, int y, out uint oz, out uvec4 oc, out uint ofog)\n{");
+            for (size_t at = 0; (at = function.find("writePixel(s, x, y, ", at)) != std::string::npos;)
+            {
+                function.replace(at, std::string("writePixel(s, x, y, ").size(), "return shadeOut(oz, oc, ofog, ");
+                at += std::string("return shadeOut(oz, oc, ofog, ").size();
+            }
+            for (size_t at = 0; (at = function.find("return;", at)) != std::string::npos;)
+            {
+                function.replace(at, std::string("return;").size(), "return false;");
+                at += std::string("return false;").size();
+            }
+            out += function + "\n";
+        }
+        out += "bool shadePrim(uint p, int x, int y, out uint s, out uint oz, out uvec4 oc, out uint ofog)\n"
+               "{\n"
+               "    uint header = pw(p, 0u);\n"
+               "    s = header >> 8u;\n"
+               "    oz = 0u;\n    oc = uvec4(0u);\n    ofog = 0u;\n"
+               "    switch (HW_TYPE(header))\n"
+               "    {\n"
+               "    case 0u: return shadePoint(p, s, x, y, oz, oc, ofog);\n"
+               "    case 1u: return shadeSprite(p, s, x, y, oz, oc, ofog);\n"
+               "    case 2u: return shadeTriangle(p, s, x, y, oz, oc, ofog);\n"
+               "    }\n"
+               "    return false;\n"
+               "}\n";
+        return out;
+    }
+
+    bool setupHardwareRaster(const std::string &prefix)
+    {
+        const char *setting = std::getenv("PS2X_GS_HW_RASTER");
+        if ((setting && *setting == '0') || !gl().graphics || !hwAllowed)
+            return false;
+        const std::string version = "#version 460 core\n";
+        std::string body = GSGpuShaders::kRaster;
+        const std::string layout = "layout(local_size_x = 16, local_size_y = 16) in;";
+        const std::string stateRead = "uint st(uint s, uint i) { return states[s * STATE_WORDS + i]; }";
+        const std::string coverType = "    uint type = header & 0xFFu;";
+        const std::string drawType = "    switch (header & 0xFFu)";
+        const size_t layoutAt = body.find(layout);
+        const size_t mainAt = body.find("void main()");
+        if (layoutAt == std::string::npos || mainAt == std::string::npos || body.find(stateRead) == std::string::npos ||
+            body.find(coverType) == std::string::npos || body.find(drawType) == std::string::npos)
+            return false;
+        body = body.substr(0, mainAt);
+        body.erase(layoutAt, layout.size());
+        body.replace(body.find(stateRead), stateRead.size(),
+                     "#ifdef HW_SPECIALIZED\n"
+                     "uint st(uint s, uint i)\n"
+                     "{\n"
+                     "    uint v = states[s * STATE_WORDS + i];\n"
+                     "    if (i == S_FLAGS) return K_FLAGS;\n"
+                     "    if (i == S_FPSM) return K_FPSM;\n"
+                     "    if (i == S_ZPSM) return K_ZPSM;\n"
+                     "    if (i == S_ZMASK) return K_ZMASK;\n"
+                     "    if (i == S_TPSM) return K_TPSM;\n"
+                     "    if (i == S_TEXMODE) return K_TEXMODE;\n"
+                     "    if (i == S_ALPHA) return K_ALPHA;\n"
+                     "    if (i == S_TEST) return (v & 0xFF0u) | K_TEST;\n"
+                     "    if (i == S_CLAMP_LO) return (v & ~0xFu) | K_CLAMPLO;\n"
+                     "    if (i == S_FBA) return K_FBA;\n"
+                     "    return v;\n"
+                     "}\n"
+                     "#else\n" +
+                         stateRead +
+                         "\n#endif\n");
+        body.replace(body.find(coverType), coverType.size(), "    uint type = HW_TYPE(header);");
+        body.replace(body.find(drawType), drawType.size(), "    switch (HW_TYPE(header))");
+        const std::string shading = hardwareShadingFunctions(body);
+        if (shading.empty())
+            return false;
+        body += shading;
+        hwFragmentHead = version + "#extension GL_ARB_fragment_shader_interlock : require\n";
+        std::string common = GSGpuShaders::kCommon;
+        const std::string vramDeclaration = "layout(std430, binding = 0) buffer VramBuffer";
+        if (common.find(vramDeclaration) == std::string::npos)
+            return false;
+        common.replace(common.find(vramDeclaration), vramDeclaration.size(), "layout(std430, binding = 0) coherent buffer VramBuffer");
+        hwFragmentBody = prefix.substr(version.size()) + common + body + GSGpuShaders::kHwFragmentMain;
+        if (gl().MaxShaderCompilerThreads)
+            gl().MaxShaderCompilerThreads(0xFFFFFFFFu);
+        hwVertexSource = version + GSGpuShaders::kHwVertex;
+        hwVertexShader = compileStage(kVertexShader, hwVertexSource);
+        if (!hwVertexShader)
+            return false;
+        const char *expand = std::getenv("PS2X_GS_HW_TRIANGLES");
+        hwConservative = !(expand && *expand == '0');
+        gl().GenFramebuffers(1, &hwFramebuffer);
+        gl().BindFramebuffer(kFramebuffer, hwFramebuffer);
+        gl().FramebufferParameteri(kFramebuffer, kFramebufferDefaultWidth, 2048);
+        gl().FramebufferParameteri(kFramebuffer, kFramebufferDefaultHeight, 2048);
+        gl().GenVertexArrays(1, &hwVertexArray);
+        std::fprintf(stderr, "[gs-gpu] hardware rasterization active%s\n", hwConservative ? ", expanded triangles" : "");
+        std::fflush(stderr);
+        return true;
+    }
+
     bool ensure()
     {
         if (initialized)
@@ -761,6 +1108,7 @@ struct GSGpuBackend::Impl
             failed = true;
             return false;
         }
+        hwEnabled = setupHardwareRaster(prefix);
         const char *hashValue = std::getenv("PS2X_FRAME_HASH");
         if (context.Shared() && hashValue && *hashValue == '1')
         {
@@ -946,8 +1294,64 @@ struct GSGpuBackend::Impl
         if (epoch != 0u)
             bindUpload(9u, pageMapBuffer, pageMaps.data(), static_cast<size_t>(epoch) * kPages * sizeof(uint32_t));
         dispatchClutOps();
-        if (primCount != 0u)
+        bool drawn = false;
+        if (primCount != 0u && hwEnabled)
         {
+            hwRuns.clear();
+            uint32_t runStart = 0u;
+            HwKey runKey = hardwareKey(0u);
+            bool ready = true;
+            for (uint32_t prim = 1u; prim <= primCount; ++prim)
+            {
+                HwKey key{};
+                if (prim < primCount)
+                {
+                    key = hardwareKey(prim);
+                    if (key == runKey)
+                        continue;
+                }
+                const Program *program = hardwareVariant(runKey);
+                ready = ready && program != nullptr;
+                hwRuns.push_back({program, runStart, prim});
+                runStart = prim;
+                runKey = key;
+            }
+            if (ready)
+            {
+                bindUpload(3u, primBuffer, prims.data(), prims.size() * sizeof(uint32_t));
+                bindUpload(4u, stateBuffer, states.data(), states.size() * sizeof(uint32_t));
+                g.BindFramebuffer(kFramebuffer, hwFramebuffer);
+                g.Viewport(0, 0, 2048, 2048);
+                g.BindVertexArray(hwVertexArray);
+                const GLuint profRaster = profBegin();
+                for (const HwRun &run : hwRuns)
+                {
+                    g.UseProgram(run.program->id);
+                    g.Uniform4ui(run.program->loc[0], epoch, 0u, 0u, 0u);
+                    g.Uniform4ui(run.program->loc[1], hwConservative ? 1u : 0u, 0u, 0u, 0u);
+                    g.DrawArrays(kTriangles, static_cast<GLint>(run.first * 6u), static_cast<GLsizei>((run.last - run.first) * 6u));
+                }
+                profEnd(0u, profRaster);
+                if (prof.enabled)
+                    prof.prims += primCount;
+                barrier();
+                stats.batches += 1u;
+                stats.prims += primCount;
+                drawn = true;
+            }
+        }
+        if (primCount != 0u && !drawn)
+        {
+            if (hwEnabled)
+                for (uint32_t prim = 0u; prim < primCount; ++prim)
+                {
+                    const uint32_t *p = prims.data() + static_cast<size_t>(prim) * kPrimWords;
+                    if ((p[0] & 0xFFu) == PrimPoint)
+                        binBox(prim, static_cast<int>(p[1]), static_cast<int>(p[2]), static_cast<int>(p[1]), static_cast<int>(p[2]));
+                    else
+                        binBox(prim, static_cast<int>(p[1] & 0xFFFFu), static_cast<int>(p[2] & 0xFFFFu), static_cast<int>(p[1] >> 16u),
+                               static_cast<int>(p[2] >> 16u));
+                }
             tileHeaders.clear();
             tileList.clear();
             for (uint32_t tile : touched)
@@ -1063,7 +1467,17 @@ struct GSGpuBackend::Impl
             const bool regionV = ((clamp >> 2) & 0x2u) != 0u;
             const int maxU = regionU ? 1023 : state.textureWidth - 1;
             const int maxV = regionV ? 1023 : state.textureHeight - 1;
-            markPages(read, ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw, 0, 0, maxU, maxV);
+            const std::array<uint32_t, 6> key{ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw,
+                                             static_cast<uint32_t>(maxU), static_cast<uint32_t>(maxV), 0u};
+            if (cacheTexturePages && texturePagesValid && key == texturePagesKey)
+                read = texturePages;
+            else
+            {
+                markPages(read, ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw, 0, 0, maxU, maxV);
+                texturePages = read;
+                texturePagesKey = key;
+                texturePagesValid = true;
+            }
         }
         if ((read & writePages).any() || (write & readPages).any())
         {
@@ -1081,6 +1495,8 @@ struct GSGpuBackend::Impl
 
     void binTriangle(uint32_t prim, const GSTriangleRaster &tri, int x0, int y0, int x1, int y1)
     {
+        if (hwEnabled)
+            return;
         const int tile = static_cast<int>(kTileSize);
         const int tx0 = x0 / tile;
         const int tx1 = x1 / tile;
@@ -1117,6 +1533,13 @@ struct GSGpuBackend::Impl
     }
 
     void bin(uint32_t prim, int x0, int y0, int x1, int y1)
+    {
+        if (hwEnabled)
+            return;
+        binBox(prim, x0, y0, x1, y1);
+    }
+
+    void binBox(uint32_t prim, int x0, int y0, int x1, int y1)
     {
         const uint32_t tx0 = static_cast<uint32_t>(std::clamp(x0, 0, 2047)) / kTileSize;
         const uint32_t tx1 = static_cast<uint32_t>(std::clamp(x1, 0, 2047)) / kTileSize;
@@ -1225,7 +1648,7 @@ struct GSGpuBackend::Impl
         const GSVertex &v2 = batch.vertices[2];
         const auto &ctx = state.context;
         GSTriangleRaster tri;
-        if (!gsTriangleSetup(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, ctx.xyoffset.ofx, ctx.xyoffset.ofy, tri))
+        if (!gsTriangleSetup(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, ctx.xyoffset.ofx, ctx.xyoffset.ofy, tri, fastTriangleSetup))
             return;
         const int minX = std::max(tri.minX, static_cast<int>(ctx.scissor.x0));
         const int maxX = std::min(tri.maxX, static_cast<int>(ctx.scissor.x1));
@@ -1745,9 +2168,28 @@ void GSGpuBackend::SetAsyncPresentDefault(bool enabled)
 GSGpuBackend::GSGpuBackend()
     : m_impl(std::make_unique<Impl>(m_stats))
 {
+    const char *setting = std::getenv("PS2X_GS_TEXTURE_PAGE_CACHE");
+    m_impl->cacheTexturePages = !setting || std::string_view(setting) != "0";
+    setting = std::getenv("PS2X_GS_FAST_TRIANGLE_SETUP");
+    m_impl->fastTriangleSetup = !setting || std::string_view(setting) != "0";
 }
 
 GSGpuBackend::~GSGpuBackend() = default;
+
+void GSGpuBackend::SetTexturePageCacheEnabled(bool enabled)
+{
+    m_impl->cacheTexturePages = enabled;
+}
+
+void GSGpuBackend::SetFastTriangleSetupEnabled(bool enabled)
+{
+    m_impl->fastTriangleSetup = enabled;
+}
+
+void GSGpuBackend::SetHardwareRasterAllowed(bool allowed)
+{
+    m_impl->hwAllowed = allowed;
+}
 
 void GSGpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 {

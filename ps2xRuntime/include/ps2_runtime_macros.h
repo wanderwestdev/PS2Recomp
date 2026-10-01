@@ -925,6 +925,14 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
 #define GPR_S64(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0LL : PS2_EXTRACT_EPI64_0(ctx_ptr->r[reg_idx]))
 #define GPR_VEC(ctx_ptr, reg_idx) ((reg_idx == 0) ? _mm_setzero_si128() : ctx_ptr->r[reg_idx])
 
+static PS2_FORCEINLINE void Ps2SetGprScalar64(R5900Context *ctx, int reg, int64_t value)
+{
+    if (reg != 0)
+    {
+        std::memcpy(&ctx->r[reg], &value, sizeof(value));
+    }
+}
+
 static PS2_FORCEINLINE void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i new_low)
 {
     if (reg != 0)
@@ -938,9 +946,7 @@ static PS2_FORCEINLINE void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i n
     {                                                                     \
         if ((reg_idx) != 0)                                               \
         {                                                                 \
-            __m128i _newVal = _mm_cvtsi64_si128((int64_t)(int32_t)(val)); \
-                                                                          \
-            Ps2SetGprLow64(ctx_ptr, reg_idx, _newVal);                    \
+            Ps2SetGprScalar64(ctx_ptr, reg_idx, (int64_t)(int32_t)(val)); \
         }                                                                 \
     } while (0)
 
@@ -950,8 +956,7 @@ static PS2_FORCEINLINE void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i n
     {                                                                     \
         if ((reg_idx) != 0)                                               \
         {                                                                 \
-            __m128i _newVal = _mm_cvtsi64_si128((int64_t)(uint32_t)(val)); \
-            Ps2SetGprLow64(ctx_ptr, reg_idx, _newVal);                    \
+            Ps2SetGprScalar64(ctx_ptr, reg_idx, (int64_t)(uint32_t)(val)); \
         }                                                                 \
     } while (0)
 
@@ -960,8 +965,7 @@ static PS2_FORCEINLINE void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i n
     {                                                                     \
         if ((reg_idx) != 0)                                               \
         {                                                                 \
-            __m128i _newVal = _mm_cvtsi64_si128((int64_t)(int32_t)(val)); \
-            Ps2SetGprLow64(ctx_ptr, reg_idx, _newVal);                    \
+            Ps2SetGprScalar64(ctx_ptr, reg_idx, (int64_t)(int32_t)(val)); \
         }                                                                 \
     } while (0)
 
@@ -970,8 +974,7 @@ static PS2_FORCEINLINE void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i n
     {                                                            \
         if ((reg_idx) != 0)                                      \
         {                                                        \
-            __m128i _newVal = _mm_cvtsi64_si128((int64_t)(val)); \
-            Ps2SetGprLow64(ctx_ptr, reg_idx, _newVal);           \
+            Ps2SetGprScalar64(ctx_ptr, reg_idx, (int64_t)(val)); \
         }                                                        \
     } while (0)
 

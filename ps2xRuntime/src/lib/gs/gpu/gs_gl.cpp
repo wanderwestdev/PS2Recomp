@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <mutex>
+#include <string_view>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -32,12 +33,13 @@ namespace
         GSGL::GLsync produced = nullptr;
         GSGL::GLsync consumed = nullptr;
         GSGL::GLuint hashBuffer = 0;
+        GSGL::GLuint hashDeviceBuffer = 0;
         const uint32_t *hash = nullptr;
         bool reading = false;
     };
 
     std::mutex s_sharedMutex;
-    std::array<SharedSlot, 3> s_sharedSlots;
+    std::array<SharedSlot, 8> s_sharedSlots;
     GSGL::Api s_hostApi;
     HGLRC s_hostContext = nullptr;
     HDC s_hostDc = nullptr;
@@ -231,16 +233,34 @@ namespace GSGL
             }
             if (slot.hash)
             {
+                static const bool deviceHash = [] {
+                    const char *setting = std::getenv("PS2X_FRAME_HASH_DEVICE");
+                    return !setting || std::string_view(setting) != "0";
+                }();
+                if (deviceHash && !slot.hashDeviceBuffer)
+                {
+                    gl.GenBuffers(1, &slot.hashDeviceBuffer);
+                    gl.BindBuffer(kShaderStorageBuffer, slot.hashDeviceBuffer);
+                    gl.BufferData(kShaderStorageBuffer, 8, nullptr, kDynamicDraw);
+                }
+                const GLuint output = deviceHash ? slot.hashDeviceBuffer : slot.hashBuffer;
                 const uint32_t zero = 0u;
-                gl.BindBuffer(kShaderStorageBuffer, slot.hashBuffer);
+                gl.BindBuffer(kShaderStorageBuffer, output);
                 gl.ClearBufferData(kShaderStorageBuffer, kR32UI, kRedInteger, kUnsignedInt, &zero);
                 gl.BindBufferBase(kShaderStorageBuffer, 7u, buffer);
-                gl.BindBufferBase(kShaderStorageBuffer, 10u, slot.hashBuffer);
+                gl.BindBufferBase(kShaderStorageBuffer, 10u, output);
                 gl.MemBarrier(kAllBarrierBits);
                 gl.UseProgram(hashProgram);
                 gl.Uniform1ui(hashLocation, width * height);
                 gl.DispatchCompute((width * height + 255u) / 256u, 1u, 1u);
                 gl.MemBarrier(kAllBarrierBits);
+                if (deviceHash)
+                {
+                    gl.BindBuffer(kCopyReadBuffer, output);
+                    gl.BindBuffer(kCopyWriteBuffer, slot.hashBuffer);
+                    gl.CopyBufferSubData(kCopyReadBuffer, kCopyWriteBuffer, 0, 0, 8);
+                    gl.MemBarrier(kAllBarrierBits);
+                }
                 slot.frame.hashValid = true;
             }
         }
@@ -285,6 +305,8 @@ namespace GSGL
                 gl.DeleteTextures(1, &slot.frame.texture);
             if (slot.hashBuffer)
                 gl.DeleteBuffers(1, &slot.hashBuffer);
+            if (slot.hashDeviceBuffer)
+                gl.DeleteBuffers(1, &slot.hashDeviceBuffer);
             slot = {};
         }
         s_readingSlot = -1;
@@ -423,6 +445,25 @@ namespace GSGL
         load(a.TexParameteri, "glTexParameteri", missing);
         load(a.TexImage2D, "glTexImage2D", missing);
         load(a.TexSubImage2D, "glTexSubImage2D", missing);
+        {
+            std::string graphicsMissing;
+            load(a.GenFramebuffers, "glGenFramebuffers", graphicsMissing);
+            load(a.DeleteFramebuffers, "glDeleteFramebuffers", graphicsMissing);
+            load(a.BindFramebuffer, "glBindFramebuffer", graphicsMissing);
+            load(a.FramebufferParameteri, "glFramebufferParameteri", graphicsMissing);
+            load(a.Viewport, "glViewport", graphicsMissing);
+            load(a.DrawArrays, "glDrawArrays", graphicsMissing);
+            load(a.GenVertexArrays, "glGenVertexArrays", graphicsMissing);
+            load(a.DeleteVertexArrays, "glDeleteVertexArrays", graphicsMissing);
+            load(a.BindVertexArray, "glBindVertexArray", graphicsMissing);
+            load(a.Enable, "glEnable", graphicsMissing);
+            load(a.Disable, "glDisable", graphicsMissing);
+            std::string parallelMissing;
+            load(a.MaxShaderCompilerThreads, "glMaxShaderCompilerThreadsARB", parallelMissing);
+            if (!a.MaxShaderCompilerThreads)
+                load(a.MaxShaderCompilerThreads, "glMaxShaderCompilerThreadsKHR", parallelMissing);
+            a.graphics = graphicsMissing.empty();
+        }
         if (!missing.empty())
         {
             error = "missing GL functions: " + missing;

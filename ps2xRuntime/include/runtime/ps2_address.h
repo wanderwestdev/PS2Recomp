@@ -60,6 +60,8 @@ static PS2_FORCEINLINE constexpr bool Ps2IsPhysicalSpecialAddress(uint32_t physA
 
 static PS2_FORCEINLINE constexpr bool Ps2IsSpecialAddress(uint32_t addr)
 {
+    if (addr < PS2_IO_BASE)
+        return false;
     if (Ps2IsKseg23Address(addr))
         return true;
 

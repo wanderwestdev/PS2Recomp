@@ -1158,4 +1158,95 @@ void main()
     data[oy * width + ox] = outPixel;
 }
 )GLSL";
+
+    const char *const kHwVertex = R"GLSL(
+layout(std430, binding = 3) readonly buffer PrimBuffer { uint prims[]; };
+flat out uint vPrim;
+uniform uvec4 uHw;
+
+void main()
+{
+    uint p = uint(gl_VertexID) / 6u;
+    uint c = uint(gl_VertexID) % 6u;
+    uint header = prims[p * 40u];
+    vPrim = p;
+    if (uHw.x != 0u && (header & 0xFFu) == 2u)
+    {
+        vec2 v[3];
+        for (uint i = 0u; i < 3u; ++i)
+            v[i] = vec2(float(int(prims[p * 40u + 3u + i * 2u])), float(int(prims[p * 40u + 4u + i * 2u]))) / 16.0 + 0.5;
+        vec2 e0 = v[1] - v[0];
+        vec2 e1 = v[2] - v[0];
+        float orient = e0.x * e1.y - e0.y * e1.x >= 0.0 ? 1.0 : -1.0;
+        vec2 n[3];
+        bool usable = true;
+        for (uint i = 0u; i < 3u; ++i)
+        {
+            vec2 d = v[(i + 1u) % 3u] - v[i];
+            float len = length(d);
+            usable = usable && len > 1.0e-3;
+            n[i] = len > 1.0e-3 ? vec2(d.y, -d.x) * (orient / len) : vec2(0.0);
+        }
+        vec2 corner[3];
+        for (uint i = 0u; i < 3u; ++i)
+        {
+            vec2 a = n[(i + 2u) % 3u];
+            vec2 b = n[i];
+            float denom = 1.0 + dot(a, b);
+            usable = usable && denom > 1.0e-4;
+            corner[i] = v[i] + (a + b) * (0.75 / max(denom, 1.0e-4));
+        }
+        if (usable)
+        {
+            vec2 q = c < 3u ? corner[c] : corner[2];
+            gl_Position = vec4(q.x / 1024.0 - 1.0, q.y / 1024.0 - 1.0, 0.0, 1.0);
+            return;
+        }
+    }
+    uint xr = prims[p * 40u + 1u];
+    uint yr = prims[p * 40u + 2u];
+    float x0;
+    float x1;
+    float y0;
+    float y1;
+    if ((header & 0xFFu) == 0u)
+    {
+        x0 = float(xr);
+        x1 = x0 + 1.0;
+        y0 = float(yr);
+        y1 = y0 + 1.0;
+    }
+    else
+    {
+        x0 = float(xr & 0xFFFFu);
+        x1 = float(xr >> 16u) + 1.0;
+        y0 = float(yr & 0xFFFFu);
+        y1 = float(yr >> 16u) + 1.0;
+    }
+    bool right = c == 1u || c == 3u || c == 4u;
+    bool bottom = c == 2u || c == 4u || c == 5u;
+    gl_Position = vec4((right ? x1 : x0) / 1024.0 - 1.0, (bottom ? y1 : y0) / 1024.0 - 1.0, 0.0, 1.0);
+    vPrim = p;
+}
+)GLSL";
+
+    const char *const kHwFragmentMain = R"GLSL(
+layout(pixel_interlock_ordered) in;
+flat in uint vPrim;
+
+void main()
+{
+    int x = int(gl_FragCoord.x);
+    int y = int(gl_FragCoord.y);
+    uint s;
+    uint z;
+    uvec4 c;
+    uint fog;
+    bool shaded = coversPixel(vPrim, x, y) && shadePrim(vPrim, x, y, s, z, c, fog);
+    beginInvocationInterlockARB();
+    if (shaded)
+        writePixel(s, x, y, z, c, fog);
+    endInvocationInterlockARB();
+}
+)GLSL";
 }

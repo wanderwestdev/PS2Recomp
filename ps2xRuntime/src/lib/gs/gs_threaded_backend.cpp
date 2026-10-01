@@ -2,6 +2,7 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_gpu_backend.h"
 #include "runtime/gs/gs_shared_present.h"
+#include "ThreadPriority.h"
 #include "ThreadNaming.h"
 
 #include <atomic>
@@ -180,6 +181,7 @@ void GSThreadedBackend::Drain() const
 void GSThreadedBackend::WorkerLoop()
 {
     ThreadNaming::SetCurrentThreadName("GSThread");
+    ThreadPriority::RaiseCurrentThread(ThreadPriority::Level::AboveNormal);
     GSPrimitiveBatch draw;
     for (;;)
     {

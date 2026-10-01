@@ -13,4 +13,6 @@ namespace GSGpuShaders
     extern const char *const kClear;
     extern const char *const kPoke;
     extern const char *const kPresent;
+    extern const char *const kHwVertex;
+    extern const char *const kHwFragmentMain;
 }

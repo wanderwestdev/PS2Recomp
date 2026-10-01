@@ -12,8 +12,11 @@
 #include "Stubs/Helpers/Support.h"
 #include "Stubs/GS.h"
 #include "GuestKernelMemory.h"
+#include "gs/gs_triangle_rules.h"
 
 #include <atomic>
+#include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -415,6 +418,43 @@ void register_ps2_gs_tests()
 {
     MiniTest::Case("PS2GS", [](TestCase &tc)
     {
+        tc.Run("fast triangle setup preserves coordinate rounding and raster rules", [](TestCase &t)
+        {
+            bool exact = true;
+            for (int raw = -65536; raw <= 65536; ++raw)
+            {
+                const float center = (static_cast<float>(raw) + 0.5f) / 16.0f;
+                const float values[] = {static_cast<float>(raw) / 16.0f, center,
+                                        std::nextafter(center, -INFINITY), std::nextafter(center, INFINITY)};
+                for (float value : values)
+                    exact = exact && gsRoundCoordinate(value, true) == std::llround(static_cast<double>(value) * 16.0);
+            }
+            for (float value : {-1000000.0f, 1000000.0f, -0.0f, 0.0f})
+                exact = exact && gsRoundCoordinate(value, true) == std::llround(static_cast<double>(value) * 16.0);
+            uint32_t random = 0x9137AB42u;
+            for (int sample = 0; sample < 16384; ++sample)
+            {
+                float vertex[6];
+                for (float &value : vertex)
+                {
+                    random = random * 1664525u + 1013904223u;
+                    value = static_cast<float>(static_cast<int>(random & 0x1FFFFu) - 65536) / 32.0f;
+                }
+                GSTriangleRaster reference{}, candidate{};
+                const int ofx = static_cast<int>(random & 0xFFFFu), ofy = static_cast<int>(random >> 16);
+                const bool a = gsTriangleSetup(vertex[0], vertex[1], vertex[2], vertex[3], vertex[4], vertex[5], ofx, ofy, reference);
+                const bool b = gsTriangleSetup(vertex[0], vertex[1], vertex[2], vertex[3], vertex[4], vertex[5], ofx, ofy, candidate, true);
+                exact = exact && a == b;
+                for (int lane = 0; lane < 3; ++lane)
+                    exact = exact && reference.x[lane] == candidate.x[lane] && reference.y[lane] == candidate.y[lane] &&
+                            reference.a[lane] == candidate.a[lane] && reference.b[lane] == candidate.b[lane] &&
+                            reference.c[lane] == candidate.c[lane] && reference.bias[lane] == candidate.bias[lane];
+                exact = exact && reference.area == candidate.area && reference.invArea == candidate.invArea &&
+                        reference.minX == candidate.minX && reference.maxX == candidate.maxX &&
+                        reference.minY == candidate.minY && reference.maxY == candidate.maxY && reference.winding == candidate.winding;
+            }
+            t.IsTrue(exact, "halfway, neighboring, signed, fallback and random coordinates must preserve all raster results");
+        });
         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
         {
             PS2Memory mem;

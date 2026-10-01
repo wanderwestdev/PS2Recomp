@@ -20,6 +20,15 @@ namespace GSGL
 
     constexpr GLenum kShaderStorageBuffer = 0x90D2;
     constexpr GLenum kComputeShader = 0x91B9;
+    constexpr GLenum kVertexShader = 0x8B31;
+    constexpr GLenum kFragmentShader = 0x8B30;
+    constexpr GLenum kFramebuffer = 0x8D40;
+    constexpr GLenum kFramebufferDefaultWidth = 0x9310;
+    constexpr GLenum kFramebufferDefaultHeight = 0x9311;
+    constexpr GLenum kTriangles = 0x0004;
+    constexpr GLenum kConservativeRasterizationNV = 0x9346;
+    constexpr GLenum kNoError = 0;
+    constexpr GLenum kCompletionStatus = 0x91B1;
     constexpr GLenum kCompileStatus = 0x8B81;
     constexpr GLenum kLinkStatus = 0x8B82;
     constexpr GLenum kInfoLogLength = 0x8B84;
@@ -121,6 +130,19 @@ namespace GSGL
         void (*TexParameteri)(GLenum, GLenum, GLint) = nullptr;
         void (*TexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *) = nullptr;
         void (*TexSubImage2D)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *) = nullptr;
+        void (*GenFramebuffers)(GLsizei, GLuint *) = nullptr;
+        void (*DeleteFramebuffers)(GLsizei, const GLuint *) = nullptr;
+        void (*BindFramebuffer)(GLenum, GLuint) = nullptr;
+        void (*FramebufferParameteri)(GLenum, GLenum, GLint) = nullptr;
+        void (*Viewport)(GLint, GLint, GLsizei, GLsizei) = nullptr;
+        void (*DrawArrays)(GLenum, GLint, GLsizei) = nullptr;
+        void (*GenVertexArrays)(GLsizei, GLuint *) = nullptr;
+        void (*DeleteVertexArrays)(GLsizei, const GLuint *) = nullptr;
+        void (*BindVertexArray)(GLuint) = nullptr;
+        void (*Enable)(GLenum) = nullptr;
+        void (*Disable)(GLenum) = nullptr;
+        void (*MaxShaderCompilerThreads)(GLuint) = nullptr;
+        bool graphics = false;
     };
 
     class Context

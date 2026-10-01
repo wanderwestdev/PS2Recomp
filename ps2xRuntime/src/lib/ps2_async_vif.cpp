@@ -2,6 +2,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
+#include "ThreadPriority.h"
 #include "ThreadNaming.h"
 
 #include <atomic>
@@ -124,6 +125,7 @@ namespace ps2x::asyncvif
         void runGif(GifStage &stage)
         {
             ThreadNaming::SetCurrentThreadName("GIFThread");
+            ThreadPriority::RaiseCurrentThread(ThreadPriority::Level::AboveNormal);
             t_onGifStage = true;
             for (;;)
             {
@@ -159,6 +161,7 @@ namespace ps2x::asyncvif
         void run(Worker &worker)
         {
             ThreadNaming::SetCurrentThreadName("VUThread");
+            ThreadPriority::RaiseCurrentThread(ThreadPriority::Level::Highest);
             t_onWorker = true;
             const char *statsValue = std::getenv("PS2X_MTVU_STATS");
             const bool stats = statsValue && *statsValue && *statsValue != '0';
