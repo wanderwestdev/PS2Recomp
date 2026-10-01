@@ -60,6 +60,9 @@ private:
         TextureFlush,
         WriteVram,
         Sync,
+        Present,
+        DrawState,
+        Vertices,
         Call,
     };
 
@@ -68,13 +71,17 @@ private:
     void Drain() const;
     void RunOnWorker(const std::function<void()> &function) const;
     void WorkerLoop();
-    void Execute(const std::vector<uint8_t> &chunk);
+    void Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBatch &draw);
 
     std::unique_ptr<GSRasterBackend> m_inner;
 
     mutable std::mutex m_producerMutex;
     std::vector<uint8_t> m_open;
     uint32_t m_lastMxcsr = UINT32_MAX;
+    GSDrawState m_lastDrawState{};
+    bool m_drawStateValid = false;
+    bool m_compactQueue = true;
+    size_t m_queueChunkLimit = 8u;
 
     mutable std::mutex m_queueMutex;
     mutable std::condition_variable m_workCv;

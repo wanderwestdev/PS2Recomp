@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstring>
 #include <vector>
+#include <cstdlib>
+#include <smmintrin.h>
 
 enum VIFCmd : uint8_t
 {
@@ -83,7 +85,7 @@ namespace
     }
 
     template <uint32_t Vl, uint32_t Components, bool ZeroExtend, uint32_t Mode>
-    void unpackFast(uint8_t *vuData, uint32_t vuAddr, const uint8_t *src, uint32_t count, uint32_t cl, uint32_t wl, uint32_t *row)
+    void unpackScalarFast(uint8_t *vuData, uint32_t vuAddr, const uint8_t *src, uint32_t count, uint32_t cl, uint32_t wl, uint32_t *row)
     {
         constexpr uint32_t bytesPerComponent = Vl == 0u ? 4u : (Vl == 1u ? 2u : 1u);
         constexpr uint32_t bytesPerVector = bytesPerComponent * Components;
@@ -128,6 +130,77 @@ namespace
                 destVec += cl - wl;
             }
         }
+    }
+
+    bool simdUnpackEnabled()
+    {
+        static const bool enabled = []
+        {
+            const char *value = std::getenv("PS2X_VIF_SIMD_UNPACK");
+            return !value || *value != '0';
+        }();
+        return enabled;
+    }
+
+    template <uint32_t Vl, uint32_t Components, bool ZeroExtend, uint32_t Mode>
+    void unpackFast(uint8_t *vuData, uint32_t vuAddr, const uint8_t *src, uint32_t count, uint32_t cl, uint32_t wl, uint32_t *row)
+    {
+        if (!simdUnpackEnabled())
+        {
+            unpackScalarFast<Vl, Components, ZeroExtend, Mode>(vuData, vuAddr, src, count, cl, wl, row);
+            return;
+        }
+        constexpr uint32_t bytes = (Vl == 0u ? 4u : Vl == 1u ? 2u : 1u) * Components;
+        const __m128i mask = _mm_setr_epi32(-1, Components > 1u ? -1 : 0, Components > 2u ? -1 : 0, Components > 3u ? -1 : 0);
+        __m128i rowValue = _mm_loadu_si128(reinterpret_cast<const __m128i *>(row));
+        uint32_t destVec = vuAddr;
+        uint32_t cyclePos = 0u;
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            const uint8_t *source = src + index * bytes;
+            __m128i value;
+            if constexpr (Vl == 0u)
+            {
+                if constexpr (Components == 4u)
+                    value = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source));
+                else
+                {
+                    alignas(16) uint32_t lanes[4]{};
+                    std::memcpy(lanes, source, bytes);
+                    value = _mm_load_si128(reinterpret_cast<const __m128i *>(lanes));
+                }
+            }
+            else
+            {
+                uint64_t packed = 0u;
+                std::memcpy(&packed, source, bytes);
+                const __m128i raw = _mm_cvtsi64_si128(static_cast<int64_t>(packed));
+                if constexpr (Vl == 1u)
+                    value = ZeroExtend ? _mm_cvtepu16_epi32(raw) : _mm_cvtepi16_epi32(raw);
+                else
+                    value = ZeroExtend ? _mm_cvtepu8_epi32(raw) : _mm_cvtepi8_epi32(raw);
+            }
+            auto *destination = reinterpret_cast<__m128i *>(vuData + (destVec & 0x3FFu) * 16u);
+            if constexpr (Components == 1u)
+                value = _mm_shuffle_epi32(value, 0u);
+            else if constexpr (Components < 4u)
+                value = _mm_or_si128(_mm_and_si128(mask, value), _mm_andnot_si128(mask, _mm_loadu_si128(destination)));
+            if constexpr (Mode != 0u)
+            {
+                value = _mm_add_epi32(value, rowValue);
+                if constexpr (Mode == 2u)
+                    rowValue = value;
+            }
+            _mm_storeu_si128(destination, value);
+            ++destVec;
+            if (++cyclePos == wl)
+            {
+                cyclePos = 0u;
+                destVec += cl - wl;
+            }
+        }
+        if constexpr (Mode == 2u)
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(row), rowValue);
     }
 
     template <uint32_t Vl, uint32_t Components>

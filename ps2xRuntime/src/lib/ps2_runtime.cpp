@@ -8,6 +8,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_shared_present.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "GuestKernelMemory.h"
@@ -31,6 +32,7 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include <rlgl.h>
 
 namespace ps2_stubs
 {
@@ -489,12 +491,16 @@ namespace
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight,
+                        bool hashImages, GSSharedPresent::Frame &diagnostic)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static uint32_t s_lastWidth = 0u;
     static uint32_t s_lastHeight = 0u;
     static std::vector<uint8_t> s_scratch;
+    static uint64_t s_lastHash = 0u;
+    diagnostic.contentHash = s_lastHash;
+    diagnostic.hashValid = hashImages && s_lastWidth != 0u && s_lastHeight != 0u;
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     if (currentTick == s_lastPresentationTick)
@@ -505,11 +511,17 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     }
     s_lastPresentationTick = currentTick;
     rt->gs().latchHostPresentationFrame();
+    if (GSSharedPresent::Active())
+    {
+        outWidth = outHeight = 0u;
+        return;
+    }
 
     uint32_t width = 0u;
     uint32_t height = 0u;
     if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch, width, height) || width == 0u || height == 0u)
     {
+        diagnostic.hashValid = false;
         outWidth = s_lastWidth = 0u;
         outHeight = s_lastHeight = 0u;
         return;
@@ -525,6 +537,31 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
     }
     UpdateTexture(tex, s_scratch.data());
+    if (hashImages)
+    {
+        const auto mix = [](uint32_t value)
+        {
+            value ^= value >> 16u;
+            value *= 0x7feb352du;
+            value ^= value >> 15u;
+            value *= 0x846ca68bu;
+            return value ^ (value >> 16u);
+        };
+        uint32_t sum = 0u;
+        uint32_t hashXor = 0u;
+        for (uint32_t i = 0u; i < width * height; ++i)
+        {
+            uint32_t pixel;
+            std::memcpy(&pixel, s_scratch.data() + static_cast<size_t>(i) * 4u, sizeof(pixel));
+            const uint32_t value = mix(pixel ^ mix(i + 1u));
+            sum += value;
+            hashXor ^= mix(value ^ 0x9e3779b9u);
+        }
+        diagnostic.contentHash = s_lastHash = static_cast<uint64_t>(sum) | (static_cast<uint64_t>(hashXor) << 32u);
+        diagnostic.width = width;
+        diagnostic.height = height;
+        diagnostic.hashValid = true;
+    }
     outWidth = s_lastWidth = width;
     outHeight = s_lastHeight = height;
 }
@@ -796,22 +833,25 @@ bool PS2Runtime::initialize(const char *title)
             return false;
         }
 
-        if (!syncCoreSubsystems())
-        {
-            std::cerr << "Failed to bind runtime core subsystems" << std::endl;
-            return false;
-        }
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_ALWAYS_RUN);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         if (ps2_host_display::startMaximized)
             MaximizeWindow();
         SetExitKey(KEY_NULL);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        GSSharedPresent::CaptureHostContext();
 #endif
+        const bool coreReady = syncCoreSubsystems();
+        GSSharedPresent::RestoreHostContext();
+        if (!coreReady)
+        {
+            std::cerr << "Failed to bind runtime core subsystems" << std::endl;
+            return false;
+        }
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
         {
@@ -2507,8 +2547,49 @@ void PS2Runtime::run()
 
     bool restoreMaximized = false;
     uint64_t tick = 0;
+    std::ofstream frameTimes;
+    if (const char *path = std::getenv("PS2X_FRAME_TIMES"); path && *path)
+    {
+        frameTimes.open(path);
+        if (frameTimes)
+            frameTimes << "seconds,field,source_sequence,render_revision,new_source,interval_ms,submit_ms,swap_ms,shared,hash_valid,image_hash,image_changed\n";
+        else
+            std::cerr << "[gs-present] cannot write frame times: " << path << '\n';
+    }
+    using PresentClock = std::chrono::steady_clock;
+    const auto presentStart = PresentClock::now();
+    auto lastSwap = presentStart;
+    const bool tracingFrames = frameTimes.is_open() && frameTimes.good();
+    std::vector<uint64_t> screenshotFields;
+    if (const char *fields = std::getenv("PS2X_SCREENSHOT_FIELDS"))
+    {
+        std::istringstream input(fields);
+        std::string value;
+        while (std::getline(input, value, ','))
+            screenshotFields.push_back(std::strtoull(value.c_str(), nullptr, 10));
+        std::sort(screenshotFields.rbegin(), screenshotFields.rend());
+    }
+    uint64_t lastSource = 0u;
+    const char *hashSetting = std::getenv("PS2X_FRAME_HASH");
+    const bool hashImages = hashSetting && *hashSetting == '1';
+    uint64_t lastHash = 0u;
+    uint32_t lastHashWidth = 0u;
+    uint32_t lastHashHeight = 0u;
+    bool hadHash = false;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        if (IsWindowMinimized())
+        {
+            PollInputEvents();
+            ps2_host_input::sample();
+            if (WindowShouldClose())
+            {
+                requestStop();
+                break;
+            }
+            WaitTime(1.0 / 120.0);
+            continue;
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
@@ -2542,13 +2623,35 @@ void PS2Runtime::run()
             }
         });
         ps2_host_display::updateWindowAspect();
+        const auto submitStart = tracingFrames ? PresentClock::now() : presentStart;
         uint32_t presentWidth = 0u;
         uint32_t presentHeight = 0u;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        GSSharedPresent::Frame sharedFrame;
+        UploadFrame(frameTex, this, presentWidth, presentHeight, hashImages, sharedFrame);
+        Texture2D displayTex = frameTex;
+        const bool shared = GSSharedPresent::Active();
+        if (shared)
+        {
+            sharedFrame = {};
+            displayTex = {};
+            presentWidth = presentHeight = 0u;
+            if (GSSharedPresent::Acquire(sharedFrame))
+            {
+                displayTex = Texture2D{sharedFrame.texture, static_cast<int>(sharedFrame.width),
+                                       static_cast<int>(sharedFrame.height), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                presentWidth = sharedFrame.width;
+                presentHeight = sharedFrame.height;
+            }
+        }
+        else
+        {
+            sharedFrame.width = presentWidth;
+            sharedFrame.height = presentHeight;
+        }
 
         BeginDrawing();
         ClearBackground(BLACK);
-        if (frameTex.id != 0 && presentWidth != 0u && presentHeight != 0u)
+        if (displayTex.id != 0 && presentWidth != 0u && presentHeight != 0u)
         {
             const float screenWidth = static_cast<float>(GetScreenWidth());
             const float screenHeight = static_cast<float>(GetScreenHeight());
@@ -2566,7 +2669,7 @@ void PS2Runtime::run()
             }
             const Rectangle srcRect{0.0f, 0.0f, static_cast<float>(presentWidth), static_cast<float>(presentHeight)};
             const Rectangle dstRect{(screenWidth - dstWidth) * 0.5f, (screenHeight - dstHeight) * 0.5f, dstWidth, dstHeight};
-            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+            DrawTexturePro(displayTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
@@ -2583,7 +2686,42 @@ void PS2Runtime::run()
                 DrawText(stateText.c_str(), 24, 20, fontSize, Fade(RAYWHITE, stateAlpha));
             }
         }
+        if (!screenshotFields.empty() && eeScheduler().currentVSyncTick() >= screenshotFields.back())
+        {
+            if (const char *directory = std::getenv("PS2X_SCREENSHOT_DIR"))
+            {
+                const auto path = std::filesystem::path(directory) / ("field-" + std::to_string(eeScheduler().currentVSyncTick()) + ".png");
+                rlDrawRenderBatchActive();
+                const Image screen = LoadImageFromScreen();
+                ExportImage(screen, path.string().c_str());
+                UnloadImage(screen);
+            }
+            screenshotFields.pop_back();
+        }
+        const auto swapStart = tracingFrames ? PresentClock::now() : presentStart;
         EndDrawing();
+        if (tracingFrames)
+        {
+            const auto now = PresentClock::now();
+            const uint64_t field = eeScheduler().currentVSyncTick();
+            const uint64_t source = shared ? sharedFrame.sequence : field;
+            frameTimes << std::chrono::duration<double>(now - presentStart).count() << ',' << field << ','
+                       << source << ',' << sharedFrame.renderSequence << ','
+                       << (shared ? static_cast<int>(source != 0u && source != lastSource) : -1) << ','
+                       << std::chrono::duration<double, std::milli>(now - lastSwap).count() << ','
+                       << std::chrono::duration<double, std::milli>(swapStart - submitStart).count() << ','
+                       << std::chrono::duration<double, std::milli>(now - swapStart).count() << ',' << shared;
+            const bool imageChanged = sharedFrame.hashValid && (!hadHash || sharedFrame.contentHash != lastHash ||
+                                      sharedFrame.width != lastHashWidth || sharedFrame.height != lastHashHeight);
+            frameTimes << ',' << sharedFrame.hashValid << ',' << sharedFrame.contentHash << ','
+                       << (sharedFrame.hashValid ? static_cast<int>(imageChanged) : -1) << '\n';
+            hadHash = sharedFrame.hashValid;
+            lastHash = sharedFrame.contentHash;
+            lastHashWidth = sharedFrame.width;
+            lastHashHeight = sharedFrame.height;
+            lastSource = source;
+            lastSwap = now;
+        }
 #if !defined(PLATFORM_VITA)
         if (IsKeyPressed(KEY_F11))
         {
@@ -2623,6 +2761,7 @@ void PS2Runtime::run()
     }
     if (frameTex.id != 0)
         UnloadTexture(frameTex);
+    GSSharedPresent::ShutdownHost();
     ps2_host_input::releaseMouse();
     CloseWindow();
 

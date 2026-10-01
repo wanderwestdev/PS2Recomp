@@ -3328,10 +3328,32 @@ struct VU1InterpreterAccess
         return _mm_andnot_ps(_mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u))), normalized);
     }
 
+    static VU1_FORCE_INLINE bool simdClipEnabled()
+    {
+        static const bool enabled = []
+        {
+            const char *value = std::getenv("PS2X_VU1_SIMD_CLIP");
+            return !value || *value != '0';
+        }();
+        return enabled;
+    }
+
     static VU1_FORCE_INLINE void clipOp(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, __m128 fsRaw, __m128 ftRaw)
     {
         const uint32_t wBits = static_cast<uint32_t>(_mm_extract_ps(ftRaw, 3));
         const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
+        if (simdClipEnabled())
+        {
+            const __m128i bits = _mm_castps_si128(fsRaw);
+            const __m128i bounds = _mm_set1_epi32(limit);
+            const uint32_t positive = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(bits, bounds)))) & 7u;
+            const uint32_t negative = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(
+                _mm_xor_si128(bits, _mm_set1_epi32(static_cast<int32_t>(0x80000000u))), bounds)))) & 7u;
+            const uint32_t plus = (positive & 1u) | ((positive & 2u) << 1u) | ((positive & 4u) << 2u);
+            const uint32_t minus = ((negative & 1u) << 1u) | ((negative & 2u) << 2u) | ((negative & 4u) << 3u);
+            queueClipAt(vu, ctx, cycle, plus | minus);
+            return;
+        }
         alignas(16) uint32_t lanes[4];
         _mm_store_ps(reinterpret_cast<float *>(lanes), fsRaw);
         uint32_t flags = 0u;

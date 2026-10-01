@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_gpu_backend.h"
+#include "runtime/gs/gs_shared_present.h"
 #include "runtime/gs/gs_swizzle.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "../gs_cpu_backend_internal.h"
@@ -15,6 +16,8 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <filesystem>
+#include <fstream>
 
 using namespace GSGL;
 using namespace GSCpuInternal;
@@ -121,6 +124,7 @@ namespace
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t displayFbp = 0;
+        uint64_t sequence = 0u;
     };
 
     struct Program
@@ -226,6 +230,7 @@ struct GSGpuBackend::Impl
     Program clear;
     Program poke;
     Program present;
+    Program presentHash;
     Program pageCopy;
 
     std::vector<uint32_t> prims;
@@ -266,7 +271,13 @@ struct GSGpuBackend::Impl
 
     std::array<Readback, 3> readbacks{};
     uint32_t readbackNext = 0u;
+    uint64_t readbackSequence = 0u;
+    uint64_t lastFrameSequence = 0u;
     PresentationFrame lastFrame;
+    uint64_t contentRevision = 1u;
+    uint64_t presentedRevision = 0u;
+    std::array<uint64_t, 7> presentedCrtc{};
+    uint64_t renderedSequence = 0u;
 
     struct PresentStats
     {
@@ -285,6 +296,9 @@ struct GSGpuBackend::Impl
         uint64_t transfers = 0u;
         uint64_t lastPrims = 0u;
         uint32_t drawn = 0u;
+        uint32_t readbackSkips = 0u;
+        uint32_t sharedSkips = 0u;
+        uint32_t composites = 0u;
     } presentStats;
 
     struct GpuProf
@@ -466,6 +480,8 @@ struct GSGpuBackend::Impl
         if (initialized)
         {
             const Api &gl = context.gl();
+            if (context.Shared())
+                DestroyShared(gl);
             for (Readback &slot : readbacks)
             {
                 if (slot.fence)
@@ -478,7 +494,7 @@ struct GSGpuBackend::Impl
                     gl.DeleteQueries(1, &query);
             const GLuint buffers[] = {vramBuffer, swizzleBuffer, clutBuffer, primBuffer, stateBuffer, tileBuffer, tileListBuffer, dataBuffer, clutOpBuffer, pageMapBuffer};
             gl.DeleteBuffers(static_cast<GLsizei>(std::size(buffers)), buffers);
-            for (Program *program : {&raster, &clutLoad, &upload, &copyRead, &copyWrite, &clear, &poke, &present, &pageCopy})
+            for (Program *program : {&raster, &clutLoad, &upload, &copyRead, &copyWrite, &clear, &poke, &present, &presentHash, &pageCopy})
                 if (program->id)
                     gl.DeleteProgram(program->id);
         }
@@ -501,6 +517,7 @@ struct GSGpuBackend::Impl
 
     size_t ringPut(const void *data, size_t size)
     {
+        const size_t payloadSize = size;
         size = std::max<size_t>(size, 16u);
         if (!ring || size > kRingChunk)
             return SIZE_MAX;
@@ -519,7 +536,11 @@ struct GSGpuBackend::Impl
         }
         const size_t offset = static_cast<size_t>(ringChunk) * kRingChunk + ringOffset;
         if (data)
-            std::memcpy(ring + offset, data, size);
+        {
+            std::memcpy(ring + offset, data, payloadSize);
+            if (payloadSize < size)
+                std::memset(ring + offset + payloadSize, 0, size - payloadSize);
+        }
         ringOffset += size;
         return offset;
     }
@@ -548,6 +569,65 @@ struct GSGpuBackend::Impl
     bool compile(Program &program, const std::string &prefix, const char *body, std::initializer_list<const char *> uniforms)
     {
         const std::string source = prefix + GSGpuShaders::kCommon + body;
+        const auto fingerprint = [](const void *data, size_t size)
+        {
+            uint64_t value = 14695981039346656037ull;
+            const auto *bytes = static_cast<const uint8_t *>(data);
+            for (size_t i = 0; i < size; ++i)
+                value = (value ^ bytes[i]) * 1099511628211ull;
+            return value;
+        };
+        const auto bindUniforms = [&]
+        {
+            size_t index = 0u;
+            for (const char *name : uniforms)
+                program.loc[index++] = gl().GetUniformLocation(program.id, name);
+        };
+        const std::string driver = std::string(reinterpret_cast<const char *>(gl().GetString(kVendor))) + "\n" +
+            reinterpret_cast<const char *>(gl().GetString(kRenderer)) + "\n" + reinterpret_cast<const char *>(gl().GetString(kVersion));
+        std::filesystem::path cachePath;
+        const char *cache = std::getenv("PS2X_GS_SHADER_CACHE");
+        if (!cache || *cache != '0')
+            if (const char *directory = std::getenv("PS2X_GS_SHADER_CACHE_DIR"))
+            {
+                const std::string key = driver + "\n" + source;
+                char name[32];
+                std::snprintf(name, sizeof(name), "%016llx.glbin", static_cast<unsigned long long>(fingerprint(key.data(), key.size())));
+                cachePath = std::filesystem::path(directory) / name;
+            }
+        if (!cachePath.empty())
+        {
+            std::ifstream input(cachePath, std::ios::binary);
+            std::array<uint32_t, 5> header{};
+            uint64_t checksum = 0u;
+            input.read(reinterpret_cast<char *>(header.data()), sizeof(header));
+            input.read(reinterpret_cast<char *>(&checksum), sizeof(checksum));
+            if (input && header[0] == 0x31425347u && header[2] == driver.size() && header[3] == source.size() &&
+                header[4] != 0u && header[4] <= 256u * 1024u * 1024u)
+            {
+                std::string storedDriver(driver.size(), '\0');
+                std::string storedSource(source.size(), '\0');
+                std::vector<uint8_t> binary(header[4]);
+                input.read(storedDriver.data(), storedDriver.size());
+                input.read(storedSource.data(), storedSource.size());
+                input.read(reinterpret_cast<char *>(binary.data()), binary.size());
+                if (input && storedDriver == driver && storedSource == source && fingerprint(binary.data(), binary.size()) == checksum)
+                {
+                    program.id = gl().CreateProgram();
+                    gl().ProgramBinary(program.id, header[1], binary.data(), static_cast<GLsizei>(binary.size()));
+                    GLint linked = 0;
+                    gl().GetProgramiv(program.id, kLinkStatus, &linked);
+                    if (linked)
+                    {
+                        bindUniforms();
+                        std::fprintf(stderr, "[gs-gpu] shader binary cache hit %s\n", cachePath.filename().string().c_str());
+                        return true;
+                    }
+                    gl().DeleteProgram(program.id);
+                    program.id = 0u;
+                }
+            }
+        }
         const char *text = source.c_str();
         const GLuint shader = gl().CreateShader(kComputeShader);
         gl().ShaderSource(shader, 1, &text, nullptr);
@@ -566,6 +646,8 @@ struct GSGpuBackend::Impl
             return false;
         }
         program.id = gl().CreateProgram();
+        if (!cachePath.empty())
+            gl().ProgramParameteri(program.id, kProgramBinaryRetrievableHint, 1);
         gl().AttachShader(program.id, shader);
         gl().LinkProgram(program.id);
         gl().DeleteShader(shader);
@@ -580,9 +662,33 @@ struct GSGpuBackend::Impl
             std::fflush(stderr);
             return false;
         }
-        size_t index = 0;
-        for (const char *name : uniforms)
-            program.loc[index++] = gl().GetUniformLocation(program.id, name);
+        bindUniforms();
+        if (!cachePath.empty())
+        {
+            GLint length = 0;
+            gl().GetProgramiv(program.id, kProgramBinaryLength, &length);
+            if (length > 0 && length <= 256 * 1024 * 1024)
+            {
+                std::vector<uint8_t> binary(static_cast<size_t>(length));
+                GLsizei written = 0;
+                GLenum format = 0u;
+                gl().GetProgramBinary(program.id, length, &written, &format, binary.data());
+                if (written > 0)
+                {
+                    const std::array<uint32_t, 5> header = {0x31425347u, format, static_cast<uint32_t>(driver.size()),
+                        static_cast<uint32_t>(source.size()), static_cast<uint32_t>(written)};
+                    const uint64_t checksum = fingerprint(binary.data(), static_cast<size_t>(written));
+                    std::error_code error;
+                    std::filesystem::create_directories(cachePath.parent_path(), error);
+                    std::ofstream output(cachePath, std::ios::binary | std::ios::trunc);
+                    output.write(reinterpret_cast<const char *>(header.data()), sizeof(header));
+                    output.write(reinterpret_cast<const char *>(&checksum), sizeof(checksum));
+                    output.write(driver.data(), driver.size());
+                    output.write(source.data(), source.size());
+                    output.write(reinterpret_cast<const char *>(binary.data()), written);
+                }
+            }
+        }
         return true;
     }
 
@@ -654,6 +760,17 @@ struct GSGpuBackend::Impl
         {
             failed = true;
             return false;
+        }
+        const char *hashValue = std::getenv("PS2X_FRAME_HASH");
+        if (context.Shared() && hashValue && *hashValue == '1')
+        {
+            if (!compile(presentHash, prefix, GSGpuShaders::kPresentHash, {"uPixels"}))
+            {
+                if (presentHash.id)
+                    gl().DeleteProgram(presentHash.id);
+                presentHash = {};
+                std::fprintf(stderr, "[gs-present] image hashing unavailable\n");
+            }
         }
         initialized = true;
         if (hostVram)
@@ -1467,14 +1584,13 @@ struct GSGpuBackend::Impl
         transferState.y = transfer.trxpos.dsay + (transferState.copiedPixels / transfer.trxreg.rrw);
     }
 
-    void harvest(Readback &slot, bool wait)
+    void harvest(Readback &slot)
     {
         if (!slot.fence)
             return;
         const auto waitStart = std::chrono::steady_clock::now();
-        const GLenum status = gl().ClientWaitSync(slot.fence, wait ? kSyncFlushCommandsBit : 0u, wait ? 1000000000ull : 0ull);
-        if (wait)
-            presentStats.wait += std::chrono::steady_clock::now() - waitStart;
+        const GLenum status = gl().ClientWaitSync(slot.fence, 0u, 0ull);
+        presentStats.wait += std::chrono::steady_clock::now() - waitStart;
         if (status != kAlreadySignaled && status != kConditionSatisfied)
             return;
         gl().DeleteSync(slot.fence);
@@ -1487,6 +1603,9 @@ struct GSGpuBackend::Impl
             ++presentStats.gpuFrames;
             slot.query = 0u;
         }
+        if (slot.sequence <= lastFrameSequence)
+            return;
+        lastFrameSequence = slot.sequence;
         lastFrame.width = slot.width;
         lastFrame.height = slot.height;
         lastFrame.displayFbp = slot.displayFbp;
@@ -1498,8 +1617,16 @@ struct GSGpuBackend::Impl
 
     PresentationFrame presentAsync(uint32_t width, uint32_t height, uint32_t displayFbp)
     {
+        for (uint32_t i = 0; i < readbacks.size(); ++i)
+            harvest(readbacks[(readbackNext + i) % readbacks.size()]);
         Readback &slot = readbacks[readbackNext];
-        harvest(slot, true);
+        if (slot.fence)
+        {
+            ++presentStats.readbackSkips;
+            if (presentStats.enabled)
+                reportPresentStats();
+            return lastFrame;
+        }
         const size_t bytes = static_cast<size_t>(width) * height * 4u;
         if (slot.capacity < bytes)
         {
@@ -1533,9 +1660,10 @@ struct GSGpuBackend::Impl
         slot.width = width;
         slot.height = height;
         slot.displayFbp = displayFbp;
+        slot.sequence = ++readbackSequence;
         readbackNext = (readbackNext + 1u) % static_cast<uint32_t>(readbacks.size());
         for (uint32_t i = 0; i < readbacks.size(); ++i)
-            harvest(readbacks[(readbackNext + i) % readbacks.size()], false);
+            harvest(readbacks[(readbackNext + i) % readbacks.size()]);
         if (presentStats.enabled)
         {
             GLuint &query = presentStats.queries[presentStats.queryNext];
@@ -1561,16 +1689,20 @@ struct GSGpuBackend::Impl
             return;
         const double frames = s.frames;
         std::fprintf(stderr,
-                     "[gs-gpu] %.1f presents/s, %.1f drawn/s, GPU %.2f ms/frame, wait %.2f ms/frame, flush %.2f ms/frame, "
-                     "%.1f batches, %.1f clut loads, %.1f transfers per frame\n",
+                     "[gs-gpu] %.1f presents/s, %.1f drawn/s, GPU interval %.2f ms/frame (%s), wait %.2f ms/frame, flush %.2f ms/frame, "
+                     "%.1f batches, %.1f clut loads, %.1f transfers per frame, %u readback skips, %u shared skips, %.1f composites/s\n",
                      frames / window, s.drawn / window, s.gpuFrames ? s.gpuNs / 1e6 / s.gpuFrames : 0.0,
+                     s.gpuFrames ? "sampled" : "unavailable",
                      std::chrono::duration<double, std::milli>(s.wait).count() / frames,
                      std::chrono::duration<double, std::milli>(s.submit).count() / frames,
                      (stats.batches - s.batches) / frames, (stats.clutLoads - s.clutLoads) / frames,
-                     (stats.flushOther - s.transfers) / frames);
+                     (stats.flushOther - s.transfers) / frames, s.readbackSkips, s.sharedSkips, s.composites / window);
         std::fflush(stderr);
         s.frames = 0u;
         s.drawn = 0u;
+        s.readbackSkips = 0u;
+        s.sharedSkips = 0u;
+        s.composites = 0u;
         s.gpuNs = 0u;
         s.gpuFrames = 0u;
         s.wait = {};
@@ -1631,6 +1763,7 @@ void GSGpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 void GSGpuBackend::Reset()
 {
     Impl &d = *m_impl;
+    ++d.contentRevision;
     d.flushBatch();
     d.clutCbp.fill(0u);
     d.transfer = {};
@@ -1639,7 +1772,7 @@ void GSGpuBackend::Reset()
     d.transferState.direction = 3u;
     d.localToHost.clear();
     d.localToHostReadPos = 0u;
-    if (d.ensure())
+    if (d.hostVram && d.hostVramSize && d.ensure())
     {
         std::array<uint16_t, 512> zeros{};
         d.writeClut(zeros);
@@ -1651,6 +1784,7 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &batch)
     Impl &d = *m_impl;
     if (batch.vertexCount == 0u || !d.ensure())
         return;
+    ++d.contentRevision;
     switch (batch.state.prim.type)
     {
     case GS_PRIM_SPRITE:
@@ -1688,6 +1822,8 @@ void GSGpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
 {
     Impl &d = *m_impl;
+    if (command.direction == 2u)
+        ++d.contentRevision;
     if (!d.ensure())
         return;
     bool flush = true;
@@ -1736,6 +1872,8 @@ void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
 void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     Impl &d = *m_impl;
+    if (data && sizeBytes)
+        ++d.contentRevision;
     if (!d.ensure())
         return;
     d.uploadImage(data, sizeBytes);
@@ -1753,7 +1891,7 @@ void GSGpuBackend::TextureFlush()
 void GSGpuBackend::Sync(GSSyncReason reason)
 {
     Impl &d = *m_impl;
-    if (!d.ensure())
+    if (!d.hostVram || !d.hostVramSize || !d.ensure())
         return;
     d.flushFor(5u);
     if (reason == GSSyncReason::DebugReadback && d.hostVram)
@@ -1767,6 +1905,22 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     if (!d.ensure())
         return result;
     d.flushBatch();
+    const bool shared = d.context.Shared() && GSSharedPresent::Active();
+    const std::array<uint64_t, 7> crtc = {request.pmode, request.smode2, request.dispfb1, request.display1,
+                                         request.dispfb2, request.display2, request.bgcolor};
+    if (shared && d.presentedRevision == d.contentRevision && d.presentedCrtc == crtc)
+    {
+        if (d.presentStats.enabled)
+            d.reportPresentStats();
+        return result;
+    }
+    if (shared && !SharedAvailable(d.gl()))
+    {
+        ++d.presentStats.sharedSkips;
+        if (d.presentStats.enabled)
+            d.reportPresentStats();
+        return result;
+    }
     const bool enable1 = (request.pmode & 0x1ull) != 0ull;
     const bool enable2 = (request.pmode & 0x2ull) != 0ull;
     const bool mmod = ((request.pmode >> 5) & 0x1ull) != 0ull;
@@ -1775,7 +1929,7 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     const bool halfHeightBuffer = (request.smode2 & 0x3ull) == 0x3ull;
     const CrtcCircuit circuits[2] = {decodeCircuit(enable1, request.dispfb1, request.display1, halfHeightBuffer),
                                      decodeCircuit(enable2, request.dispfb2, request.display2, halfHeightBuffer)};
-    if (!circuits[0].enabled && !circuits[1].enabled)
+    if (!circuits[0].enabled && !circuits[1].enabled && !shared)
         return result;
     int32_t x0 = INT32_MAX, y0 = INT32_MAX, x1 = INT32_MIN, y1 = INT32_MIN;
     int32_t hstep = INT32_MAX, vstep = INT32_MAX;
@@ -1789,6 +1943,12 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
         y1 = std::max(y1, c.dy + c.dh);
         hstep = std::min(hstep, c.hdiv);
         vstep = std::min(vstep, c.vdiv);
+    }
+    const bool blank = !circuits[0].enabled && !circuits[1].enabled;
+    if (blank)
+    {
+        x0 = y0 = 0;
+        x1 = y1 = hstep = vstep = 1;
     }
     const uint32_t width = std::min<uint32_t>(kMaxPresentationWidth, static_cast<uint32_t>((x1 - x0 + hstep - 1) / hstep));
     const uint32_t height = std::min<uint32_t>(kMaxPresentationHeight, static_cast<uint32_t>((y1 - y0 + vstep - 1) / vstep));
@@ -1812,8 +1972,23 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     gl.Uniform4ui(d.present.loc[3], static_cast<uint32_t>(request.bgcolor & 0xFFFFFFu), (slbg ? 1u : 0u) | (mmod ? 2u : 0u), alp, 0u);
     const GLuint profPresent = d.profBegin();
     gl.DispatchCompute((width + 15u) / 16u, (height + 15u) / 16u, 1u);
+    ++d.presentStats.composites;
     d.profEnd(5u, profPresent);
     d.profFrame();
+    if (shared)
+    {
+        if (PublishShared(gl, d.dataBuffer, width, height, d.renderedSequence + 1u, d.presentHash.id, d.presentHash.loc[0]))
+        {
+            ++d.renderedSequence;
+            d.presentedRevision = d.contentRevision;
+            d.presentedCrtc = crtc;
+        }
+        else
+            ++d.presentStats.sharedSkips;
+        if (d.presentStats.enabled)
+            d.reportPresentStats();
+        return {};
+    }
     if (s_asyncPresent.load(std::memory_order_relaxed))
         return d.presentAsync(width, height, circuits[0].enabled ? circuits[0].fbp : circuits[1].fbp);
     result.pixels.resize(static_cast<size_t>(width) * height * 4u);
@@ -1827,6 +2002,7 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
 bool GSGpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 {
     Impl &d = *m_impl;
+    ++d.contentRevision;
     if (!d.ensure() || context.frame.fbw == 0u)
         return false;
     const uint8_t psm = context.frame.psm;
@@ -1897,6 +2073,7 @@ uint32_t GSGpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32
 void GSGpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
     Impl &d = *m_impl;
+    ++d.contentRevision;
     if (!d.ensure())
         return;
     d.flushBatch();

@@ -23,6 +23,8 @@ namespace GSGL
     constexpr GLenum kCompileStatus = 0x8B81;
     constexpr GLenum kLinkStatus = 0x8B82;
     constexpr GLenum kInfoLogLength = 0x8B84;
+    constexpr GLenum kProgramBinaryLength = 0x8741;
+    constexpr GLenum kProgramBinaryRetrievableHint = 0x8257;
     constexpr GLenum kDynamicDraw = 0x88E8;
     constexpr GLenum kStreamDraw = 0x88E0;
     constexpr GLenum kDynamicRead = 0x88E9;
@@ -51,6 +53,17 @@ namespace GSGL
     constexpr GLenum kTimeElapsed = 0x88BF;
     constexpr GLenum kQueryResult = 0x8866;
     constexpr GLenum kTimestamp = 0x8E28;
+    constexpr GLenum kTexture2D = 0x0DE1;
+    constexpr GLenum kRgba8 = 0x8058;
+    constexpr GLenum kRgba = 0x1908;
+    constexpr GLenum kUnsignedByte = 0x1401;
+    constexpr GLenum kPixelUnpackBuffer = 0x88EC;
+    constexpr GLenum kTextureMinFilter = 0x2801;
+    constexpr GLenum kTextureMagFilter = 0x2800;
+    constexpr GLenum kTextureWrapS = 0x2802;
+    constexpr GLenum kTextureWrapT = 0x2803;
+    constexpr GLint kLinear = 0x2601;
+    constexpr GLint kClampToEdge = 0x812F;
 
     struct Api
     {
@@ -84,6 +97,9 @@ namespace GSGL
         void (*LinkProgram)(GLuint) = nullptr;
         void (*GetProgramiv)(GLuint, GLenum, GLint *) = nullptr;
         void (*GetProgramInfoLog)(GLuint, GLsizei, GLsizei *, GLchar *) = nullptr;
+        void (*ProgramParameteri)(GLuint, GLenum, GLint) = nullptr;
+        void (*GetProgramBinary)(GLuint, GLsizei, GLsizei *, GLenum *, void *) = nullptr;
+        void (*ProgramBinary)(GLuint, GLenum, const void *, GLsizei) = nullptr;
         void (*DeleteProgram)(GLuint) = nullptr;
         void (*UseProgram)(GLuint) = nullptr;
         GLint (*GetUniformLocation)(GLuint, const GLchar *) = nullptr;
@@ -99,6 +115,12 @@ namespace GSGL
         void (*Flush)() = nullptr;
         GLenum (*GetError)() = nullptr;
         const unsigned char *(*GetString)(GLenum) = nullptr;
+        void (*GenTextures)(GLsizei, GLuint *) = nullptr;
+        void (*DeleteTextures)(GLsizei, const GLuint *) = nullptr;
+        void (*BindTexture)(GLenum, GLuint) = nullptr;
+        void (*TexParameteri)(GLenum, GLenum, GLint) = nullptr;
+        void (*TexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *) = nullptr;
+        void (*TexSubImage2D)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *) = nullptr;
     };
 
     class Context
@@ -113,11 +135,18 @@ namespace GSGL
         void Destroy();
         bool Valid() const { return m_context != nullptr; }
         const Api &gl() const { return m_api; }
+        bool Shared() const { return m_shared; }
 
     private:
         void *m_window = nullptr;
         void *m_dc = nullptr;
         void *m_context = nullptr;
         Api m_api;
+        bool m_shared = false;
     };
+
+    bool PublishShared(const Api &gl, GLuint buffer, uint32_t width, uint32_t height, uint64_t renderSequence,
+                       GLuint hashProgram, GLint hashLocation);
+    bool SharedAvailable(const Api &gl);
+    void DestroyShared(const Api &gl);
 }

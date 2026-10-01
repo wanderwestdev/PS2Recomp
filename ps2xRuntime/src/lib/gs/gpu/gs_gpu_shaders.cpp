@@ -2,6 +2,45 @@
 
 namespace GSGpuShaders
 {
+    const char *const kPresentHash = R"GLSL(
+layout(local_size_x = 256) in;
+layout(std430, binding = 7) readonly buffer DataBuffer { uint data[]; };
+layout(std430, binding = 10) buffer HashBuffer { uint imageHash[2]; };
+uniform uint uPixels;
+shared uint sums[256];
+shared uint xors[256];
+uint mixHash(uint v)
+{
+    v ^= v >> 16u;
+    v *= 0x7feb352du;
+    v ^= v >> 15u;
+    v *= 0x846ca68bu;
+    return v ^ (v >> 16u);
+}
+void main()
+{
+    uint lane = gl_LocalInvocationID.x;
+    uint i = gl_GlobalInvocationID.x;
+    uint value = i < uPixels ? mixHash(data[i] ^ mixHash(i + 1u)) : 0u;
+    sums[lane] = value;
+    xors[lane] = i < uPixels ? mixHash(value ^ 0x9e3779b9u) : 0u;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u)
+    {
+        if (lane < stride)
+        {
+            sums[lane] += sums[lane + stride];
+            xors[lane] ^= xors[lane + stride];
+        }
+        barrier();
+    }
+    if (lane == 0u)
+    {
+        atomicAdd(imageHash[0], sums[0]);
+        atomicXor(imageHash[1], xors[0]);
+    }
+}
+)GLSL";
     const char *const kCommon = R"GLSL(
 
 layout(std430, binding = 0) buffer VramBuffer { uint vram[]; };

@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <array>
+#include <random>
 #include <vector>
 
 namespace
@@ -626,6 +628,82 @@ void register_ps2_memory_tests()
             t.Equals(sy, 0x00000001u, "zero-extend y");
             t.Equals(sz, 0x00007FFFu, "zero-extend z");
             t.Equals(sw, 0x00008001u, "zero-extend w");
+        });
+
+        tc.Run("VIF fast UNPACK matches scalar semantics across formats modes cycles and wrap", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::mt19937 random(0x564946u);
+            std::array<uint32_t, PS2_VU1_DATA_SIZE / 4u> expected;
+            bool matches = true;
+            for (uint32_t vl = 0u; vl < 3u && matches; ++vl)
+            for (uint32_t components = 1u; components <= 4u && matches; ++components)
+            for (uint32_t unsignedData = 0u; unsignedData <= 1u && matches; ++unsignedData)
+            for (uint32_t mode = 0u; mode < 3u && matches; ++mode)
+            for (uint32_t count : {1u, 7u, 256u})
+            for (const auto cycle : {std::array<uint32_t, 2>{1u, 1u}, {7u, 3u}, {255u, 1u}})
+            {
+                for (auto &value : expected)
+                    value = random();
+                std::memcpy(mem.getVU1Data(), expected.data(), PS2_VU1_DATA_SIZE);
+                std::array<uint32_t, 4> row;
+                for (auto &value : row)
+                    value = random();
+                std::vector<uint8_t> packet;
+                appendU32(packet, makeVifCmd(0x01u, 0u, (cycle[1] << 8u) | (cycle[0] & 255u)));
+                appendU32(packet, makeVifCmd(0x05u, 0u, mode));
+                appendU32(packet, makeVifCmd(0x30u, 0u, 0u));
+                for (const auto value : row)
+                    appendU32(packet, value);
+                const uint32_t start = 1021u;
+                appendU32(packet, makeVifCmd(static_cast<uint8_t>(0x60u | ((components - 1u) << 2u) | vl),
+                                            static_cast<uint8_t>(count), start | (unsignedData << 14u)));
+                uint32_t destination = start;
+                uint32_t cyclePosition = 0u;
+                const uint32_t bytes = 4u >> vl;
+                for (uint32_t vector = 0u; vector < count; ++vector)
+                {
+                    auto *lanes = expected.data() + (destination & 1023u) * 4u;
+                    for (uint32_t lane = 0u; lane < components; ++lane)
+                    {
+                        const uint32_t raw = random();
+                        for (uint32_t byte = 0u; byte < bytes; ++byte)
+                            packet.push_back(static_cast<uint8_t>(raw >> (byte * 8u)));
+                        lanes[lane] = vl == 0u ? raw : vl == 1u ?
+                            (unsignedData ? raw & 65535u : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)))) :
+                            (unsignedData ? raw & 255u : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw))));
+                    }
+                    if (components == 1u)
+                        lanes[1] = lanes[2] = lanes[3] = lanes[0];
+                    if (mode != 0u)
+                        for (uint32_t lane = 0u; lane < 4u; ++lane)
+                        {
+                            lanes[lane] += row[lane];
+                            if (mode == 2u)
+                                row[lane] = lanes[lane];
+                        }
+                    ++destination;
+                    if (++cyclePosition == cycle[1])
+                    {
+                        cyclePosition = 0u;
+                        destination += cycle[0] - cycle[1];
+                    }
+                }
+                while (packet.size() & 3u)
+                    packet.push_back(0u);
+                mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+                matches = std::memcmp(mem.getVU1Data(), expected.data(), PS2_VU1_DATA_SIZE) == 0 &&
+                          std::memcmp(mem.vif1_regs.row, row.data(), sizeof(row)) == 0;
+                if (!matches)
+                {
+                    t.IsTrue(false, "UNPACK case vl=" + std::to_string(vl) + " components=" + std::to_string(components) +
+                        " unsigned=" + std::to_string(unsignedData) + " mode=" + std::to_string(mode) +
+                        " count=" + std::to_string(count) + " cycle=" + std::to_string(cycle[0]) + ":" + std::to_string(cycle[1]));
+                    return;
+                }
+            }
+            t.IsTrue(matches, "UNPACK changed vector data, preserved lanes, wrapping row arithmetic, or skipped destinations");
         });
 
         tc.Run("VIF UNPACK bit15 adds TOPS to destination address", [](TestCase &t)

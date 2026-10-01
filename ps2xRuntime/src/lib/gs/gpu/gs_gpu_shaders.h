@@ -2,6 +2,7 @@
 
 namespace GSGpuShaders
 {
+    extern const char *const kPresentHash;
     extern const char *const kCommon;
     extern const char *const kRaster;
     extern const char *const kPageCopy;

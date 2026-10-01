@@ -1,9 +1,11 @@
 #include "runtime/gs/gs_threaded_backend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_gpu_backend.h"
+#include "runtime/gs/gs_shared_present.h"
 #include "ThreadNaming.h"
 
 #include <atomic>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <xmmintrin.h>
@@ -53,6 +55,10 @@ namespace
 GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
     : m_inner(std::move(inner))
 {
+    const char *compact = std::getenv("PS2X_GS_COMPACT_QUEUE");
+    m_compactQueue = !compact || *compact != '0';
+    if (const char *limit = std::getenv("PS2X_GS_QUEUE_CHUNKS"))
+        m_queueChunkLimit = static_cast<size_t>(std::clamp(std::atoi(limit), 1, static_cast<int>(kMaxPendingChunks)));
     m_open.reserve(kPublishBytes + 4096u);
     m_worker = std::thread([this]
                            { WorkerLoop(); });
@@ -106,10 +112,28 @@ void GSThreadedBackend::Enqueue(Op op, const void *payload, uint32_t size)
         m_open.insert(m_open.end(), reinterpret_cast<const uint8_t *>(&csrSize), reinterpret_cast<const uint8_t *>(&csrSize) + 4);
         m_open.insert(m_open.end(), reinterpret_cast<const uint8_t *>(&csr), reinterpret_cast<const uint8_t *>(&csr) + 4);
     }
-    m_open.push_back(static_cast<uint8_t>(op));
-    m_open.insert(m_open.end(), reinterpret_cast<const uint8_t *>(&size), reinterpret_cast<const uint8_t *>(&size) + 4);
-    if (size != 0u)
-        m_open.insert(m_open.end(), static_cast<const uint8_t *>(payload), static_cast<const uint8_t *>(payload) + size);
+    const auto append = [&](Op kind, const void *bytes, uint32_t length)
+    {
+        uint8_t header[5];
+        header[0] = static_cast<uint8_t>(kind);
+        std::memcpy(header + 1u, &length, sizeof(length));
+        m_open.insert(m_open.end(), header, header + sizeof(header));
+        if (length)
+            m_open.insert(m_open.end(), static_cast<const uint8_t *>(bytes), static_cast<const uint8_t *>(bytes) + length);
+    };
+    if (op == Op::Submit && m_compactQueue)
+    {
+        const auto &draw = *static_cast<const GSPrimitiveBatch *>(payload);
+        if (!m_drawStateValid || std::memcmp(&m_lastDrawState, &draw.state, sizeof(draw.state)) != 0)
+        {
+            std::memcpy(&m_lastDrawState, &draw.state, sizeof(draw.state));
+            m_drawStateValid = true;
+            append(Op::DrawState, &draw.state, sizeof(draw.state));
+        }
+        append(Op::Vertices, &draw, static_cast<uint32_t>(offsetof(GSPrimitiveBatch, state)));
+    }
+    else
+        append(op, payload, size);
     if (m_open.size() >= kPublishBytes)
         PublishLocked();
 }
@@ -122,7 +146,7 @@ void GSThreadedBackend::PublishLocked()
     {
         std::unique_lock<std::mutex> lock(m_queueMutex);
         m_doneCv.wait(lock, [&]
-                      { return m_stop || m_pending.size() < kMaxPendingChunks; });
+                      { return m_stop || m_pending.size() < m_queueChunkLimit; });
         m_pending.push_back(std::move(m_open));
         ++m_published;
         if (!m_spare.empty())
@@ -156,6 +180,7 @@ void GSThreadedBackend::Drain() const
 void GSThreadedBackend::WorkerLoop()
 {
     ThreadNaming::SetCurrentThreadName("GSThread");
+    GSPrimitiveBatch draw;
     for (;;)
     {
         std::vector<uint8_t> chunk;
@@ -164,13 +189,16 @@ void GSThreadedBackend::WorkerLoop()
             m_workCv.wait(lock, [&]
                           { return m_stop || !m_pending.empty(); });
             if (m_stop)
+            {
+                m_inner.reset();
                 return;
+            }
             chunk = std::move(m_pending.front());
             m_pending.pop_front();
         }
         {
             std::lock_guard<std::mutex> exec(m_execMutex);
-            Execute(chunk);
+            Execute(chunk, draw);
         }
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
@@ -182,7 +210,7 @@ void GSThreadedBackend::WorkerLoop()
     }
 }
 
-void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk)
+void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk, GSPrimitiveBatch &draw)
 {
     const uint8_t *data = chunk.data();
     const size_t size = chunk.size();
@@ -225,6 +253,17 @@ void GSThreadedBackend::Execute(const std::vector<uint8_t> &chunk)
         }
         case Op::Sync:
             m_inner->Sync(readAt<GSSyncReason>(payload));
+            break;
+        case Op::DrawState:
+            std::memcpy(&draw.state, payload, sizeof(draw.state));
+            break;
+        case Op::Vertices:
+            std::memcpy(&draw, payload, offsetof(GSPrimitiveBatch, state));
+            if (!discardDraws())
+                m_inner->Submit(draw);
+            break;
+        case Op::Present:
+            m_inner->Present(readAt<GSPresentationRequest>(payload));
             break;
         case Op::Call:
             (*readAt<const std::function<void()> *>(payload))();
@@ -283,6 +322,8 @@ void GSThreadedBackend::TextureFlush()
 
 void GSThreadedBackend::Sync(GSSyncReason reason)
 {
+    if (reason == GSSyncReason::Presentation && GSSharedPresent::Active())
+        return;
     if (reason == GSSyncReason::Finish)
     {
         Enqueue(Op::Sync, &reason, sizeof(reason));
@@ -293,6 +334,13 @@ void GSThreadedBackend::Sync(GSSyncReason reason)
 
 PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &request)
 {
+    if (GSSharedPresent::Active())
+    {
+        Enqueue(Op::Present, &request, sizeof(request));
+        std::lock_guard<std::mutex> lock(m_producerMutex);
+        PublishLocked();
+        return {};
+    }
     PresentationFrame frame;
     RunOnWorker([&] { frame = m_inner->Present(request); });
     return frame;

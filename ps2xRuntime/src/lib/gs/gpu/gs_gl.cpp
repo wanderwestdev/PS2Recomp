@@ -1,4 +1,11 @@
 #include "gs_gl.h"
+#include "runtime/gs/gs_shared_present.h"
+
+#include <array>
+#include <atomic>
+#include <cstdlib>
+#include <cstdio>
+#include <mutex>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -18,6 +25,46 @@ namespace
     constexpr int kContextCoreProfileBit = 0x0001;
 
     using CreateContextAttribs = HGLRC(WINAPI *)(HDC, HGLRC, const int *);
+
+    struct SharedSlot
+    {
+        GSSharedPresent::Frame frame;
+        GSGL::GLsync produced = nullptr;
+        GSGL::GLsync consumed = nullptr;
+        GSGL::GLuint hashBuffer = 0;
+        const uint32_t *hash = nullptr;
+        bool reading = false;
+    };
+
+    std::mutex s_sharedMutex;
+    std::array<SharedSlot, 3> s_sharedSlots;
+    GSGL::Api s_hostApi;
+    HGLRC s_hostContext = nullptr;
+    HDC s_hostDc = nullptr;
+    PIXELFORMATDESCRIPTOR s_hostFormat{};
+    int s_hostFormatIndex = 0;
+    int s_readingSlot = -1;
+    uint64_t s_sharedSequence = 0;
+    std::atomic<bool> s_sharedActive{false};
+
+    bool completed(const GSGL::Api &gl, GSGL::GLsync fence)
+    {
+        if (!fence)
+            return true;
+        const auto status = gl.ClientWaitSync(fence, 0u, 0u);
+        return status == GSGL::kAlreadySignaled || status == GSGL::kConditionSatisfied;
+    }
+
+    void releaseReading()
+    {
+        if (s_readingSlot < 0)
+            return;
+        SharedSlot &slot = s_sharedSlots[s_readingSlot];
+        slot.consumed = s_hostApi.FenceSync(GSGL::kSyncGpuCommandsComplete, 0u);
+        s_hostApi.Flush();
+        slot.reading = false;
+        s_readingSlot = -1;
+    }
 
     HMODULE openGlModule()
     {
@@ -52,8 +99,197 @@ namespace
     }
 }
 
+namespace GSSharedPresent
+{
+    void CaptureHostContext()
+    {
+        const char *value = std::getenv("PS2X_GS_DIRECT_PRESENT");
+        if (!value || *value != '1')
+            return;
+        const HDC dc = wglGetCurrentDC();
+        const HGLRC context = wglGetCurrentContext();
+        if (!dc || !context)
+            return;
+        std::string missing;
+        GSGL::Api api;
+        load(api.FenceSync, "glFenceSync", missing);
+        load(api.ClientWaitSync, "glClientWaitSync", missing);
+        load(api.DeleteSync, "glDeleteSync", missing);
+        load(api.Flush, "glFlush", missing);
+        if (!missing.empty())
+        {
+            std::fprintf(stderr, "[gs-present] shared presentation unavailable: %s\n", missing.c_str());
+            return;
+        }
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        s_hostFormatIndex = GetPixelFormat(dc);
+        if (!DescribePixelFormat(dc, s_hostFormatIndex, sizeof(s_hostFormat), &s_hostFormat))
+            return;
+        s_hostApi = api;
+        s_hostContext = context;
+        s_hostDc = dc;
+        wglMakeCurrent(nullptr, nullptr);
+    }
+
+    void RestoreHostContext()
+    {
+        if (s_hostDc && s_hostContext)
+            wglMakeCurrent(s_hostDc, s_hostContext);
+    }
+
+    bool Active()
+    {
+        return s_sharedActive.load(std::memory_order_acquire);
+    }
+
+    bool Acquire(Frame &frame)
+    {
+        if (!Active())
+            return false;
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        int newest = -1;
+        uint64_t sequence = s_readingSlot >= 0 ? s_sharedSlots[s_readingSlot].frame.sequence : 0u;
+        for (int i = 0; i < static_cast<int>(s_sharedSlots.size()); ++i)
+        {
+            const SharedSlot &slot = s_sharedSlots[i];
+            if (!slot.reading && slot.frame.sequence > sequence && slot.produced && completed(s_hostApi, slot.produced))
+            {
+                newest = i;
+                sequence = slot.frame.sequence;
+            }
+        }
+        if (newest >= 0)
+        {
+            releaseReading();
+            SharedSlot &slot = s_sharedSlots[newest];
+            s_hostApi.DeleteSync(slot.produced);
+            slot.produced = nullptr;
+            if (slot.frame.hashValid)
+                slot.frame.contentHash = static_cast<uint64_t>(slot.hash[0]) | (static_cast<uint64_t>(slot.hash[1]) << 32u);
+            slot.reading = true;
+            s_readingSlot = newest;
+        }
+        if (s_readingSlot < 0)
+            return false;
+        frame = s_sharedSlots[s_readingSlot].frame;
+        return true;
+    }
+
+    void ShutdownHost()
+    {
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        releaseReading();
+        s_sharedActive.store(false, std::memory_order_release);
+        s_hostContext = nullptr;
+        s_hostDc = nullptr;
+    }
+}
+
 namespace GSGL
 {
+    bool SharedAvailable(const Api &gl)
+    {
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        for (const SharedSlot &slot : s_sharedSlots)
+            if (!slot.reading && completed(gl, slot.produced) && completed(gl, slot.consumed))
+                return true;
+        return false;
+    }
+
+    bool PublishShared(const Api &gl, GLuint buffer, uint32_t width, uint32_t height, uint64_t renderSequence,
+                       GLuint hashProgram, GLint hashLocation)
+    {
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        if (!s_sharedActive.load(std::memory_order_relaxed))
+            return false;
+        SharedSlot *available = nullptr;
+        for (SharedSlot &slot : s_sharedSlots)
+        {
+            if (slot.reading || !completed(gl, slot.produced) || !completed(gl, slot.consumed))
+                continue;
+            if (!available || slot.frame.sequence < available->frame.sequence)
+                available = &slot;
+        }
+        if (!available)
+            return false;
+        SharedSlot &slot = *available;
+        if (slot.produced)
+            gl.DeleteSync(slot.produced);
+        if (slot.consumed)
+            gl.DeleteSync(slot.consumed);
+        slot.produced = slot.consumed = nullptr;
+        slot.frame.hashValid = false;
+        if (hashProgram)
+        {
+            if (!slot.hashBuffer)
+            {
+                gl.GenBuffers(1, &slot.hashBuffer);
+                gl.BindBuffer(kShaderStorageBuffer, slot.hashBuffer);
+                const GLbitfield flags = kMapReadBit | kMapPersistentBit | kMapCoherentBit;
+                gl.BufferStorage(kShaderStorageBuffer, 8, nullptr, flags);
+                slot.hash = static_cast<const uint32_t *>(gl.MapBufferRange(kShaderStorageBuffer, 0, 8, flags));
+            }
+            if (slot.hash)
+            {
+                const uint32_t zero = 0u;
+                gl.BindBuffer(kShaderStorageBuffer, slot.hashBuffer);
+                gl.ClearBufferData(kShaderStorageBuffer, kR32UI, kRedInteger, kUnsignedInt, &zero);
+                gl.BindBufferBase(kShaderStorageBuffer, 7u, buffer);
+                gl.BindBufferBase(kShaderStorageBuffer, 10u, slot.hashBuffer);
+                gl.MemBarrier(kAllBarrierBits);
+                gl.UseProgram(hashProgram);
+                gl.Uniform1ui(hashLocation, width * height);
+                gl.DispatchCompute((width * height + 255u) / 256u, 1u, 1u);
+                gl.MemBarrier(kAllBarrierBits);
+                slot.frame.hashValid = true;
+            }
+        }
+        gl.BindBuffer(kPixelUnpackBuffer, 0u);
+        if (!slot.frame.texture)
+            gl.GenTextures(1, &slot.frame.texture);
+        gl.BindTexture(kTexture2D, slot.frame.texture);
+        if (slot.frame.width != width || slot.frame.height != height)
+        {
+            gl.TexImage2D(kTexture2D, 0, kRgba8, width, height, 0, kRgba, kUnsignedByte, nullptr);
+            gl.TexParameteri(kTexture2D, kTextureMinFilter, kLinear);
+            gl.TexParameteri(kTexture2D, kTextureMagFilter, kLinear);
+            gl.TexParameteri(kTexture2D, kTextureWrapS, kClampToEdge);
+            gl.TexParameteri(kTexture2D, kTextureWrapT, kClampToEdge);
+        }
+        gl.MemBarrier(kAllBarrierBits);
+        gl.BindBuffer(kPixelUnpackBuffer, buffer);
+        gl.TexSubImage2D(kTexture2D, 0, 0, 0, width, height, kRgba, kUnsignedByte, nullptr);
+        gl.MemBarrier(kAllBarrierBits);
+        gl.BindBuffer(kPixelUnpackBuffer, 0u);
+        gl.BindTexture(kTexture2D, 0u);
+        slot.frame.width = width;
+        slot.frame.height = height;
+        slot.frame.sequence = ++s_sharedSequence;
+        slot.frame.renderSequence = renderSequence;
+        slot.produced = gl.FenceSync(kSyncGpuCommandsComplete, 0u);
+        gl.Flush();
+        return true;
+    }
+
+    void DestroyShared(const Api &gl)
+    {
+        std::lock_guard<std::mutex> lock(s_sharedMutex);
+        s_sharedActive.store(false, std::memory_order_release);
+        for (SharedSlot &slot : s_sharedSlots)
+        {
+            if (slot.produced)
+                gl.DeleteSync(slot.produced);
+            if (slot.consumed)
+                gl.DeleteSync(slot.consumed);
+            if (slot.frame.texture)
+                gl.DeleteTextures(1, &slot.frame.texture);
+            if (slot.hashBuffer)
+                gl.DeleteBuffers(1, &slot.hashBuffer);
+            slot = {};
+        }
+        s_readingSlot = -1;
+    }
+
     Context::~Context()
     {
         Destroy();
@@ -82,7 +318,9 @@ namespace GSGL
         descriptor.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
         descriptor.iPixelType = PFD_TYPE_RGBA;
         descriptor.cColorBits = 32;
-        const int format = ChoosePixelFormat(dc, &descriptor);
+        const int format = s_hostContext ? s_hostFormatIndex : ChoosePixelFormat(dc, &descriptor);
+        if (s_hostContext)
+            descriptor = s_hostFormat;
         if (format == 0 || !SetPixelFormat(dc, format, &descriptor))
         {
             ReleaseDC(window, dc);
@@ -106,7 +344,13 @@ namespace GSGL
         {
             const int attributes[] = {kContextMajorVersion, 4, kContextMinorVersion, 6, kContextProfileMask, kContextCoreProfileBit,
                                       kContextFlags, 0, 0};
-            context = createAttribs(dc, nullptr, attributes);
+            context = createAttribs(dc, s_hostContext, attributes);
+            m_shared = context && s_hostContext;
+            if (!context && s_hostContext)
+            {
+                std::fprintf(stderr, "[gs-present] WGL sharing failed (%lu); using RAM presentation\n", GetLastError());
+                context = createAttribs(dc, nullptr, attributes);
+            }
         }
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(legacy);
@@ -155,6 +399,9 @@ namespace GSGL
         load(a.LinkProgram, "glLinkProgram", missing);
         load(a.GetProgramiv, "glGetProgramiv", missing);
         load(a.GetProgramInfoLog, "glGetProgramInfoLog", missing);
+        load(a.ProgramParameteri, "glProgramParameteri", missing);
+        load(a.GetProgramBinary, "glGetProgramBinary", missing);
+        load(a.ProgramBinary, "glProgramBinary", missing);
         load(a.DeleteProgram, "glDeleteProgram", missing);
         load(a.UseProgram, "glUseProgram", missing);
         load(a.GetUniformLocation, "glGetUniformLocation", missing);
@@ -170,11 +417,22 @@ namespace GSGL
         load(a.Flush, "glFlush", missing);
         load(a.GetError, "glGetError", missing);
         load(a.GetString, "glGetString", missing);
+        load(a.GenTextures, "glGenTextures", missing);
+        load(a.DeleteTextures, "glDeleteTextures", missing);
+        load(a.BindTexture, "glBindTexture", missing);
+        load(a.TexParameteri, "glTexParameteri", missing);
+        load(a.TexImage2D, "glTexImage2D", missing);
+        load(a.TexSubImage2D, "glTexSubImage2D", missing);
         if (!missing.empty())
         {
             error = "missing GL functions: " + missing;
             Destroy();
             return false;
+        }
+        if (m_shared)
+        {
+            s_sharedActive.store(true, std::memory_order_release);
+            std::fprintf(stderr, "[gs-present] shared GPU textures active\n");
         }
         return true;
     }
@@ -194,11 +452,15 @@ namespace GSGL
             DestroyWindow(static_cast<HWND>(m_window));
         m_window = nullptr;
         m_api = {};
+        m_shared = false;
     }
 }
 #else
 namespace GSGL
 {
+    bool PublishShared(const Api &, GLuint, uint32_t, uint32_t, uint64_t, GLuint, GLint) { return false; }
+    bool SharedAvailable(const Api &) { return false; }
+    void DestroyShared(const Api &) {}
     Context::~Context() = default;
 
     bool Context::Create(std::string &error)
@@ -210,5 +472,13 @@ namespace GSGL
     void Context::Destroy()
     {
     }
+}
+namespace GSSharedPresent
+{
+    void CaptureHostContext() {}
+    void RestoreHostContext() {}
+    bool Active() { return false; }
+    bool Acquire(Frame &) { return false; }
+    void ShutdownHost() {}
 }
 #endif
