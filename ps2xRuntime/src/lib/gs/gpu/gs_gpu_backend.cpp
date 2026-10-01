@@ -7,6 +7,8 @@
 #include "../gs_triangle_rules.h"
 #include "gs_gl.h"
 #include "gs_gpu_shaders.h"
+#include "ThreadNaming.h"
+#include "ThreadPriority.h"
 
 #include <algorithm>
 #include <atomic>
@@ -15,7 +17,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
 #include <map>
+#include <mutex>
+#include <set>
+#include <sstream>
+#include <thread>
 #include <filesystem>
 #include <fstream>
 
@@ -243,13 +251,28 @@ struct GSGpuBackend::Impl
     std::string hwFragmentBody;
     using HwKey = std::array<uint32_t, 11>;
     std::map<HwKey, Program> hwVariants;
-    struct PendingVariant
+    struct CompileJob
     {
-        GLuint program = 0;
-        GLuint fragment = 0;
+        HwKey key{};
+        std::string fragment;
         std::string cacheKey;
         std::filesystem::path cachePath;
     };
+    struct CompileResult
+    {
+        HwKey key{};
+        GLuint program = 0;
+        bool fromCache = false;
+        double ms = 0.0;
+    };
+    std::set<HwKey> hwRequested;
+    std::deque<CompileJob> hwJobs;
+    std::vector<CompileResult> hwResults;
+    std::mutex hwCompileMutex;
+    std::condition_variable hwCompileCv;
+    bool hwCompileStop = false;
+    std::thread hwCompiler;
+    void *hwWorkerContext = nullptr;
     struct HwRun
     {
         const Program *program;
@@ -257,8 +280,9 @@ struct GSGpuBackend::Impl
         uint32_t last;
     };
     std::vector<HwRun> hwRuns;
+    double hwRingWaitMs = 0.0;
+    double hwVariantMs = 0.0;
     std::string hwVertexSource;
-    std::map<HwKey, PendingVariant> hwPending;
 
     std::vector<uint32_t> prims;
     uint32_t primCount = 0u;
@@ -504,6 +528,7 @@ struct GSGpuBackend::Impl
 
     ~Impl()
     {
+        stopCompileWorker();
         if (initialized && prof.enabled)
         {
             profResolve();
@@ -569,7 +594,9 @@ struct GSGpuBackend::Impl
             ringChunk = (ringChunk + 1u) % kRingChunks;
             if (GLsync fence = ringFences[ringChunk])
             {
+                const auto waitStart = std::chrono::steady_clock::now();
                 gl().ClientWaitSync(fence, kSyncFlushCommandsBit, 5000000000ull);
+                hwRingWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
                 gl().DeleteSync(fence);
                 ringFences[ringChunk] = nullptr;
             }
@@ -753,6 +780,20 @@ struct GSGpuBackend::Impl
         return 0u;
     }
 
+    static bool hwLogEnabled()
+    {
+        static const bool enabled = [] {
+            const char *value = std::getenv("PS2X_GS_HW_LOG");
+            return value && *value && *value != '0';
+        }();
+        return enabled;
+    }
+
+    static double hwLogSeconds()
+    {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
     HwKey hardwareKey(uint32_t prim) const
     {
         const uint32_t header = prims[static_cast<size_t>(prim) * kPrimWords];
@@ -857,63 +898,213 @@ struct GSGpuBackend::Impl
         program.loc[1] = gl().GetUniformLocation(id, "uHw");
     }
 
+    void drainCompiledVariants()
+    {
+        std::vector<CompileResult> results;
+        {
+            std::lock_guard<std::mutex> lock(hwCompileMutex);
+            results.swap(hwResults);
+        }
+        for (const CompileResult &result : results)
+        {
+            Program &program = hwVariants[result.key];
+            if (result.program)
+                finishVariant(program, result.program);
+            if (hwLogEnabled())
+                std::fprintf(stderr, "[gs-hw] %.3f variant %s in %.0f ms (%zu known)\n", hwLogSeconds(),
+                             !result.program ? "failed" : result.fromCache ? "loaded from cache" : "compiled", result.ms, hwVariants.size());
+        }
+    }
+
+    std::filesystem::path hardwareManifestPath() const
+    {
+        const char *cache = std::getenv("PS2X_GS_SHADER_CACHE");
+        const char *directory = std::getenv("PS2X_GS_SHADER_CACHE_DIR");
+        if ((cache && *cache == '0') || !directory)
+            return {};
+        return std::filesystem::path(directory) / "hw_keys.txt";
+    }
+
+    void prewarmHardwareVariants()
+    {
+        const std::filesystem::path path = hardwareManifestPath();
+        if (path.empty())
+            return;
+        std::ifstream input(path);
+        std::string line;
+        size_t queued = 0u;
+        while (std::getline(input, line))
+        {
+            HwKey key{};
+            std::istringstream fields(line);
+            size_t count = 0u;
+            while (count < key.size() && (fields >> std::hex >> key[count]))
+                ++count;
+            if (count != key.size() || !hwRequested.insert(key).second)
+                continue;
+            requestVariant(key);
+            ++queued;
+        }
+        if (queued)
+            std::fprintf(stderr, "[gs-gpu] preloading %zu hardware raster shaders\n", queued);
+    }
+
+    void rememberVariant(const HwKey &key)
+    {
+        const std::filesystem::path path = hardwareManifestPath();
+        if (path.empty())
+            return;
+        std::error_code error;
+        std::filesystem::create_directories(path.parent_path(), error);
+        std::ofstream output(path, std::ios::app);
+        for (size_t i = 0; i < key.size(); ++i)
+            output << std::hex << key[i] << (i + 1u < key.size() ? ' ' : '\n');
+    }
+
+    void requestVariant(const HwKey &key)
+    {
+        CompileJob job;
+        job.key = key;
+        job.fragment = hardwareFragmentSource(key);
+        job.cacheKey = std::string(reinterpret_cast<const char *>(gl().GetString(kRenderer))) + "\n" +
+                       reinterpret_cast<const char *>(gl().GetString(kVersion)) + "\n" + hwVertexSource + "\n" + job.fragment;
+        job.cachePath = hardwareCachePath(job.cacheKey);
+        {
+            std::lock_guard<std::mutex> lock(hwCompileMutex);
+            hwJobs.push_back(std::move(job));
+        }
+        hwCompileCv.notify_one();
+    }
+
     const Program *hardwareVariant(const HwKey &key)
     {
         auto found = hwVariants.find(key);
         if (found != hwVariants.end())
             return found->second.id ? &found->second : nullptr;
-        auto pending = hwPending.find(key);
-        if (pending != hwPending.end())
+        if (!hwRequested.insert(key).second)
+            return nullptr;
+        rememberVariant(key);
+        requestVariant(key);
+        return nullptr;
+    }
+
+    void compileWorker()
+    {
+        if (!context.MakeWorkerCurrent(hwWorkerContext))
+            return;
+        ThreadNaming::SetCurrentThreadName("GSShaderCompiler");
+#if defined(_WIN32)
+        SetThreadPriority(GetCurrentThread(), -1);
+#endif
+        if (gl().MaxShaderCompilerThreads)
+            gl().MaxShaderCompilerThreads(2u);
+        const GLuint vertex = compileStage(kVertexShader, hwVertexSource);
+        struct InFlight
         {
-            GLint done = 1;
-            if (gl().MaxShaderCompilerThreads)
-                gl().GetProgramiv(pending->second.program, kCompletionStatus, &done);
-            if (!done)
-                return nullptr;
-            Program &program = hwVariants[key];
-            GLint ok = 0;
-            gl().GetProgramiv(pending->second.program, kLinkStatus, &ok);
-            gl().DeleteShader(pending->second.fragment);
-            if (ok)
-            {
-                finishVariant(program, pending->second.program);
-                storeHardwareBinary(pending->second.cachePath, pending->second.cacheKey, program.id);
-            }
-            else
-            {
-                GLint length = 0;
-                gl().GetProgramiv(pending->second.program, kInfoLogLength, &length);
-                std::string log(static_cast<size_t>(std::max(length, 1)), '\0');
-                gl().GetProgramInfoLog(pending->second.program, length, nullptr, log.data());
-                std::fprintf(stderr, "[gs-gpu] hardware raster variant failed; that state keeps the compute renderer:\n%s\n", log.c_str());
-                std::fflush(stderr);
-                gl().DeleteProgram(pending->second.program);
-            }
-            hwPending.erase(pending);
-            return program.id ? &program : nullptr;
-        }
-        const std::string fragmentSource = hardwareFragmentSource(key);
-        PendingVariant variant;
-        variant.cacheKey = std::string(reinterpret_cast<const char *>(gl().GetString(kRenderer))) + "\n" +
-                           reinterpret_cast<const char *>(gl().GetString(kVersion)) + "\n" + hwVertexSource + "\n" + fragmentSource;
-        variant.cachePath = hardwareCachePath(variant.cacheKey);
-        if (const GLuint cached = loadHardwareBinary(variant.cachePath, variant.cacheKey))
+            CompileJob job;
+            GLuint program = 0;
+            GLuint fragment = 0;
+            std::chrono::steady_clock::time_point started;
+        };
+        std::vector<InFlight> inFlight;
+        for (;;)
         {
-            Program &program = hwVariants[key];
-            finishVariant(program, cached);
-            return &program;
+            std::deque<CompileJob> jobs;
+            {
+                std::unique_lock<std::mutex> lock(hwCompileMutex);
+                if (inFlight.empty())
+                    hwCompileCv.wait(lock, [&] { return hwCompileStop || !hwJobs.empty(); });
+                else
+                    hwCompileCv.wait_for(lock, std::chrono::milliseconds(4), [&] { return hwCompileStop || !hwJobs.empty(); });
+                if (hwCompileStop)
+                    break;
+                jobs.swap(hwJobs);
+            }
+            std::vector<CompileResult> done;
+            for (CompileJob &job : jobs)
+            {
+                const auto started = std::chrono::steady_clock::now();
+                if (const GLuint cached = loadHardwareBinary(job.cachePath, job.cacheKey))
+                {
+                    gl().Finish();
+                    std::lock_guard<std::mutex> lock(hwCompileMutex);
+                    hwResults.push_back({job.key, cached, true, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count()});
+                    continue;
+                }
+                InFlight item;
+                item.started = started;
+                const char *text = job.fragment.c_str();
+                item.fragment = gl().CreateShader(kFragmentShader);
+                gl().ShaderSource(item.fragment, 1, &text, nullptr);
+                gl().CompileShader(item.fragment);
+                item.program = gl().CreateProgram();
+                gl().ProgramParameteri(item.program, kProgramBinaryRetrievableHint, 1);
+                gl().AttachShader(item.program, vertex);
+                gl().AttachShader(item.program, item.fragment);
+                gl().LinkProgram(item.program);
+                item.job = std::move(job);
+                inFlight.push_back(std::move(item));
+            }
+            for (size_t i = 0; i < inFlight.size();)
+            {
+                InFlight &item = inFlight[i];
+                GLint complete = 1;
+                if (gl().MaxShaderCompilerThreads)
+                    gl().GetProgramiv(item.program, kCompletionStatus, &complete);
+                if (!complete)
+                {
+                    ++i;
+                    continue;
+                }
+                GLint ok = 0;
+                gl().GetProgramiv(item.program, kLinkStatus, &ok);
+                gl().DeleteShader(item.fragment);
+                if (ok)
+                    storeHardwareBinary(item.job.cachePath, item.job.cacheKey, item.program);
+                else
+                {
+                    GLint length = 0;
+                    gl().GetProgramiv(item.program, kInfoLogLength, &length);
+                    std::string log(static_cast<size_t>(std::max(length, 1)), '\0');
+                    gl().GetProgramInfoLog(item.program, length, nullptr, log.data());
+                    std::fprintf(stderr, "[gs-gpu] hardware raster variant failed; that state keeps the compute renderer:\n%s\n", log.c_str());
+                    std::fflush(stderr);
+                    gl().DeleteProgram(item.program);
+                    item.program = 0;
+                }
+                done.push_back({item.job.key, item.program, false,
+                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - item.started).count()});
+                inFlight.erase(inFlight.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+            if (!done.empty())
+            {
+                gl().Finish();
+                std::lock_guard<std::mutex> lock(hwCompileMutex);
+                hwResults.insert(hwResults.end(), done.begin(), done.end());
+            }
         }
-        const char *text = fragmentSource.c_str();
-        variant.fragment = gl().CreateShader(kFragmentShader);
-        gl().ShaderSource(variant.fragment, 1, &text, nullptr);
-        gl().CompileShader(variant.fragment);
-        variant.program = gl().CreateProgram();
-        gl().ProgramParameteri(variant.program, kProgramBinaryRetrievableHint, 1);
-        gl().AttachShader(variant.program, hwVertexShader);
-        gl().AttachShader(variant.program, variant.fragment);
-        gl().LinkProgram(variant.program);
-        hwPending.emplace(key, std::move(variant));
-        return gl().MaxShaderCompilerThreads ? nullptr : hardwareVariant(key);
+        for (InFlight &item : inFlight)
+        {
+            gl().DeleteShader(item.fragment);
+            gl().DeleteProgram(item.program);
+        }
+        if (vertex)
+            gl().DeleteShader(vertex);
+        gl().Finish();
+    }
+
+    void stopCompileWorker()
+    {
+        if (!hwCompiler.joinable())
+            return;
+        {
+            std::lock_guard<std::mutex> lock(hwCompileMutex);
+            hwCompileStop = true;
+        }
+        hwCompileCv.notify_all();
+        hwCompiler.join();
+        Context::DestroyWorker(hwWorkerContext);
+        hwWorkerContext = nullptr;
     }
 
     static std::string hardwareShadingFunctions(const std::string &body)
@@ -1027,6 +1218,11 @@ struct GSGpuBackend::Impl
         hwVertexShader = compileStage(kVertexShader, hwVertexSource);
         if (!hwVertexShader)
             return false;
+        hwWorkerContext = context.CreateWorker();
+        if (!hwWorkerContext)
+            return false;
+        hwCompiler = std::thread([this] { compileWorker(); });
+        prewarmHardwareVariants();
         const char *expand = std::getenv("PS2X_GS_HW_TRIANGLES");
         hwConservative = !(expand && *expand == '0');
         gl().GenFramebuffers(1, &hwFramebuffer);
@@ -1283,6 +1479,28 @@ struct GSGpuBackend::Impl
 
     void flushBatch()
     {
+        const auto flushStart = std::chrono::steady_clock::now();
+        const uint32_t flushPrims = primCount;
+        bool fallback = false;
+        struct FlushLog
+        {
+            const std::chrono::steady_clock::time_point &start;
+            const uint32_t &prims;
+            const bool &fallback;
+            double &ringWait;
+            double &variantMs;
+            ~FlushLog()
+            {
+                if (!hwLogEnabled())
+                    return;
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                if (fallback || ms > 8.0)
+                    std::fprintf(stderr, "[gs-hw] %.3f flush %u prims %.1f ms ring wait %.1f ms variants %.1f ms%s\n", hwLogSeconds(), prims, ms, ringWait,
+                                 variantMs, fallback ? " (compute fallback)" : "");
+            }
+        } flushLog{flushStart, flushPrims, fallback, hwRingWaitMs, hwVariantMs};
+        hwRingWaitMs = 0.0;
+        hwVariantMs = 0.0;
         if (initialized)
             executeTransfers();
         if (!initialized || (primCount == 0u && clutOps.empty()))
@@ -1297,6 +1515,7 @@ struct GSGpuBackend::Impl
         bool drawn = false;
         if (primCount != 0u && hwEnabled)
         {
+            drainCompiledVariants();
             hwRuns.clear();
             uint32_t runStart = 0u;
             HwKey runKey = hardwareKey(0u);
@@ -1310,7 +1529,9 @@ struct GSGpuBackend::Impl
                     if (key == runKey)
                         continue;
                 }
+                const auto variantStart = std::chrono::steady_clock::now();
                 const Program *program = hardwareVariant(runKey);
+                hwVariantMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - variantStart).count();
                 ready = ready && program != nullptr;
                 hwRuns.push_back({program, runStart, prim});
                 runStart = prim;
@@ -1342,12 +1563,36 @@ struct GSGpuBackend::Impl
         }
         if (primCount != 0u && !drawn)
         {
+            fallback = hwEnabled;
             if (hwEnabled)
                 for (uint32_t prim = 0u; prim < primCount; ++prim)
                 {
                     const uint32_t *p = prims.data() + static_cast<size_t>(prim) * kPrimWords;
                     if ((p[0] & 0xFFu) == PrimPoint)
                         binBox(prim, static_cast<int>(p[1]), static_cast<int>(p[2]), static_cast<int>(p[1]), static_cast<int>(p[2]));
+                    else if ((p[0] & 0xFFu) == PrimTriangle)
+                    {
+                        GSTriangleRaster tri;
+                        for (int v = 0; v < 3; ++v)
+                        {
+                            tri.x[v] = static_cast<int32_t>(p[3u + v * 2u]);
+                            tri.y[v] = static_cast<int32_t>(p[4u + v * 2u]);
+                        }
+                        const int64_t sign = static_cast<int32_t>(p[9]);
+                        for (int e = 0; e < 3; ++e)
+                        {
+                            const int a = (e + 1) % 3;
+                            const int b = (e + 2) % 3;
+                            tri.a[e] = -(tri.y[b] - tri.y[a]) * sign;
+                            tri.b[e] = (tri.x[b] - tri.x[a]) * sign;
+                            tri.c[e] = -(tri.a[e] * tri.x[a] + tri.b[e] * tri.y[a]);
+                            tri.bias[e] = (tri.a[e] > 0 || (tri.a[e] == 0 && tri.b[e] > 0)) ? 1 : 0;
+                        }
+                        hwEnabled = false;
+                        binTriangle(prim, tri, static_cast<int>(p[1] & 0xFFFFu), static_cast<int>(p[2] & 0xFFFFu), static_cast<int>(p[1] >> 16u),
+                                    static_cast<int>(p[2] >> 16u));
+                        hwEnabled = true;
+                    }
                     else
                         binBox(prim, static_cast<int>(p[1] & 0xFFFFu), static_cast<int>(p[2] & 0xFFFFu), static_cast<int>(p[1] >> 16u),
                                static_cast<int>(p[2] >> 16u));

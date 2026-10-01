@@ -158,6 +158,9 @@ namespace GSGL
         bool Valid() const { return m_context != nullptr; }
         const Api &gl() const { return m_api; }
         bool Shared() const { return m_shared; }
+        void *CreateWorker() const;
+        bool MakeWorkerCurrent(void *worker) const;
+        static void DestroyWorker(void *worker);
 
     private:
         void *m_window = nullptr;

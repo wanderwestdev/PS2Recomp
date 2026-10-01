@@ -478,6 +478,30 @@ namespace GSGL
         return true;
     }
 
+    void *Context::CreateWorker() const
+    {
+        const auto createAttribs = reinterpret_cast<CreateContextAttribs>(wglGetProcAddress("wglCreateContextAttribsARB"));
+        if (!createAttribs || !m_context || !m_dc)
+            return nullptr;
+        const int attributes[] = {kContextMajorVersion, 4, kContextMinorVersion, 6, kContextProfileMask, kContextCoreProfileBit,
+                                  kContextFlags, 0, 0};
+        return createAttribs(static_cast<HDC>(m_dc), static_cast<HGLRC>(m_context), attributes);
+    }
+
+    bool Context::MakeWorkerCurrent(void *worker) const
+    {
+        return worker && m_dc && wglMakeCurrent(static_cast<HDC>(m_dc), static_cast<HGLRC>(worker));
+    }
+
+    void Context::DestroyWorker(void *worker)
+    {
+        if (!worker)
+            return;
+        if (wglGetCurrentContext() == static_cast<HGLRC>(worker))
+            wglMakeCurrent(nullptr, nullptr);
+        wglDeleteContext(static_cast<HGLRC>(worker));
+    }
+
     void Context::Destroy()
     {
         if (m_context)
@@ -509,6 +533,10 @@ namespace GSGL
         error = "GPU GS backend is only implemented for Windows";
         return false;
     }
+
+    void *Context::CreateWorker() const { return nullptr; }
+    bool Context::MakeWorkerCurrent(void *) const { return false; }
+    void Context::DestroyWorker(void *) {}
 
     void Context::Destroy()
     {
