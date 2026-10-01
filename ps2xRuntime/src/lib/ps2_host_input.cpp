@@ -338,12 +338,38 @@ namespace ps2_host_input
         std::atomic<const std::atomic<uint64_t> *> g_fieldCounter{nullptr};
         std::atomic<uint32_t> g_invertRightDefault{0u};
         std::atomic<bool> g_mouseCameraEnabled{false};
+        std::atomic<bool> g_mouseStickEnabled{true};
         bool g_mouseLocked = false;
         int g_ignoredMouseButton = -1;
         bool g_skipMouseDelta = false;
         bool g_mouseMoved = false;
         float g_mouseRightX = 0.0f;
         float g_mouseRightY = 0.0f;
+        MouseCameraInput g_mouseCameraInput;
+        std::chrono::steady_clock::time_point g_mouseInputStart;
+
+        void recordMouseCameraInput(Vector2 delta, bool active)
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (!active)
+            {
+                g_mouseCameraInput = {};
+                return;
+            }
+            g_mouseCameraInput.active = true;
+            if (delta.x == 0.0f && delta.y == 0.0f)
+                return;
+            const auto now = std::chrono::steady_clock::now();
+            if ((g_mouseCameraInput.x == 0.0f && g_mouseCameraInput.y == 0.0f) ||
+                now - g_mouseInputStart > std::chrono::milliseconds(100))
+            {
+                g_mouseCameraInput.x = 0.0f;
+                g_mouseCameraInput.y = 0.0f;
+                g_mouseInputStart = now;
+            }
+            g_mouseCameraInput.x += delta.x;
+            g_mouseCameraInput.y += delta.y;
+        }
 
         bool isHostBindingDown(const HostBinding &binding)
         {
@@ -382,16 +408,19 @@ namespace ps2_host_input
 
         float mouseVerticalSensitivity()
         {
-            static const float sensitivity = positiveSetting("PS2X_MOUSE_VERTICAL_SENSITIVITY", 1.5f);
+            static const float sensitivity = positiveSetting("PS2X_MOUSE_VERTICAL_SENSITIVITY", 1.0f);
             return sensitivity;
         }
 
-        float mouseStickAxis(float desired)
+        Vector2 mouseStick(Vector2 desired)
         {
-            if (desired == 0.0f)
-                return 0.0f;
-            const float magnitude = 0.42f + 0.58f * std::clamp(std::abs(desired), 0.0f, 1.0f);
-            return std::copysign(magnitude, desired);
+            const float distance = std::hypot(desired.x, desired.y);
+            if (distance <= 0.0f)
+                return {};
+            constexpr float deadzone = 0.4f;
+            const float magnitude = deadzone + (1.0f - deadzone) * std::min(distance, 1.0f);
+            const float scale = magnitude / distance;
+            return {desired.x * scale, desired.y * scale};
         }
 
         void sampleMouse()
@@ -403,6 +432,7 @@ namespace ps2_host_input
                     EnableCursor();
                 g_mouseLocked = false;
                 g_ignoredMouseButton = -1;
+                recordMouseCameraInput({}, false);
                 return;
             }
             if (!IsWindowFocused() || IsKeyPressed(KEY_ESCAPE))
@@ -411,6 +441,7 @@ namespace ps2_host_input
                     EnableCursor();
                 g_mouseLocked = false;
                 g_ignoredMouseButton = -1;
+                recordMouseCameraInput({}, false);
                 return;
             }
             if (!g_mouseLocked)
@@ -429,6 +460,7 @@ namespace ps2_host_input
                     g_ignoredMouseButton = button;
                     g_skipMouseDelta = true;
                 }
+                recordMouseCameraInput({}, g_mouseLocked);
                 return;
             }
             if (g_ignoredMouseButton != -1 && !IsMouseButtonDown(g_ignoredMouseButton))
@@ -436,17 +468,22 @@ namespace ps2_host_input
             if (g_skipMouseDelta)
             {
                 g_skipMouseDelta = false;
+                recordMouseCameraInput({}, true);
                 return;
             }
 
             const Vector2 delta = GetMouseDelta();
+            recordMouseCameraInput(delta, true);
+            if (!g_mouseStickEnabled.load(std::memory_order_relaxed))
+                return;
             const float distance = std::hypot(delta.x, delta.y);
             if (distance <= 0.0f)
                 return;
             const float frameTime = std::max(GetFrameTime(), 1.0f / 240.0f);
             const float scale = mouseSensitivity() / (frameTime * 900.0f);
-            g_mouseRightX = mouseStickAxis(delta.x * scale);
-            g_mouseRightY = mouseStickAxis(delta.y * scale * mouseVerticalSensitivity());
+            const Vector2 stick = mouseStick({delta.x * scale, delta.y * scale * mouseVerticalSensitivity()});
+            g_mouseRightX = stick.x;
+            g_mouseRightY = stick.y;
             g_mouseMoved = true;
         }
 
@@ -510,7 +547,7 @@ namespace ps2_host_input
                     state.leftX = x;
                 if (const uint8_t y = keyAxis(KEY_W, KEY_S); y != 0x80u)
                     state.leftY = y;
-                if (g_mouseMoved)
+                if (g_mouseMoved && g_mouseStickEnabled.load(std::memory_order_relaxed))
                 {
                     const uint32_t invert = rightStickInvert();
                     state.rightX = axisToByte((invert & kInvertRightX) != 0u ? -g_mouseRightX : g_mouseRightX);
@@ -548,6 +585,31 @@ namespace ps2_host_input
         g_state = state;
     }
 
+    void setMouseStickEnabled(bool enabled)
+    {
+        g_mouseStickEnabled.store(enabled, std::memory_order_relaxed);
+    }
+
+    MouseCameraInput consumeMouseCameraInput()
+    {
+        MouseCameraInput input;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            input = g_mouseCameraInput;
+            g_mouseCameraInput.x = 0.0f;
+            g_mouseCameraInput.y = 0.0f;
+            if (std::chrono::steady_clock::now() - g_mouseInputStart > std::chrono::milliseconds(100))
+            {
+                input.x = 0.0f;
+                input.y = 0.0f;
+            }
+        }
+        const uint32_t invert = rightStickInvert();
+        input.x *= mouseSensitivity() * ((invert & kInvertRightX) != 0u ? -1.0f : 1.0f);
+        input.y *= mouseSensitivity() * mouseVerticalSensitivity() * ((invert & kInvertRightY) != 0u ? -1.0f : 1.0f);
+        return input;
+    }
+
     void releaseMouse()
     {
         if (g_mouseLocked)
@@ -555,6 +617,7 @@ namespace ps2_host_input
         g_mouseLocked = false;
         g_ignoredMouseButton = -1;
         g_mouseMoved = false;
+        recordMouseCameraInput({}, false);
     }
 
     ps2x::iop::PadInputState padState(uint32_t port)
