@@ -5,6 +5,7 @@
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -735,8 +736,47 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
+// GS frontend time for PS2X_MTVU_STATS (printed by ps2_async_vif.cpp): wall time inside
+// processGIFPacket, lock wait included, and the packet count, on every thread that calls it.
+namespace ps2x::gsstats
+{
+    std::atomic<uint64_t> g_packetNs{0}, g_packets{0};
+
+    bool enabled()
+    {
+        static const bool on = []
+        {
+            const char *value = std::getenv("PS2X_MTVU_STATS");
+            return value && *value && *value != '0';
+        }();
+        return on;
+    }
+
+    void take(uint64_t &packetNs, uint64_t &packets)
+    {
+        packetNs = g_packetNs.exchange(0u, std::memory_order_relaxed);
+        packets = g_packets.exchange(0u, std::memory_order_relaxed);
+    }
+
+    struct PacketTimer
+    {
+        bool on = enabled();
+        std::chrono::steady_clock::time_point start = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~PacketTimer()
+        {
+            if (!on)
+                return;
+            g_packetNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - start).count()),
+                                 std::memory_order_relaxed);
+            g_packets.fetch_add(1u, std::memory_order_relaxed);
+        }
+    };
+}
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    const ps2x::gsstats::PacketTimer timer;
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;

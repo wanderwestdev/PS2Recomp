@@ -83,11 +83,15 @@ struct PS2AudioBackend::Impl
         uint32_t sampleKey;
     };
     std::vector<TrackedSound> activeSounds;
-    static constexpr size_t kRingSamples = 16384u;
+    // Stereo samples at 48 kHz: 96 per millisecond. Playback starts with about 85 ms queued, so one
+    // or two late frames (17-33 ms each) drain the queue without an audible gap; 43 ms was too
+    // little with the device pulling 10.7 ms blocks. The ring holds about 340 ms, and an overflow
+    // trims back to the same 85 ms.
+    static constexpr size_t kRingSamples = 32768u;
     std::array<int16_t, kRingSamples> ring{};
     size_t read = 0u;
     size_t queued = 0u;
-    static constexpr size_t kPrimeSamples = 4096u;
+    static constexpr size_t kPrimeSamples = 8192u;
     static constexpr int32_t kFadeFrames = 128;
     bool primed = false;
     int32_t fadePosition = 0;
@@ -285,7 +289,7 @@ void PS2AudioBackend::submitPcm(std::span<const int16_t> samples)
     if (m_impl->queued + samples.size() > Impl::kRingSamples)
     {
         const size_t drop = std::min(m_impl->queued, std::max(m_impl->queued + samples.size() - Impl::kRingSamples,
-                                                          m_impl->queued > 4096u ? m_impl->queued - 4096u : 0u));
+                                                          m_impl->queued > Impl::kPrimeSamples ? m_impl->queued - Impl::kPrimeSamples : 0u));
         m_impl->read = (m_impl->read + drop) % Impl::kRingSamples;
         m_impl->queued -= drop;
         m_impl->droppedFrames += drop / 2u;
