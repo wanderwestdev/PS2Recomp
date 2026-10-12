@@ -7,8 +7,10 @@
 #include "ps2_vu1_impl.inl"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cfenv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -990,9 +992,38 @@ bool VU1InterpreterAccess::runLoop(VU1Interpreter &vu, uint8_t *vuCode, uint32_t
     return runLoopWith(vu, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles, compiled);
 }
 
+// VU1 execution counters for PS2X_MTVU_STATS (printed by ps2_async_vif.cpp): wall time inside
+// runLoopWith, calls into compiled code, compiled calls that fell back because the pc has no
+// compiled block, and instruction pairs the interpreter ran.
+namespace ps2x::vu1stats
+{
+    std::atomic<uint64_t> g_runNs{0}, g_compiledCalls{0}, g_fallbacks{0}, g_interpretedPairs{0};
+
+    bool enabled()
+    {
+        static const bool on = []
+        {
+            const char *value = std::getenv("PS2X_MTVU_STATS");
+            return value && *value && *value != '0';
+        }();
+        return on;
+    }
+
+    void take(uint64_t &runNs, uint64_t &compiledCalls, uint64_t &fallbacks, uint64_t &interpretedPairs)
+    {
+        runNs = g_runNs.exchange(0u, std::memory_order_relaxed);
+        compiledCalls = g_compiledCalls.exchange(0u, std::memory_order_relaxed);
+        fallbacks = g_fallbacks.exchange(0u, std::memory_order_relaxed);
+        interpretedPairs = g_interpretedPairs.exchange(0u, std::memory_order_relaxed);
+    }
+}
+
 bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize,
                                        GS &gs, PS2Memory *memory, uint32_t maxCycles, CompiledProgram compiled)
 {
+    const bool stats = ps2x::vu1stats::enabled();
+    const auto statsStart = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    uint64_t compiledCalls = 0u, fallbacks = 0u, interpretedPairs = 0u;
     vu.m_activeVuData = vuData;
     vu.m_activeVuDataSize = dataSize;
     vu.m_activeGs = &gs;
@@ -1011,6 +1042,7 @@ bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint
         if (compiled && !interpretNextPair)
         {
             const StepResult result = compiled(vu, compiledArgs);
+            ++compiledCalls;
             if (result == StepResult::Budget)
                 break;
             if (result == StepResult::Ended)
@@ -1018,10 +1050,12 @@ bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint
                 programEnded = true;
                 break;
             }
+            fallbacks += result == StepResult::Fallback ? 1u : 0u;
             interpretNextPair = true;
             continue;
         }
         interpretNextPair = false;
+        ++interpretedPairs;
         if (vu.m_unit == VU1Interpreter::Unit::VU1)
             vu1NormShadow.valid = false;
 
@@ -1057,6 +1091,16 @@ bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint
     vu.m_state.cycles = vu.m_cycle;
     if (changeRounding)
         _mm_setcsr((_mm_getcsr() & ~0x6000u) | (previousCsr & 0x6000u));
+    if (stats)
+    {
+        using namespace ps2x::vu1stats;
+        g_runNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - statsStart).count()),
+                          std::memory_order_relaxed);
+        g_compiledCalls.fetch_add(compiledCalls, std::memory_order_relaxed);
+        g_fallbacks.fetch_add(fallbacks, std::memory_order_relaxed);
+        g_interpretedPairs.fetch_add(interpretedPairs, std::memory_order_relaxed);
+    }
     return programEnded;
 }
 

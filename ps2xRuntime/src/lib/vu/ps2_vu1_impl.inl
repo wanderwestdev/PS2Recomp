@@ -3615,6 +3615,14 @@ struct VU1InterpreterAccess
         if (vu.m_state.branchPending || vu.m_state.ebit || vu.m_state.haltAfterDelaySlot || vu.m_stopRequested ||
             args.dataSize != kFastMemSize || args.codeSize != kFastCodeSize || !args.vuData || vu.m_storeValid != 0u)
             return StepResult::Fallback;
+        // A pc with no compiled block falls back before any setup: the setup and the commit after
+        // the loop cost more than the one interpreted pair that follows, and runLoopWith comes back
+        // here after every pair until execution reaches a compiled block again.
+        {
+            const uint32_t pc = vu.m_state.pc;
+            if ((pc & 7u) != 0u || (pc >> 3) >= entries || table[pc >> 3] == nullptr)
+                return StepResult::Fallback;
+        }
         materializeWrites(vu);
         Vu1FastCtx ctx;
         ctx.norm = vu1NormShadow.norm;

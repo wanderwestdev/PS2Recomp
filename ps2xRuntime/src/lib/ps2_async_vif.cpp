@@ -16,6 +16,18 @@
 #include <algorithm>
 #include <xmmintrin.h>
 
+namespace ps2x::vu1stats
+{
+    // Defined in vu/ps2_vu1_core.cpp: VU1 execution counters since the last call.
+    void take(uint64_t &runNs, uint64_t &compiledCalls, uint64_t &fallbacks, uint64_t &interpretedPairs);
+}
+
+namespace ps2x::gsstats
+{
+    // Defined in gs/gs_frontend.cpp: time inside GS::processGIFPacket since the last call.
+    void take(uint64_t &packetNs, uint64_t &packets);
+}
+
 namespace ps2x::asyncvif
 {
     namespace
@@ -213,9 +225,18 @@ namespace ps2x::asyncvif
                         const double busy = std::chrono::duration<double>(busyTime).count();
                         const uint64_t fields = field > windowField ? field - windowField : 1u;
                         const uint64_t cycles = s_vu1Completed.load(std::memory_order_acquire);
-                        std::fprintf(stderr, "[mtvu] field %llu: %.1f fields/s, VU busy %.0f%%, %.2f ms VU work per field, %.2f M VU cycles per field\n",
+                        uint64_t runNs = 0u, compiledCalls = 0u, fallbacks = 0u, interpretedPairs = 0u;
+                        ps2x::vu1stats::take(runNs, compiledCalls, fallbacks, interpretedPairs);
+                        uint64_t packetNs = 0u, packets = 0u;
+                        ps2x::gsstats::take(packetNs, packets);
+                        std::fprintf(stderr, "[mtvu] field %llu: %.1f fields/s, VU busy %.0f%%, %.2f ms VU work per field, %.2f M VU cycles per field"
+                                             " | VU1 run %.2f ms/field, %.0f compiled calls, %.0f fallbacks, %.0f interpreted pairs per field"
+                                             " | GS frontend %.2f ms/field over %.0f packets\n",
                                      static_cast<unsigned long long>(field), fields / window, 100.0 * busy / window, 1000.0 * busy / fields,
-                                     static_cast<double>(cycles >= windowCycles ? cycles - windowCycles : cycles) / fields / 1000000.0);
+                                     static_cast<double>(cycles >= windowCycles ? cycles - windowCycles : cycles) / fields / 1000000.0,
+                                     runNs / 1.0e6 / fields, static_cast<double>(compiledCalls) / fields,
+                                     static_cast<double>(fallbacks) / fields, static_cast<double>(interpretedPairs) / fields,
+                                     packetNs / 1.0e6 / fields, static_cast<double>(packets) / fields);
                         std::fflush(stderr);
                         busyTime = {};
                         windowStart = now;
