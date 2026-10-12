@@ -25,6 +25,8 @@
 #include <stdexcept>
 #include <fstream>
 #include <algorithm>
+#include <cmath>
+#include <string_view>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -2593,6 +2595,45 @@ void PS2Runtime::run()
     uint32_t lastHashWidth = 0u;
     uint32_t lastHashHeight = 0u;
     bool hadHash = false;
+    // Sharp bilinear: each source pixel is a solid block at the largest whole scale that fits,
+    // and only the one-pixel seam between blocks is blended. Crisp like nearest, without its
+    // uneven pixel widths at a non-integer scale (512 lines into 1080). PS2X_PRESENT_FILTER=bilinear
+    // keeps the plain bilinear stretch.
+    const char *filterSetting = std::getenv("PS2X_PRESENT_FILTER");
+    Shader sharpShader{};
+    int sharpTexSize = -1;
+    int sharpPrescale = -1;
+    if (!(filterSetting && std::string_view(filterSetting) == "bilinear"))
+    {
+        static const char *kSharpBilinear = R"GLSL(#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+uniform vec2 texSize;
+uniform vec2 prescale;
+out vec4 finalColor;
+void main()
+{
+    vec2 texel = fragTexCoord * texSize;
+    vec2 base = floor(texel);
+    vec2 centre = fract(texel) - 0.5;
+    vec2 range = 0.5 - 0.5 / prescale;
+    vec2 f = (centre - clamp(centre, -range, range)) * prescale + 0.5;
+    finalColor = texture(texture0, (base + f) / texSize) * colDiffuse * fragColor;
+}
+)GLSL";
+        sharpShader = LoadShaderFromMemory(nullptr, kSharpBilinear);
+        if (IsShaderValid(sharpShader))
+        {
+            sharpTexSize = GetShaderLocation(sharpShader, "texSize");
+            sharpPrescale = GetShaderLocation(sharpShader, "prescale");
+        }
+        else
+        {
+            std::cerr << "[present] sharp bilinear shader unavailable; using bilinear" << std::endl;
+        }
+    }
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         if (IsWindowMinimized())
@@ -2686,7 +2727,20 @@ void PS2Runtime::run()
             }
             const Rectangle srcRect{0.0f, 0.0f, static_cast<float>(presentWidth), static_cast<float>(presentHeight)};
             const Rectangle dstRect{(screenWidth - dstWidth) * 0.5f, (screenHeight - dstHeight) * 0.5f, dstWidth, dstHeight};
+            const bool sharp = sharpTexSize >= 0;
+            if (sharp)
+            {
+                SetTextureFilter(displayTex, TEXTURE_FILTER_BILINEAR);
+                const float texSize[2] = {static_cast<float>(presentWidth), static_cast<float>(presentHeight)};
+                const float prescale[2] = {std::max(1.0f, std::floor(dstWidth / texSize[0])),
+                                           std::max(1.0f, std::floor(dstHeight / texSize[1]))};
+                SetShaderValue(sharpShader, sharpTexSize, texSize, SHADER_UNIFORM_VEC2);
+                SetShaderValue(sharpShader, sharpPrescale, prescale, SHADER_UNIFORM_VEC2);
+                BeginShaderMode(sharpShader);
+            }
             DrawTexturePro(displayTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+            if (sharp)
+                EndShaderMode();
         }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
