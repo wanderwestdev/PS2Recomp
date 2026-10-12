@@ -51,8 +51,8 @@ namespace ps2x::iop
     struct MemoryCardRequest
     {
         MemoryCardOperation operation = MemoryCardOperation::Init;
-        // The fifth argument is carried in $t0 by the EE n32 ABI
-        std::array<uint32_t, 5> arguments{};
+        // arguments[4] is $t0 and arguments[5] is $t1. sceMcGetDir's table pointer is the sixth argument.
+        std::array<uint32_t, 6> arguments{};
     };
 
     class IopHost

@@ -279,6 +279,29 @@ namespace
         require(iop.debugSnapshot().diagnostics.empty(), "stale load outcomes survived reset");
     }
 
+    void mcGetDirDispatches()
+    {
+        Host host;
+        IopSubsystem iop(host);
+        require(iop.loadModule("rom0:MCSERV").moduleId > 0, "MCSERV load failed");
+        host.fill(0x1000u, 1044u, 0u);
+        const std::array<uint32_t, 5> header{0u, 0u, 0u, 8u, 0x2000u};
+        require(host.writeGuest(0x1000u, header.data(), sizeof(header)), "packet header write failed");
+        constexpr char name[] = "/BASLUS-*";
+        require(host.writeGuest(0x1014u, name, sizeof(name)), "packet filename write failed");
+        auto query = request(mcSid, 0x0Du, 4u);
+        query.send = {0x1000u, 1044u};
+        const size_t before = host.cardCalls.size();
+        require(iop.handleRpc(query).handled, "getdir RPC failed");
+        require(host.cardCalls.size() == before + 1u, "getdir was not dispatched");
+        const auto &call = host.cardCalls.back();
+        require(call.operation == MemoryCardOperation::GetDir &&
+                    call.arguments[0] == 0u && call.arguments[1] == 0u &&
+                    call.arguments[2] == 0x1014u && call.arguments[4] == 8u &&
+                    call.arguments[5] == 0x2000u,
+                "getdir packet did not carry the table pointer");
+    }
+
     void libsdUnchanged()
     {
         Host host;
@@ -304,6 +327,7 @@ int main()
         {"MCSERV response bounds for both dialects", mcReplyBounds},
         {"MCSERV rejects truncated name packet", mcShortNamePacket},
         {"MCSERV accepts complete name packets in both dialects", mcFullNamePacket},
+        {"MCSERV getdir passes the entry table to the card", mcGetDirDispatches},
         {"MCSERV status replies preserve bounds and cannot wrap", mcStatusBounds},
         {"Extended module aliases and activation", moduleAliases},
         {"Unsupported debug and game IRX stay unsupported", unknownModulesStayUnknown},
