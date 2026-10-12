@@ -306,6 +306,17 @@ namespace ps2_host_input
                 }
             }
             input.active = input.active || input.buttons != 0u;
+            if (input.buttons != 0u)
+            {
+                static uint64_t loggedBucket = ~0ull;
+                const uint64_t bucket = vsyncTick / 200u;
+                if (bucket != loggedBucket)
+                {
+                    loggedBucket = bucket;
+                    std::cerr << "[input] tick " << vsyncTick
+                              << " buttons 0x" << std::hex << input.buttons << std::dec << "\n";
+                }
+            }
             return input;
         }
 
@@ -533,11 +544,12 @@ namespace ps2_host_input
             }
             if (gamepadAvailable)
             {
-                state.leftX = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
-                state.leftY = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y));
+                const auto resting = [](float axis) { return std::fabs(axis) < 0.15f ? 0.0f : axis; };
+                state.leftX = axisToByte(resting(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X)));
+                state.leftY = axisToByte(resting(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y)));
                 const uint32_t invert = rightStickInvert();
-                const float rightX = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X);
-                const float rightY = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y);
+                const float rightX = resting(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X));
+                const float rightY = resting(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
                 state.rightX = axisToByte((invert & kInvertRightX) != 0u ? -rightX : rightX);
                 state.rightY = axisToByte((invert & kInvertRightY) != 0u ? -rightY : rightY);
             }
