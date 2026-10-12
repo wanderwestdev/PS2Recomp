@@ -526,8 +526,9 @@ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &reques
         setRegU32(&context, static_cast<int>(4 + i), request.arguments[i]);
     }
 
-    // EE n32 ABI: the fifth argument travels in $t0, matching the sceMc* stubs.
+    // EE n32 ABI: the fifth argument travels in $t0 and the sixth in $t1, matching the sceMc* stubs.
     setRegU32(&context, 8, request.arguments[4]);
+    setRegU32(&context, 9, request.arguments[5]);
 
     handler(m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM(),
             &context,
