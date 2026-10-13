@@ -501,6 +501,11 @@ namespace ps2x::asyncvif
         return now < timing.busyUntil;
     }
 
+    void syncVu1(PS2Memory &memory)
+    {
+        syncVu(memory);
+    }
+
     void sync(PS2Memory &memory)
     {
         if (t_onWorker)

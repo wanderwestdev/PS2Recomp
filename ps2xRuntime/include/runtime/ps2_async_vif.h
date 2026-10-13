@@ -33,6 +33,9 @@ namespace ps2x::asyncvif
     std::vector<uint8_t> takeBuffer();
     void enqueue(PS2Memory &memory, std::vector<Item> &&items);
     void sync(PS2Memory &memory);
+    // Waits for the VU thread only. The GIF stage keeps drawing what it already has; every
+    // later GIF transfer still goes through the VU thread's queue, so the order is kept.
+    void syncVu1(PS2Memory &memory);
     void stop(PS2Memory &memory);
 
     struct Vu1TimingHooks
