@@ -157,6 +157,11 @@ namespace ps2recomp
         m_emitInstructionComments = emitInstructionComments;
     }
 
+    void CodeGenerator::setRestrictPointers(bool restrictPointers)
+    {
+        m_restrictPointers = restrictPointers;
+    }
+
     void CodeGenerator::setReporter(RecompilerReporter *reporter)
     {
         m_reporter = reporter;

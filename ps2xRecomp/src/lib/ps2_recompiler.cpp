@@ -1063,6 +1063,7 @@ namespace ps2recomp
                 m_codeGenerator->setRuntimeRelocationSites(loadRuntimeRelocationSites(m_config.runtimeRelocationsPath));
             }
             m_codeGenerator->setEmitInstructionComments(true);
+            m_codeGenerator->setRestrictPointers(m_config.restrictPointers);
 
             fs::create_directories(m_config.outputPath);
 
