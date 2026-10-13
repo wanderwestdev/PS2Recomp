@@ -92,7 +92,20 @@ struct PS2AudioBackend::Impl
     size_t read = 0u;
     size_t queued = 0u;
     static constexpr size_t kPrimeSamples = 8192u;
+    // After an underrun, playback resumes with about 21 ms queued instead of the start-up 85 ms:
+    // the hitch that caused it is already over, and waiting for 85 ms only made every cut longer.
+    static constexpr size_t kRePrimeSamples = 2048u;
     static constexpr int32_t kFadeFrames = 128;
+    // Gap concealment: while the queue is empty, replay the last kGrainFrames of output in a loop
+    // (crossfaded at each wrap) and fade it out over kConcealFrames, instead of going silent at once.
+    // A short game hitch then sounds like a brief smear rather than a cut.
+    static constexpr int32_t kGrainFrames = 960;      // 20 ms
+    static constexpr int32_t kConcealFrames = 14400;  // 300 ms
+    std::array<int16_t, kGrainFrames * 2> history{};
+    int32_t historyPos = 0;
+    int32_t concealPos = 0;
+    int32_t concealHead = 0;
+    bool conceal = true; // PS2X_AUDIO_CONCEAL=0: old behavior (85 ms re-prime, fade to silence)
     bool primed = false;
     int32_t fadePosition = 0;
     int32_t gapRemaining = 0;
@@ -103,6 +116,7 @@ struct PS2AudioBackend::Impl
     AudioStream stream{};
     bool streamReady = false;
     std::FILE *dump = nullptr;
+    std::FILE *outDump = nullptr;
     uint32_t dumpBytes = 0u;
     bool statsEnabled = false;
     bool everPrimed = false;
@@ -124,21 +138,23 @@ struct PS2AudioBackend::Impl
             return;
         std::lock_guard<std::mutex> lock(owner->pcmMutex);
         owner->requestedFrames += frames;
-        if (!owner->primed && owner->queued >= kPrimeSamples)
-        {
-            owner->primed = true;
-            owner->everPrimed = true;
-            owner->fadePosition = 0;
-            owner->fadeSource = owner->lastOutput;
-        }
         for (size_t frame = 0u; frame < frames; ++frame)
         {
+            if (!owner->primed && owner->queued >= (owner->everPrimed && owner->conceal ? kRePrimeSamples : kPrimeSamples))
+            {
+                owner->primed = true;
+                owner->everPrimed = true;
+                owner->fadePosition = 0;
+                owner->fadeSource = owner->lastOutput;
+            }
             if (owner->primed && owner->queued < 2u)
             {
                 owner->primed = false;
                 ++owner->underruns;
                 owner->gapRemaining = kFadeFrames;
                 owner->gapSource = owner->lastOutput;
+                owner->concealPos = 0;
+                owner->concealHead = 0;
             }
             if (owner->primed)
             {
@@ -148,20 +164,54 @@ struct PS2AudioBackend::Impl
                 {
                     const int32_t sample = owner->ring[(owner->read + channel) % kRingSamples];
                     owner->lastOutput[channel] = static_cast<int16_t>((sample * fade + owner->fadeSource[channel] * (kFadeFrames - fade)) / kFadeFrames);
+                    owner->history[owner->historyPos * 2 + channel] = owner->lastOutput[channel];
                 }
+                owner->historyPos = (owner->historyPos + 1) % kGrainFrames;
                 owner->read = (owner->read + 2u) % kRingSamples;
                 owner->queued -= 2u;
             }
-            else
+            else if (owner->everPrimed && !owner->conceal)
             {
-                owner->missingFrames += owner->everPrimed ? 1u : 0u;
+                ++owner->missingFrames;
                 owner->gapRemaining = std::max(owner->gapRemaining - 1, 0);
                 for (size_t channel = 0u; channel < 2u; ++channel)
                     owner->lastOutput[channel] = static_cast<int16_t>(owner->gapSource[channel] * owner->gapRemaining / kFadeFrames);
             }
+            else if (owner->everPrimed)
+            {
+                ++owner->missingFrames;
+                // Loop the last 20 ms (oldest sample first) with a crossfaded loop point: over the
+                // grain's last kFadeFrames the start of the grain fades in, then the playhead jumps
+                // back to kFadeFrames, which continues that faded-in signal without a step. Entry
+                // fades from the last live sample; the whole loop fades out over 300 ms.
+                const int32_t pos = owner->concealPos;
+                const int32_t head = owner->concealHead;
+                const int32_t gain = std::max(kConcealFrames - pos, 0);
+                for (size_t channel = 0u; channel < 2u; ++channel)
+                {
+                    const auto at = [&](int32_t i)
+                    { return static_cast<int32_t>(owner->history[((owner->historyPos + i) % kGrainFrames) * 2 + channel]); };
+                    int32_t sample = at(head);
+                    const int32_t loopStart = kGrainFrames - kFadeFrames;
+                    if (head >= loopStart)
+                    {
+                        const int32_t w = head - loopStart;
+                        sample = (sample * (kFadeFrames - w) + at(head - loopStart) * w) / kFadeFrames;
+                    }
+                    if (pos < kFadeFrames)
+                        sample = (sample * pos + owner->gapSource[channel] * (kFadeFrames - pos)) / kFadeFrames;
+                    owner->lastOutput[channel] = static_cast<int16_t>(static_cast<int64_t>(sample) * gain / kConcealFrames);
+                }
+                owner->concealHead = head + 1 >= kGrainFrames ? kFadeFrames : head + 1;
+                owner->concealPos = std::min(pos + 1, kConcealFrames);
+            }
             output[frame * 2u] = owner->lastOutput[0];
             output[frame * 2u + 1u] = owner->lastOutput[1];
         }
+        // PS2X_AUDIO_OUT_DUMP: raw 48 kHz stereo s16 of what the device plays (debugging only;
+        // writes from the audio callback).
+        if (owner->outDump)
+            std::fwrite(output, sizeof(int16_t), requested, owner->outDump);
     }
 
     void finishDump()
@@ -217,6 +267,10 @@ void PS2AudioBackend::setAudioReady(bool ready)
         const char *audioMute = std::getenv("PS2X_AUDIO_MUTE");
         if (audioMute && *audioMute && *audioMute != '0')
             SetMasterVolume(0.0f);
+        const char *concealValue = std::getenv("PS2X_AUDIO_CONCEAL");
+        m_impl->conceal = !(concealValue && *concealValue == '0');
+        if (const char *outPath = std::getenv("PS2X_AUDIO_OUT_DUMP"); outPath && *outPath)
+            m_impl->outDump = std::fopen(outPath, "wb");
         SetAudioStreamBufferSizeDefault(512);
         m_impl->stream = LoadAudioStream(48000, 16, 2);
         m_impl->streamReady = m_impl->stream.buffer != nullptr;
@@ -247,6 +301,11 @@ void PS2AudioBackend::setAudioReady(bool ready)
             m_impl->streamReady = false;
             Impl::streamOwner = nullptr;
         }
+        if (m_impl->outDump)
+        {
+            std::fclose(m_impl->outDump);
+            m_impl->outDump = nullptr;
+        }
         m_impl->finishDump();
         resetPcm();
     }
@@ -264,6 +323,10 @@ void PS2AudioBackend::resetPcm()
     m_impl->lastOutput = {};
     m_impl->fadeSource = {};
     m_impl->gapSource = {};
+    m_impl->history = {};
+    m_impl->historyPos = 0;
+    m_impl->concealPos = 0;
+    m_impl->concealHead = 0;
     m_impl->everPrimed = false;
     m_impl->producedFrames = 0u;
     m_impl->requestedFrames = 0u;
