@@ -3206,6 +3206,22 @@ struct VU1InterpreterAccess
         if constexpr (cross)
             result = _mm_and_ps(result, destMask(0xEu));
 
+#if defined(PS2X_VU1_FAST_FLOAT)
+        // Fast float (PS2X_VU1_FAST_FLOAT): IEEE math, then the PS2's overflow clamp to +-max.
+        // runLoopWith sets FTZ, so an underflow is already a signed zero. Operands arrive
+        // normalized (vnorm), so no input is a denormal or infinity. There is no exact path:
+        // where the PS2's FMAC rounds differently (cancellation in MADD/MSUB), the result may
+        // differ in the last bits. The safety check below costs more than the arithmetic.
+        result = _mm_min_ps(_mm_max_ps(result, _mm_set1_ps(-std::numeric_limits<float>::max())),
+                            _mm_set1_ps(std::numeric_limits<float>::max()));
+        {
+            const __m128 fastZero = _mm_setzero_ps();
+            __m128 fastProductZero = fastZero;
+            if constexpr (!(K == FK::Add || K == FK::Sub))
+                fastProductZero = _mm_or_ps(_mm_cmpeq_ps(s, fastZero), _mm_cmpeq_ps(t, fastZero));
+            return {s, t, result, product, _mm_cmpeq_ps(result, fastZero), fastProductZero, true};
+        }
+#endif
         const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
         const __m128 zero = _mm_setzero_ps();
         const __m128 absResult = _mm_and_ps(result, absMask);
