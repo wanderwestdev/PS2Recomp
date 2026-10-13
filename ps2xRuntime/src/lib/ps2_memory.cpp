@@ -2476,7 +2476,18 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 {
     if (address == 0x10009000u && ps2x::asyncvif::vu1Busy(*this))
         return (m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u) | 0x100u;
-    if (isAsyncVifRegister(address))
+    // GIF and VIF1 status reads (a game polling for draw finish) only need the VU thread to
+    // finish: the PS2 reports the paths idle once the data left them, not once the GS drew it.
+    // FIFO reads still wait for the GS, which may be sending data back.
+    // PS2X_STATUS_FULL_SYNC=1 waits for the GS as well (the old behavior, for comparison).
+    static const bool fullStatusSync = []
+    {
+        const char *value = std::getenv("PS2X_STATUS_FULL_SYNC");
+        return value && *value && *value != '0';
+    }();
+    if (address < 0x10005000u && !fullStatusSync && isAsyncVifRegister(address))
+        ps2x::asyncvif::syncVu1(*this);
+    else if (isAsyncVifRegister(address))
         ps2x::asyncvif::sync(*this);
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
