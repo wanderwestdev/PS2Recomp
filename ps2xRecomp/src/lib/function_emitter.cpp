@@ -83,7 +83,10 @@ namespace ps2recomp
             sanitizedName = nameBuilder.str();
         }
 
-        ss << "void " << sanitizedName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
+        if (cg.m_restrictPointers)
+            ss << "void " << sanitizedName << "(uint8_t* __restrict rdram, R5900Context* __restrict ctx, PS2Runtime *runtime) {\n";
+        else
+            ss << "void " << sanitizedName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
         ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
         ss << "    PS_LOG_ENTRY(\"" << sanitizedName << "\");\n";
         ss << "#endif\n";

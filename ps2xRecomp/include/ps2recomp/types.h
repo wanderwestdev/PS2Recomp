@@ -199,6 +199,10 @@ namespace ps2recomp
         std::vector<JumpTable> jumpTables;
         bool autoStubByName = true;
         bool directTailCalls = true;
+        // restrict_pointers: generated functions take rdram and ctx as __restrict. They never alias
+        // (separate host allocations); without the promise, MSVC reloads guest registers after every
+        // RAM store because it has no type-based alias analysis.
+        bool restrictPointers = false;
         std::string runtimeRelocationsPath;
     };
 

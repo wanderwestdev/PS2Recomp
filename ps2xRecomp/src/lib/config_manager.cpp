@@ -66,6 +66,7 @@ namespace ps2recomp
             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
             config.autoStubByName = toml::find_or<bool>(general, "auto_stub_by_name", config.autoStubByName);
             config.directTailCalls = toml::find_or<bool>(general, "direct_tail_calls", config.directTailCalls);
+            config.restrictPointers = toml::find_or<bool>(general, "restrict_pointers", config.restrictPointers);
             config.runtimeRelocationsPath = toml::find_or<std::string>(general, "runtime_relocations", "");
 
             if (general.contains("stubs") && general.at("stubs").is_array())
