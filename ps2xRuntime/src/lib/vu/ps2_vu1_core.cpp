@@ -1030,9 +1030,16 @@ bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint
     vu.m_activeMemory = memory;
 
     const unsigned previousCsr = _mm_getcsr();
-    const bool changeRounding = (previousCsr & 0x6000u) != 0x6000u;
+#if defined(PS2X_VU1_FAST_FLOAT)
+    // Round toward zero as the PS2 does, plus flush-to-zero: fast-float FMAC results that underflow
+    // become signed zeros, as on the PS2, without the exact path (ps2_vu1_impl.inl fmacCore).
+    constexpr unsigned kVuCsrBits = 0x6000u | 0x8000u;
+#else
+    constexpr unsigned kVuCsrBits = 0x6000u;
+#endif
+    const bool changeRounding = (previousCsr & kVuCsrBits) != kVuCsrBits;
     if (changeRounding)
-        _mm_setcsr(previousCsr | 0x6000u);
+        _mm_setcsr(previousCsr | kVuCsrBits);
     const uint64_t budgetEnd = vu.m_cycle + maxCycles;
     bool programEnded = false;
     const Vu1RunArgs compiledArgs{vuData, dataSize, &gs, memory, codeSize, budgetEnd};
@@ -1090,7 +1097,7 @@ bool VU1InterpreterAccess::runLoopWith(VU1Interpreter &vu, uint8_t *vuCode, uint
     }
     vu.m_state.cycles = vu.m_cycle;
     if (changeRounding)
-        _mm_setcsr((_mm_getcsr() & ~0x6000u) | (previousCsr & 0x6000u));
+        _mm_setcsr((_mm_getcsr() & ~kVuCsrBits) | (previousCsr & kVuCsrBits));
     if (stats)
     {
         using namespace ps2x::vu1stats;
