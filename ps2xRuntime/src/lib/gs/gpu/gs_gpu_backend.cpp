@@ -88,6 +88,7 @@ namespace
     constexpr uint32_t FPabe = 32u;
     constexpr uint32_t FLinear = 64u;
     constexpr uint32_t FWrap = 128u;
+    constexpr uint32_t FHiTex = 256u; // texture read from the high-resolution samples
 
     uint32_t fbits(float value)
     {
@@ -117,6 +118,9 @@ namespace
     };
 
     std::atomic<bool> s_asyncPresent{false};
+    // Internal resolution requested by the host (0 = not yet; PS2X_GS_SCALE at start) and in effect.
+    std::atomic<uint32_t> s_requestedScale{0u};
+    std::atomic<uint32_t> s_activeScale{1u};
 
     constexpr size_t kRingChunk = 16u * 1024u * 1024u;
     constexpr uint32_t kRingChunks = 4u;
@@ -241,6 +245,60 @@ struct GSGpuBackend::Impl
     Program presentHash;
     Program pageCopy;
     Program hwRaster;
+    // Internal resolution (PS2X_GS_SCALE): a high-resolution copy of GS memory, SS x SS samples per
+    // word, drawn by the HIRES programs next to the unchanged native pass (gs_gpu_shaders.cpp).
+    struct HiPrograms
+    {
+        Program raster;
+        Program pageCopy;
+        Program replicate;
+        Program present;
+    };
+    std::array<HiPrograms, 5> hiPrograms{};
+    std::string hiBasePrefix;
+    bool hwAvailable = false;
+    bool hiForce = false;
+    Program rasterHi;
+    Program pageCopyHi;
+    Program replicateHi;
+    Program presentHi;
+    GLuint vramHiBuffer = 0;
+    uint32_t hiScale = 1u;
+    bool hiActive = false;
+    // Frame buffers (fbp | fbw << 9) that received textured triangles: the 3D scene, drawn at high
+    // resolution. Other targets (blur chains, glow volumes, masks) are drawn natively and replicated,
+    // unless the batch copies a high-resolution image at about 1:1 (batchHiCopy).
+    std::bitset<1u << 15u> hiTargets;
+    bool batchHiCopy = false;
+    bool hiAllTargets = false;
+    // Pages last written by the high-resolution raster. A textured state whose first texture page
+    // is in here reads the samples (FHiTex); batches never read pages they write (prepareTarget).
+    std::bitset<kPages> hiRendered;
+    // Pages last drawn by a native-only batch: their samples are out of date until replicated, which
+    // happens when a high-resolution batch or the presentation needs them.
+    std::bitset<kPages> hiStale;
+    // Frame pacing: a fence per presented frame; presenting frame N waits for frame N - k to finish
+    // on the GPU (PS2X_GS_FRAMES_IN_FLIGHT = k, default 2, 0 = off). Without it the GS thread can
+    // queue many frames of work, and every frame the window shows waits behind that queue.
+    std::deque<GLsync> presentFences;
+
+    void paceFrames()
+    {
+        static const size_t inFlight = []
+        {
+            const char *value = std::getenv("PS2X_GS_FRAMES_IN_FLIGHT");
+            return static_cast<size_t>(value && *value ? std::clamp(std::atoi(value), 0, 8) : 2);
+        }();
+        if (inFlight == 0u)
+            return;
+        presentFences.push_back(gl().FenceSync(kSyncGpuCommandsComplete, 0u));
+        while (presentFences.size() > inFlight)
+        {
+            gl().ClientWaitSync(presentFences.front(), kSyncFlushCommandsBit, 1000000000ull);
+            gl().DeleteSync(presentFences.front());
+            presentFences.pop_front();
+        }
+    }
     GLuint hwFramebuffer = 0;
     GLuint hwVertexArray = 0;
     bool hwEnabled = false;
@@ -529,6 +587,7 @@ struct GSGpuBackend::Impl
     ~Impl()
     {
         stopCompileWorker();
+        stopHiCompiler();
         if (initialized && prof.enabled)
         {
             profResolve();
@@ -561,6 +620,12 @@ struct GSGpuBackend::Impl
             for (auto &[key, program] : hwVariants)
                 if (program.id)
                     gl.DeleteProgram(program.id);
+            for (HiPrograms &programs : hiPrograms)
+                for (Program *program : {&programs.raster, &programs.pageCopy, &programs.replicate, &programs.present})
+                    if (program->id)
+                        gl.DeleteProgram(program->id);
+            if (vramHiBuffer)
+                gl.DeleteBuffers(1, &vramHiBuffer);
             if (hwVertexShader)
                 gl.DeleteShader(hwVertexShader);
         }
@@ -697,11 +762,14 @@ struct GSGpuBackend::Impl
             }
         }
         const char *text = source.c_str();
+        const auto compileStart = std::chrono::steady_clock::now();
         const GLuint shader = gl().CreateShader(kComputeShader);
         gl().ShaderSource(shader, 1, &text, nullptr);
         gl().CompileShader(shader);
         GLint ok = 0;
         gl().GetShaderiv(shader, kCompileStatus, &ok);
+        if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compileStart).count(); ms > 250.0)
+            std::fprintf(stderr, "[gs-gpu] compute shader compiled in %.0f ms (%zu bytes of source)\n", ms, source.size());
         if (!ok)
         {
             GLint length = 0;
@@ -1261,7 +1329,9 @@ struct GSGpuBackend::Impl
             {"TABLE_P8", PixelStorageMode::P8}, {"TABLE_P4", PixelStorageMode::P4}};
         const uint32_t sizes[] = {65536u, 65536u, 131072u, 131072u, 131072u, 131072u, 262144u, 524288u};
         std::vector<uint16_t> swizzle;
-        std::string prefix = "#version 460 core\n";
+        // Ballot lets the raster loops mark the primitive index as uniform across the wave, so the
+        // primitive and state reads become scalar loads (the shaders check for the extension).
+        std::string prefix = "#version 460 core\n#extension GL_ARB_shader_ballot : enable\n";
         for (size_t i = 0; i < std::size(tables); ++i)
         {
             prefix += "#define " + std::string(tables[i].first) + " " + std::to_string(swizzle.size()) + "u\n";
@@ -1305,6 +1375,7 @@ struct GSGpuBackend::Impl
             return false;
         }
         hwEnabled = setupHardwareRaster(prefix);
+        setupHiRes(prefix);
         const char *hashValue = std::getenv("PS2X_FRAME_HASH");
         if (context.Shared() && hashValue && *hashValue == '1')
         {
@@ -1322,6 +1393,265 @@ struct GSGpuBackend::Impl
         return true;
     }
 
+    // Internal resolution: PS2X_GS_SCALE=2..4 at start, GSGpuBackend::RequestInternalScale later.
+    void setupHiRes(const std::string &prefix)
+    {
+        hiBasePrefix = prefix;
+        hwAvailable = hwEnabled;
+        // PS2X_GS_HI_FORCE=1 with scale 1: run the high-resolution path at 1x (overhead measurements).
+        const char *force = std::getenv("PS2X_GS_HI_FORCE");
+        hiForce = force && *force == '1';
+        // PS2X_GS_HI_ALL=1: every batch at high resolution (comparisons).
+        const char *all = std::getenv("PS2X_GS_HI_ALL");
+        hiAllTargets = all && *all == '1';
+        uint32_t scale = s_requestedScale.load();
+        if (scale == 0u)
+        {
+            const char *value = std::getenv("PS2X_GS_SCALE");
+            scale = static_cast<uint32_t>(std::clamp(value && *value ? std::atoi(value) : 1, 1, 4));
+            uint32_t expected = 0u;
+            s_requestedScale.compare_exchange_strong(expected, scale);
+            scale = s_requestedScale.load();
+        }
+        setScale(scale);
+        // Compile these scales in the background now, so a later switch (the Options menu, F8) does
+        // not wait for the compiler. PS2X_GS_HI_PREWARM=<digits>, 0 for none; default 2 and 3.
+        const char *prewarm = std::getenv("PS2X_GS_HI_PREWARM");
+        for (const char *c = prewarm && *prewarm ? prewarm : "23"; *c; ++c)
+            if (*c >= '2' && *c <= '4')
+                queueHiCompile(static_cast<uint32_t>(*c - '0'));
+    }
+
+    // The high-resolution programs take about 10 s per scale to compile on the reference driver, so
+    // a worker thread with its own shared context compiles them (the shader binary cache makes later
+    // runs fast). A requested scale takes effect once its programs are ready; until then the
+    // current scale stays.
+    enum : int { HiNone = 0, HiCompiling = 1, HiReady = 2, HiFailed = 3 };
+    std::array<std::atomic<int>, 5> hiCompileState{};
+    std::thread hiCompiler;
+    void *hiWorkerContext = nullptr;
+    std::mutex hiCompileMutex;
+    std::condition_variable hiCompileCv;
+    std::deque<uint32_t> hiCompileQueue;
+    bool hiCompileStop = false;
+
+    std::string hiPrefixFor(uint32_t scale) const
+    {
+        std::string hiPrefix = hiBasePrefix + "#define HIRES 1\n#define SS " + std::to_string(scale) + "u\n";
+        // PS2X_GS_HI_DEFINES=A,B: extra defines for experiments on the high-resolution shaders.
+        if (const char *extra = std::getenv("PS2X_GS_HI_DEFINES"); extra && *extra)
+        {
+            std::string list = extra;
+            for (size_t at = 0; (at = list.find(',', at)) != std::string::npos;)
+                list.replace(at, 1, "\n#define ");
+            hiPrefix += "#define " + list + "\n";
+        }
+        return hiPrefix;
+    }
+
+    bool compileHiPrograms(uint32_t scale, HiPrograms &compiled)
+    {
+        const std::string hiPrefix = hiPrefixFor(scale);
+        const std::string common = GSGpuShaders::kCommonHi;
+        const std::string rasterBody = common + GSGpuShaders::kRaster;
+        const std::string pageCopyBody = common + GSGpuShaders::kPageCopyHi;
+        const std::string replicateBody = common + GSGpuShaders::kReplicate;
+        const std::string presentBody = common + GSGpuShaders::kPresent;
+        const auto start = std::chrono::steady_clock::now();
+        if (!compile(compiled.raster, hiPrefix, rasterBody.c_str(), {"uRaster"}) || !compile(compiled.pageCopy, hiPrefix, pageCopyBody.c_str(), {}) ||
+            !compile(compiled.replicate, hiPrefix, replicateBody.c_str(), {}) ||
+            !compile(compiled.present, hiPrefix, presentBody.c_str(), {"uOut", "uC1", "uC2", "uMode"}))
+        {
+            for (Program *program : {&compiled.raster, &compiled.pageCopy, &compiled.replicate, &compiled.present})
+                if (program->id)
+                    gl().DeleteProgram(program->id);
+            compiled = {};
+            std::fprintf(stderr, "[gs-gpu] internal resolution x%u unavailable (shader compile failed)\n", scale);
+            std::fflush(stderr);
+            return false;
+        }
+        std::fprintf(stderr, "[gs-gpu] internal resolution x%u programs ready in %.0f ms\n", scale,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        std::fflush(stderr);
+        return true;
+    }
+
+    void hiCompileWorker()
+    {
+        if (!context.MakeWorkerCurrent(hiWorkerContext))
+            return;
+        ThreadNaming::SetCurrentThreadName("GSHiResCompiler");
+#if defined(_WIN32)
+        SetThreadPriority(GetCurrentThread(), -1);
+#endif
+        for (;;)
+        {
+            uint32_t scale = 0u;
+            {
+                std::unique_lock<std::mutex> lock(hiCompileMutex);
+                hiCompileCv.wait(lock, [&] { return hiCompileStop || !hiCompileQueue.empty(); });
+                if (hiCompileStop)
+                    break;
+                scale = hiCompileQueue.front();
+                hiCompileQueue.pop_front();
+            }
+            HiPrograms compiled;
+            const bool ok = compileHiPrograms(scale, compiled);
+            gl().Finish();
+            if (ok)
+            {
+                std::lock_guard<std::mutex> lock(hiCompileMutex);
+                hiPrograms[scale] = compiled;
+            }
+            hiCompileState[scale].store(ok ? HiReady : HiFailed);
+        }
+        gl().Finish();
+    }
+
+    // Queue a scale for the worker. False when there is no worker (compile on this thread instead).
+    bool queueHiCompile(uint32_t scale)
+    {
+        if (!hiCompiler.joinable())
+        {
+            hiWorkerContext = context.CreateWorker();
+            if (!hiWorkerContext)
+                return false;
+            hiCompiler = std::thread([this] { hiCompileWorker(); });
+        }
+        int expected = HiNone;
+        if (hiCompileState[scale].compare_exchange_strong(expected, HiCompiling))
+        {
+            std::lock_guard<std::mutex> lock(hiCompileMutex);
+            hiCompileQueue.push_back(scale);
+            hiCompileCv.notify_all();
+        }
+        return true;
+    }
+
+    void stopHiCompiler()
+    {
+        if (!hiCompiler.joinable())
+            return;
+        {
+            std::lock_guard<std::mutex> lock(hiCompileMutex);
+            hiCompileStop = true;
+        }
+        hiCompileCv.notify_all();
+        hiCompiler.join();
+        Context::DestroyWorker(hiWorkerContext);
+        hiWorkerContext = nullptr;
+    }
+
+    // True when the programs for a scale are ready. Otherwise starts compiling them, on the worker
+    // when there is one (false until it finishes), or right here.
+    bool hiProgramsFor(uint32_t scale)
+    {
+        const int state = hiCompileState[scale].load();
+        if (state == HiReady)
+            return true;
+        if (state == HiFailed)
+            return false;
+        if (queueHiCompile(scale))
+            return false;
+        HiPrograms compiled;
+        const bool ok = compileHiPrograms(scale, compiled);
+        if (ok)
+            hiPrograms[scale] = compiled;
+        hiCompileState[scale].store(ok ? HiReady : HiFailed);
+        return ok;
+    }
+    // Switch the internal resolution: the samples start as copies of native memory.
+    void setScale(uint32_t scale)
+    {
+        scale = std::clamp<uint32_t>(scale, 1u, 4u);
+        const bool wantHi = scale > 1u || hiForce;
+        if (wantHi == hiActive && (!wantHi || scale == hiScale))
+        {
+            s_activeScale.store(scale);
+            return;
+        }
+        if (wantHi && !hiProgramsFor(scale))
+        {
+            // Still compiling: keep the current scale and try again at the next frame. If the
+            // programs failed, stay where we are and stop asking.
+            if (hiCompileState[scale].load() == HiFailed)
+                s_requestedScale.store(hiActive ? hiScale : 1u);
+            return;
+        }
+        if (vramHiBuffer)
+        {
+            gl().DeleteBuffers(1, &vramHiBuffer);
+            vramHiBuffer = 0u;
+        }
+        hiActive = false;
+        hiScale = 1u;
+        hwEnabled = hwAvailable;
+        hiRendered.reset();
+        hiStale.reset();
+        hiTargets.reset();
+        if (wantHi)
+        {
+            rasterHi = hiPrograms[scale].raster;
+            pageCopyHi = hiPrograms[scale].pageCopy;
+            replicateHi = hiPrograms[scale].replicate;
+            presentHi = hiPrograms[scale].present;
+            const size_t words = (GSSwizzle::kMemorySize + static_cast<size_t>(kShadowPages) * 8192u) / 4u;
+            vramHiBuffer = makeBuffer(words * scale * scale * 4u, nullptr, 11u);
+            hiScale = scale;
+            hiActive = true;
+            // The high-resolution pass reuses the compute rasterizer's tile bins.
+            hwEnabled = false;
+            if (initialized)
+            {
+                barrier();
+                replicatePages(std::bitset<kPages>().set());
+            }
+            std::fprintf(stderr, "[gs-gpu] internal resolution x%u (%zu MiB of samples)\n", scale, words * scale * scale * 4u >> 20u);
+        }
+        else
+            std::fprintf(stderr, "[gs-gpu] native resolution\n");
+        std::fflush(stderr);
+        s_activeScale.store(hiActive ? hiScale : 1u);
+    }
+
+    // Apply a scale requested from another thread (called on the GS thread between frames).
+    void applyRequestedScale()
+    {
+        const uint32_t want = s_requestedScale.load();
+        if (want != 0u && initialized && want != (hiActive ? hiScale : 1u))
+        {
+            flushBatch();
+            setScale(want);
+        }
+    }
+
+    // Native words of these pages to every sample, and the pages marked as not drawn at high resolution.
+    void replicatePages(const std::bitset<kPages> &pages)
+    {
+        if (!hiActive || pages.none())
+            return;
+        hiRendered &= ~pages;
+        hiStale &= ~pages;
+        std::vector<uint32_t> list;
+        list.reserve(pages.count());
+        for (uint32_t page = 0; page < kPages; ++page)
+            if (pages.test(page))
+                list.push_back(page);
+        uploadData(list.data(), list.size() * sizeof(uint32_t));
+        gl().UseProgram(replicateHi.id);
+        gl().DispatchCompute(static_cast<GLuint>(list.size()), 1u, 1u);
+        barrier();
+    }
+
+    void replicateRegion(uint32_t psm, uint32_t base, uint32_t bw, int x0, int y0, int x1, int y1)
+    {
+        if (!hiActive)
+            return;
+        std::bitset<kPages> pages;
+        markPages(pages, psm, base, bw, x0, y0, x1, y1);
+        replicatePages(pages);
+    }
+
     void barrier()
     {
         gl().MemBarrier(kAllBarrierBits);
@@ -1334,6 +1664,11 @@ struct GSGpuBackend::Impl
             return;
         gl().BindBuffer(kShaderStorageBuffer, vramBuffer);
         gl().BufferSubData(kShaderStorageBuffer, 0, static_cast<GLsizeiptr>(std::min<uint32_t>(hostVramSize, GSSwizzle::kMemorySize)), hostVram);
+        if (hiActive)
+        {
+            barrier();
+            replicatePages(std::bitset<kPages>().set());
+        }
     }
 
     void downloadVram(uint8_t *out, size_t size)
@@ -1363,6 +1698,7 @@ struct GSGpuBackend::Impl
         readPages.reset();
         batchClutPages.reset();
         hasTarget = false;
+        batchHiCopy = false;
         clutOps.clear();
         epoch = 0u;
         batchClutLoads = 0u;
@@ -1416,6 +1752,15 @@ struct GSGpuBackend::Impl
             gl().DispatchCompute(static_cast<GLuint>(copyPairs.size()), 1u, 1u);
             profEnd(3u, profCopy);
             barrier();
+            if (hiActive)
+            {
+                // The copied samples are as current as the source's.
+                for (uint32_t pair : copyPairs)
+                    hiStale.set((pair >> 16u) % kPages, hiStale.test((pair & 0xFFFFu) % kPages));
+                gl().UseProgram(pageCopyHi.id);
+                gl().DispatchCompute(static_cast<GLuint>(copyPairs.size()), 1u, 1u);
+                barrier();
+            }
             copyPairs.clear();
         }
         if (!uploadWords.empty())
@@ -1438,6 +1783,7 @@ struct GSGpuBackend::Impl
             uploadGroups.clear();
             uploadData_.clear();
             uploadCount = 0u;
+            replicatePages(pendingWritePages);
         }
         pendingWritePages.reset();
     }
@@ -1612,10 +1958,30 @@ struct GSGpuBackend::Impl
             bindUpload(4u, stateBuffer, states.data(), states.size() * sizeof(uint32_t));
             bindUpload(5u, tileBuffer, tileHeaders.data(), tileHeaders.size() * sizeof(uint32_t));
             bindUpload(6u, tileListBuffer, tileList.data(), tileList.size() * sizeof(uint32_t));
-            g.UseProgram(raster.id);
-            g.Uniform4ui(raster.loc[0], epoch, 0u, 0u, 0u);
             const GLuint profRaster = profBegin();
-            g.DispatchCompute(static_cast<GLuint>(touched.size()), 1u, 1u);
+            const bool hiBatch = hiActive && (hiAllTargets || batchHiCopy || hiTargets.test(static_cast<size_t>(targetKey & 0x7FFFu)));
+            if (!hiBatch)
+            {
+                g.UseProgram(raster.id);
+                g.Uniform4ui(raster.loc[0], epoch, 0u, 0u, 0u);
+                g.DispatchCompute(static_cast<GLuint>(touched.size()), 1u, 1u);
+                if (hiActive)
+                {
+                    // A native-only target: its samples are replicated from the native pixels when needed.
+                    hiRendered &= ~writePages;
+                    hiStale |= writePages;
+                }
+            }
+            else
+            {
+                // Same bins, SS x SS sub-tiles per tile, into the samples; sample 0 also writes the
+                // native memory.
+                replicatePages(writePages & hiStale);
+                g.UseProgram(rasterHi.id);
+                g.Uniform4ui(rasterHi.loc[0], epoch, 0u, 0u, 0u);
+                g.DispatchCompute(static_cast<GLuint>(touched.size()), hiScale * hiScale, 1u);
+                hiRendered |= writePages;
+            }
             profEnd(0u, profRaster);
             if (prof.enabled)
             {
@@ -1633,7 +1999,29 @@ struct GSGpuBackend::Impl
                                             static_cast<uint32_t>(dispatchMax), st0[SFbp] >> 5u, st0[SFpsm], st0[SZbp] >> 5u, st0[SFlags]};
                 prof.sumMaxBin += dispatchMax;
             }
-            barrier();
+            // PS2X_GS_BATCH_DUMP=<first>:<count>: one line per batch for batches first..first+count.
+            static const char *dumpSpec = std::getenv("PS2X_GS_BATCH_DUMP");
+            static uint64_t dumpIndex = 0;
+            if (dumpSpec)
+            {
+                const uint64_t first = std::strtoull(dumpSpec, nullptr, 10);
+                const char *colon = std::strchr(dumpSpec, ':');
+                const uint64_t count = colon ? std::strtoull(colon + 1, nullptr, 10) : 50u;
+                if (dumpIndex >= first && dumpIndex < first + count)
+                {
+                    const uint32_t *p = prims.data();
+                    const uint32_t *sp = states.data() + static_cast<size_t>(p[0] >> 8u) * kStateWords;
+                    uint32_t types[3] = {};
+                    for (uint32_t i = 0; i < primCount; ++i)
+                        ++types[std::min(prims[static_cast<size_t>(i) * kPrimWords] & 0xFFu, 2u)];
+                    float uv[4] = {};
+                    std::memcpy(uv, p + 7, sizeof(uv));
+                    std::fprintf(stderr, "[gs-batch] #%llu fbp %x fbw %u fpsm %x flags %x prims %u (pt %u sp %u tri %u) tex %x tbw %u size %08x box %u-%u x %u-%u uv %.1f,%.1f-%.1f,%.1f\n",
+                                 static_cast<unsigned long long>(dumpIndex), sp[SFbp] >> 5u, sp[SFbw], sp[SFpsm], sp[SFlags], primCount, types[0], types[1],
+                                 types[2], sp[STbp0], sp[STbw], sp[STexSize], p[1] & 0xFFFFu, p[1] >> 16u, p[2] & 0xFFFFu, p[2] >> 16u, uv[0], uv[1], uv[2], uv[3]);
+                }
+                ++dumpIndex;
+            }            barrier();
             stats.batches += 1u;
             stats.tiles += touched.size();
             stats.prims += primCount;
@@ -1654,9 +2042,11 @@ struct GSGpuBackend::Impl
         s[SZmask] = ctx.zbuf.zmask ? 1u : 0u;
         s[SScissorX] = static_cast<uint32_t>(ctx.scissor.x0) | (static_cast<uint32_t>(ctx.scissor.x1) << 16u);
         s[SScissorY] = static_cast<uint32_t>(ctx.scissor.y0) | (static_cast<uint32_t>(ctx.scissor.y1) << 16u);
-        const uint32_t flags = (state.prim.iip ? FIip : 0u) | (state.prim.tme ? FTme : 0u) | (state.prim.fge ? FFge : 0u) |
-                               (state.prim.abe ? FAbe : 0u) | (state.prim.fst ? FFst : 0u) | (state.pabe ? FPabe : 0u) |
-                               (state.linearFilter ? FLinear : 0u) | ((state.colclamp & 1u) == 0u ? FWrap : 0u);
+        uint32_t flags = (state.prim.iip ? FIip : 0u) | (state.prim.tme ? FTme : 0u) | (state.prim.fge ? FFge : 0u) |
+                         (state.prim.abe ? FAbe : 0u) | (state.prim.fst ? FFst : 0u) | (state.pabe ? FPabe : 0u) |
+                         (state.linearFilter ? FLinear : 0u) | ((state.colclamp & 1u) == 0u ? FWrap : 0u);
+        if (hiActive && state.prim.tme && hiRendered.test((ctx.tex0.tbp0 >> 5u) % kPages))
+            flags |= FHiTex;
         s[SFlags] = flags;
         if (state.prim.tme)
         {
@@ -1878,6 +2268,15 @@ struct GSGpuBackend::Impl
             p[8] = fbits(v0f);
             p[9] = fbits(u1f);
             p[10] = fbits(v1f);
+            // A copy of a high-resolution image at about 1:1 (a frame buffer copy, not a
+            // downsampled blur step) keeps the batch at high resolution.
+            if (hiActive && (states[static_cast<size_t>(s) * kStateWords + SFlags] & FHiTex) != 0u)
+            {
+                const float width = std::max(std::fabs(v1.x - v0.x), 1.0f);
+                const float height = std::max(std::fabs(v1.y - v0.y), 1.0f);
+                if (std::fabs(u1f - u0f) <= width * 1.25f && std::fabs(v1f - v0f) <= height * 1.25f)
+                    batchHiCopy = true;
+            }
         }
         p[13] = static_cast<uint32_t>(v1.z);
         p[14] = packColor(v1);
@@ -1895,15 +2294,20 @@ struct GSGpuBackend::Impl
         GSTriangleRaster tri;
         if (!gsTriangleSetup(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, ctx.xyoffset.ofx, ctx.xyoffset.ofy, tri, fastTriangleSetup))
             return;
-        const int minX = std::max(tri.minX, static_cast<int>(ctx.scissor.x0));
+        // At internal resolution the samples left of and above the first native sample position
+        // can be covered too, so the box starts one pixel earlier.
+        const int hiMargin = hiActive ? 1 : 0;
+        const int minX = std::max(tri.minX - hiMargin, static_cast<int>(ctx.scissor.x0));
         const int maxX = std::min(tri.maxX, static_cast<int>(ctx.scissor.x1));
-        const int minY = std::max(tri.minY, static_cast<int>(ctx.scissor.y0));
+        const int minY = std::max(tri.minY - hiMargin, static_cast<int>(ctx.scissor.y0));
         const int maxY = std::min(tri.maxY, static_cast<int>(ctx.scissor.y1));
         if (minX > maxX || minY > maxY)
             return;
 
         prepareTarget(state, minX, minY, maxX, maxY);
         const uint32_t s = addState(state);
+        if (hiActive && state.prim.tme)
+            hiTargets.set((ctx.frame.fbp | (ctx.frame.fbw << 9u)) & 0x7FFFu);
         uint32_t *p = newPrim(PrimTriangle, s);
         p[1] = static_cast<uint32_t>(minX) | (static_cast<uint32_t>(maxX) << 16u);
         p[2] = static_cast<uint32_t>(minY) | (static_cast<uint32_t>(maxY) << 16u);
@@ -1929,6 +2333,14 @@ struct GSGpuBackend::Impl
             p[29u + i] = static_cast<uint32_t>(vs[i]->u) | (static_cast<uint32_t>(vs[i]->v) << 16u);
         }
         p[32] = static_cast<uint32_t>(v0.fog) | (static_cast<uint32_t>(v1.fog) << 8u) | (static_cast<uint32_t>(v2.fog) << 16u);
+        // Depth without fp64 in the shader: an integer base plus float offsets. The weights are
+        // floats already, so this keeps the precision of the double form except in the final add,
+        // which stays exact.
+        const double zBase = std::clamp(std::floor(v0.z), 0.0, 4294967295.0);
+        p[33] = static_cast<uint32_t>(zBase);
+        p[34] = fbits(static_cast<float>(v0.z - zBase));
+        p[35] = fbits(static_cast<float>(v1.z - v0.z));
+        p[36] = fbits(static_cast<float>(v2.z - v0.z));
         binTriangle(primCount - 1u, tri, minX, minY, maxX, maxY);
     }
 
@@ -2125,6 +2537,8 @@ struct GSGpuBackend::Impl
                         static_cast<uint32_t>(transfer.trxpos.dsax) | (static_cast<uint32_t>(transfer.trxpos.dsay) << 16u));
         gl().Uniform4ui(copyWrite.loc[1], rrw, rrh, transfer.trxpos.dir, 0u);
         dispatchLinear(total, 4u);
+        replicateRegion(b.dpsm, b.dbp, std::max<uint32_t>(b.dbw, 1u), transfer.trxpos.dsax, transfer.trxpos.dsay,
+                        static_cast<int>(transfer.trxpos.dsax + rrw) - 1, static_cast<int>(transfer.trxpos.dsay + rrh) - 1);
         transferState.copiedPixels = total;
         transferState.direction = 3u;
     }
@@ -2410,6 +2824,17 @@ void GSGpuBackend::SetAsyncPresentDefault(bool enabled)
     s_asyncPresent.store(enabled, std::memory_order_relaxed);
 }
 
+void GSGpuBackend::RequestInternalScale(uint32_t scale)
+{
+    s_requestedScale.store(std::clamp<uint32_t>(scale, 1u, 4u));
+}
+
+uint32_t GSGpuBackend::InternalScale()
+{
+    const uint32_t requested = s_requestedScale.load();
+    return requested != 0u ? requested : s_activeScale.load();
+}
+
 GSGpuBackend::GSGpuBackend()
     : m_impl(std::make_unique<Impl>(m_stats))
 {
@@ -2592,6 +3017,7 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     if (!d.ensure())
         return result;
     d.flushBatch();
+    d.applyRequestedScale();
     const bool shared = d.context.Shared() && GSSharedPresent::Active();
     const std::array<uint64_t, 7> crtc = {request.pmode, request.smode2, request.dispfb1, request.display1,
                                          request.dispfb2, request.display2, request.bgcolor};
@@ -2637,8 +3063,21 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
         x0 = y0 = 0;
         x1 = y1 = hstep = vstep = 1;
     }
-    const uint32_t width = std::min<uint32_t>(kMaxPresentationWidth, static_cast<uint32_t>((x1 - x0 + hstep - 1) / hstep));
-    const uint32_t height = std::min<uint32_t>(kMaxPresentationHeight, static_cast<uint32_t>((y1 - y0 + vstep - 1) / vstep));
+    const uint32_t nativeWidth = std::min<uint32_t>(kMaxPresentationWidth, static_cast<uint32_t>((x1 - x0 + hstep - 1) / hstep));
+    const uint32_t nativeHeight = std::min<uint32_t>(kMaxPresentationHeight, static_cast<uint32_t>((y1 - y0 + vstep - 1) / vstep));
+    // Internal resolution: present from the samples at hiScale times the size when it fits.
+    static const bool hiPresentAllowed = []
+    {
+        const char *value = std::getenv("PS2X_GS_HI_PRESENT");
+        return !(value && *value == '0');
+    }();
+    const bool hiPresent = hiPresentAllowed && d.hiActive && !blank && nativeWidth * d.hiScale <= kMaxPresentationWidth &&
+                           nativeHeight * d.hiScale <= kMaxPresentationHeight;
+    if (hiPresent && d.hiStale.any())
+        d.replicatePages(d.hiStale);
+    const Program &presentProgram = hiPresent ? d.presentHi : d.present;
+    const uint32_t width = hiPresent ? nativeWidth * d.hiScale : nativeWidth;
+    const uint32_t height = hiPresent ? nativeHeight * d.hiScale : nativeHeight;
     result.width = width;
     result.height = height;
     auto pack = [](const CrtcCircuit &c, std::array<uint32_t, 12> &out)
@@ -2651,19 +3090,59 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     pack(circuits[1], c2);
     d.reserveData(static_cast<size_t>(width) * height * 4u);
     const Api &gl = d.gl();
-    gl.UseProgram(d.present.id);
-    gl.Uniform4ui(d.present.loc[0], width, height, static_cast<uint32_t>(x0 & 0xFFFF) | (static_cast<uint32_t>(y0) << 16u),
+    gl.UseProgram(presentProgram.id);
+    gl.Uniform4ui(presentProgram.loc[0], width, height, static_cast<uint32_t>(x0 & 0xFFFF) | (static_cast<uint32_t>(y0) << 16u),
                   static_cast<uint32_t>(hstep) | (static_cast<uint32_t>(vstep) << 16u));
-    gl.Uniform1uiv(d.present.loc[1], 12, c1.data());
-    gl.Uniform1uiv(d.present.loc[2], 12, c2.data());
-    gl.Uniform4ui(d.present.loc[3], static_cast<uint32_t>(request.bgcolor & 0xFFFFFFu), (slbg ? 1u : 0u) | (mmod ? 2u : 0u), alp, 0u);
+    gl.Uniform1uiv(presentProgram.loc[1], 12, c1.data());
+    gl.Uniform1uiv(presentProgram.loc[2], 12, c2.data());
+    gl.Uniform4ui(presentProgram.loc[3], static_cast<uint32_t>(request.bgcolor & 0xFFFFFFu), (slbg ? 1u : 0u) | (mmod ? 2u : 0u), alp, 0u);
     const GLuint profPresent = d.profBegin();
     gl.DispatchCompute((width + 15u) / 16u, (height + 15u) / 16u, 1u);
     ++d.presentStats.composites;
+    // PS2X_GS_PRESENT_DUMP=<prefix>:<n>,<n>...: write the n-th composed frames at full size as PPM
+    // (debugging the internal resolution; the window screenshot is scaled to the window).
+    {
+        static uint64_t presentIndex = 0u;
+        static const std::vector<uint64_t> dumpAt = []
+        {
+            std::vector<uint64_t> at;
+            if (const char *value = std::getenv("PS2X_GS_PRESENT_DUMP"))
+            {
+                const char *colon = std::strrchr(value, ':');
+                for (const char *c = colon ? colon + 1 : value; c && *c;)
+                {
+                    at.push_back(std::strtoull(c, nullptr, 10));
+                    c = std::strchr(c, ',');
+                    if (c)
+                        ++c;
+                }
+            }
+            return at;
+        }();
+        ++presentIndex;
+        if (std::find(dumpAt.begin(), dumpAt.end(), presentIndex) != dumpAt.end())
+        {
+            std::string prefix = std::getenv("PS2X_GS_PRESENT_DUMP");
+            prefix = prefix.substr(0, prefix.rfind(':'));
+            std::vector<uint8_t> rgba(static_cast<size_t>(width) * height * 4u);
+            d.readData(rgba.data(), rgba.size());
+            const std::string path = prefix + "-" + std::to_string(presentIndex) + ".ppm";
+            if (std::FILE *file = std::fopen(path.c_str(), "wb"))
+            {
+                std::fprintf(file, "P6\n%u %u\n255\n", width, height);
+                for (size_t i = 0; i < rgba.size(); i += 4u)
+                    std::fwrite(&rgba[i], 1u, 3u, file);
+                std::fclose(file);
+                std::fprintf(stderr, "[gs-gpu] present %llu dumped to %s (%ux%u)\n", static_cast<unsigned long long>(presentIndex),
+                             path.c_str(), width, height);
+            }
+        }
+    }
     d.profEnd(5u, profPresent);
     d.profFrame();
     if (shared)
     {
+        d.paceFrames();
         if (PublishShared(gl, d.dataBuffer, width, height, d.renderedSequence + 1u, d.presentHash.id, d.presentHash.loc[0]))
         {
             ++d.renderedSequence;
@@ -2724,6 +3203,8 @@ bool GSGpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
     gl.Uniform4ui(d.clear.loc[1], x0, y0, x1, y1);
     gl.DispatchCompute((x1 - x0 + 16u) / 16u, (y1 - y0 + 16u) / 16u, 1u);
     d.barrier();
+    d.replicateRegion(psm, context.frame.fbp << 5u, std::max<uint32_t>(context.frame.fbw, 1u), static_cast<int>(x0), static_cast<int>(y0),
+                      static_cast<int>(x1), static_cast<int>(y1));
     return true;
 }
 
@@ -2771,6 +3252,7 @@ void GSGpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t 
     gl.Uniform4ui(d.poke.loc[1], value, 1u, 0u, 0u);
     gl.DispatchCompute(1u, 1u, 1u);
     d.barrier();
+    d.replicateRegion(psm, base, bw, static_cast<int>(x), static_cast<int>(y), static_cast<int>(x), static_cast<int>(y));
 }
 
 void GSGpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
