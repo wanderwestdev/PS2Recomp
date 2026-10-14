@@ -2002,7 +2002,14 @@ struct GSGpuBackend::Impl
             // PS2X_GS_BATCH_DUMP=<first>:<count>: one line per batch for batches first..first+count.
             static const char *dumpSpec = std::getenv("PS2X_GS_BATCH_DUMP");
             static uint64_t dumpIndex = 0;
-            if (dumpSpec)
+            // PS2X_GS_BATCH_DUMP_AFTER=<seconds>: count and print only after that much wall time.
+            static const auto dumpStart = std::chrono::steady_clock::now();
+            static const double dumpAfter = []
+            {
+                const char *value = std::getenv("PS2X_GS_BATCH_DUMP_AFTER");
+                return value ? std::atof(value) : 0.0;
+            }();
+            if (dumpSpec && std::chrono::duration<double>(std::chrono::steady_clock::now() - dumpStart).count() >= dumpAfter)
             {
                 const uint64_t first = std::strtoull(dumpSpec, nullptr, 10);
                 const char *colon = std::strchr(dumpSpec, ':');
@@ -2019,9 +2026,39 @@ struct GSGpuBackend::Impl
                     std::fprintf(stderr, "[gs-batch] #%llu fbp %x fbw %u fpsm %x flags %x prims %u (pt %u sp %u tri %u) tex %x tbw %u size %08x box %u-%u x %u-%u uv %.1f,%.1f-%.1f,%.1f\n",
                                  static_cast<unsigned long long>(dumpIndex), sp[SFbp] >> 5u, sp[SFbw], sp[SFpsm], sp[SFlags], primCount, types[0], types[1],
                                  types[2], sp[STbp0], sp[STbw], sp[STexSize], p[1] & 0xFFFFu, p[1] >> 16u, p[2] & 0xFFFFu, p[2] >> 16u, uv[0], uv[1], uv[2], uv[3]);
+                    // PS2X_GS_BATCH_DUMP_TRIS=1: also every textured triangle (screen box, ST/UV, state texture).
+                    static const bool dumpTris = std::getenv("PS2X_GS_BATCH_DUMP_TRIS") != nullptr;
+                    if (dumpTris)
+                        for (uint32_t i = 0; i < primCount; ++i)
+                        {
+                            const uint32_t *q = prims.data() + static_cast<size_t>(i) * kPrimWords;
+                            const uint32_t *qs = states.data() + static_cast<size_t>(q[0] >> 8u) * kStateWords;
+                            if ((q[0] & 0xFFu) != PrimTriangle || (qs[SFlags] & FTme) == 0u)
+                                continue;
+                            float st[9] = {};
+                            std::memcpy(st, q + 20, sizeof(st));
+                            std::fprintf(stderr, "[gs-batch]   tri %u xy %d,%d %d,%d %d,%d uv %08x %08x %08x stq %.4f,%.4f %.4f,%.4f %.4f,%.4f tex %x tbw %u tpsm %x size %08x flags %x color %08x\n",
+                                         i, static_cast<int32_t>(q[3]), static_cast<int32_t>(q[4]), static_cast<int32_t>(q[5]), static_cast<int32_t>(q[6]),
+                                         static_cast<int32_t>(q[7]), static_cast<int32_t>(q[8]), q[29], q[30], q[31], st[0] / st[2], st[1] / st[2], st[3] / st[5],
+                                         st[4] / st[5], st[6] / st[8], st[7] / st[8], qs[STbp0], qs[STbw], qs[STpsm], qs[STexSize], qs[SFlags], q[19]);
+                        }
+                    if ((sp[SFlags] & FTme) != 0u)
+                        for (uint32_t i = 0; i < primCount && i < 64u; ++i)
+                        {
+                            const uint32_t *q = prims.data() + static_cast<size_t>(i) * kPrimWords;
+                            if ((q[0] & 0xFFu) != PrimSprite)
+                                continue;
+                            float quv[4] = {};
+                            std::memcpy(quv, q + 7, sizeof(quv));
+                            const uint32_t *qs = states.data() + static_cast<size_t>(q[0] >> 8u) * kStateWords;
+                            std::fprintf(stderr, "[gs-batch]   sprite %u box %u-%u x %u-%u uv %.1f,%.1f-%.1f,%.1f tex %x tbw %u tpsm %x color %08x\n", i,
+                                         q[1] & 0xFFFFu, q[1] >> 16u, q[2] & 0xFFFFu, q[2] >> 16u, quv[0], quv[1], quv[2], quv[3], qs[STbp0], qs[STbw],
+                                         qs[STpsm], q[14]);
+                        }
                 }
                 ++dumpIndex;
-            }            barrier();
+            }
+            barrier();
             stats.batches += 1u;
             stats.tiles += touched.size();
             stats.prims += primCount;
@@ -2824,6 +2861,93 @@ void GSGpuBackend::SetAsyncPresentDefault(bool enabled)
     s_asyncPresent.store(enabled, std::memory_order_relaxed);
 }
 
+namespace
+{
+    std::mutex s_remapMutex;
+    std::shared_ptr<const std::vector<GSGpuBackend::QuadRemap>> s_remaps;
+    std::atomic<bool> s_haveRemaps{false};
+}
+
+void GSGpuBackend::SetQuadRemaps(std::vector<QuadRemap> remaps)
+{
+    auto shared = std::make_shared<const std::vector<QuadRemap>>(std::move(remaps));
+    std::lock_guard<std::mutex> lock(s_remapMutex);
+    s_haveRemaps.store(!shared->empty());
+    s_remaps = std::move(shared);
+}
+
+// A triangle of a remapped quad: the half holding the quad's top-left UV corner becomes the pieces
+// (two triangles each); the other half is dropped. False when the triangle is not remapped.
+bool remapQuadTriangle(const GSPrimitiveBatch &batch, std::vector<GSPrimitiveBatch> &out)
+{
+    if (!s_haveRemaps.load(std::memory_order_relaxed) || batch.vertexCount < 3u || !batch.state.prim.tme || !batch.state.prim.fst)
+        return false;
+    std::shared_ptr<const std::vector<GSGpuBackend::QuadRemap>> remaps;
+    {
+        std::lock_guard<std::mutex> lock(s_remapMutex);
+        remaps = s_remaps;
+    }
+    if (!remaps)
+        return false;
+    const GSVertex *v = batch.vertices.data();
+    const uint16_t umin = std::min({v[0].u, v[1].u, v[2].u}), umax = std::max({v[0].u, v[1].u, v[2].u});
+    const uint16_t vmin = std::min({v[0].v, v[1].v, v[2].v}), vmax = std::max({v[0].v, v[1].v, v[2].v});
+    for (const GSGpuBackend::QuadRemap &remap : *remaps)
+    {
+        // The game's own corners can be half a texel apart, so UVs match within one texel.
+        const auto near = [](int a, int b) { return std::abs(a - b) <= 16; };
+        if (remap.tbp0 != batch.state.context.tex0.tbp0 || !near(remap.u0, umin) || !near(remap.u1, umax) || !near(remap.v0, vmin) ||
+            !near(remap.v1, vmax))
+            continue;
+        const GSVertex *topLeft = nullptr, *topRight = nullptr, *bottomLeft = nullptr;
+        for (int i = 0; i < 3; ++i)
+        {
+            if (near(v[i].u, remap.u0) && near(v[i].v, remap.v0))
+                topLeft = &v[i];
+            else if (near(v[i].u, remap.u1) && near(v[i].v, remap.v0))
+                topRight = &v[i];
+            else if (near(v[i].u, remap.u0) && near(v[i].v, remap.v1))
+                bottomLeft = &v[i];
+        }
+        out.clear();
+        if (!topLeft)
+            return true; // the quad's other half: the pieces were drawn with the first
+        if (!topRight || !bottomLeft)
+            return false;
+        const float scaleX = (topRight->x - topLeft->x) / static_cast<float>(topRight->u - topLeft->u);
+        const float top = topLeft->y, bottom = bottomLeft->y;
+        for (const GSGpuBackend::QuadRemap::Piece &piece : remap.pieces)
+        {
+            const float left = topLeft->x + static_cast<float>(piece.dx) * scaleX;
+            const float right = left + static_cast<float>(piece.u1 - piece.u0) * scaleX;
+            GSVertex corners[4] = {*topLeft, *topLeft, *topLeft, *topLeft};
+            const float xs[4] = {left, right, left, right};
+            const float ys[4] = {top, top, bottom, bottom};
+            const uint16_t us[4] = {piece.u0, piece.u1, piece.u0, piece.u1};
+            const uint16_t vs[4] = {piece.v0, piece.v0, piece.v1, piece.v1};
+            for (int i = 0; i < 4; ++i)
+            {
+                corners[i].x = xs[i];
+                corners[i].y = ys[i];
+                corners[i].u = us[i];
+                corners[i].v = vs[i];
+            }
+            const int order[2][3] = {{0, 1, 2}, {1, 2, 3}};
+            for (const auto &tri : order)
+            {
+                GSPrimitiveBatch piecesBatch = batch;
+                piecesBatch.state.prim.type = GS_PRIM_TRIANGLE;
+                piecesBatch.vertexCount = 3u;
+                for (int i = 0; i < 3; ++i)
+                    piecesBatch.vertices[i] = corners[tri[i]];
+                out.push_back(piecesBatch);
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 void GSGpuBackend::RequestInternalScale(uint32_t scale)
 {
     s_requestedScale.store(std::clamp<uint32_t>(scale, 1u, 4u));
@@ -2905,8 +3029,15 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &batch)
     case GS_PRIM_TRIANGLE:
     case GS_PRIM_TRISTRIP:
     case GS_PRIM_TRIFAN:
-        d.addTriangle(batch);
+    {
+        thread_local std::vector<GSPrimitiveBatch> replacement;
+        if (!remapQuadTriangle(batch, replacement))
+            d.addTriangle(batch);
+        else
+            for (const GSPrimitiveBatch &piece : replacement)
+                d.addTriangle(piece);
         break;
+    }
     case GS_PRIM_LINE:
     case GS_PRIM_LINESTRIP:
         d.addLine(batch);
