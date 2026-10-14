@@ -2868,6 +2868,21 @@ namespace
     std::atomic<bool> s_haveRemaps{false};
 }
 
+namespace
+{
+    std::shared_ptr<const GSGpuBackend::TexturePatch> s_patch;
+    // Set when the game uploads into the patched texture again; cleared once the patch is written.
+    std::atomic<bool> s_patchDirty{true};
+    bool s_patchWriting = false;
+}
+
+void GSGpuBackend::SetTexturePatch(std::shared_ptr<const TexturePatch> patch)
+{
+    std::lock_guard<std::mutex> lock(s_remapMutex);
+    s_patch = std::move(patch);
+    s_patchDirty.store(true);
+}
+
 void GSGpuBackend::SetQuadRemaps(std::vector<QuadRemap> remaps)
 {
     auto shared = std::make_shared<const std::vector<QuadRemap>>(std::move(remaps));
@@ -2896,9 +2911,37 @@ bool remapQuadTriangle(const GSPrimitiveBatch &batch, std::vector<GSPrimitiveBat
     {
         // The game's own corners can be half a texel apart, so UVs match within one texel.
         const auto near = [](int a, int b) { return std::abs(a - b) <= 16; };
-        if (remap.tbp0 != batch.state.context.tex0.tbp0 || !near(remap.u0, umin) || !near(remap.u1, umax) || !near(remap.v0, vmin) ||
-            !near(remap.v1, vmax))
+        if (remap.tbp0 != batch.state.context.tex0.tbp0 || (remap.tbw != 0u && remap.tbw != batch.state.context.tex0.tbw))
             continue;
+        if (remap.maxUvHeight != 0u && vmax - vmin > remap.maxUvHeight)
+            continue;
+        if (remap.matchUv && (!near(remap.u0, umin) || !near(remap.u1, umax) || !near(remap.v0, vmin) || !near(remap.v1, vmax)))
+            continue;
+        if (remap.matchScreen)
+        {
+            const float cx = (std::min({v[0].x, v[1].x, v[2].x}) + std::max({v[0].x, v[1].x, v[2].x})) * 0.5f;
+            const float cy = (std::min({v[0].y, v[1].y, v[2].y}) + std::max({v[0].y, v[1].y, v[2].y})) * 0.5f;
+            if (cx < remap.x0 || cx > remap.x1 || cy < remap.y0 || cy > remap.y1)
+                continue;
+        }
+        out.clear();
+        if (remap.action == GSGpuBackend::QuadRemap::Action::Hide)
+            return true;
+        if (remap.action == GSGpuBackend::QuadRemap::Action::Move)
+        {
+            GSPrimitiveBatch moved = batch;
+            for (uint32_t i = 0; i < moved.vertexCount && i < moved.vertices.size(); ++i)
+            {
+                moved.vertices[i].x += remap.dx;
+                moved.vertices[i].y += remap.dy;
+            }
+            out.push_back(moved);
+            return true;
+        }
+        static const bool remapLog = std::getenv("PS2X_GS_REMAP_LOG") != nullptr;
+        if (remapLog)
+            std::fprintf(stderr, "[gs-remap] pieces uv %04x-%04x,%04x-%04x xy %.0f,%.0f %.0f,%.0f %.0f,%.0f\n", umin, umax, vmin, vmax, v[0].x,
+                         v[0].y, v[1].x, v[1].y, v[2].x, v[2].y);
         const GSVertex *topLeft = nullptr, *topRight = nullptr, *bottomLeft = nullptr;
         for (int i = 0; i < 3; ++i)
         {
@@ -2919,10 +2962,10 @@ bool remapQuadTriangle(const GSPrimitiveBatch &batch, std::vector<GSPrimitiveBat
         for (const GSGpuBackend::QuadRemap::Piece &piece : remap.pieces)
         {
             const float left = topLeft->x + static_cast<float>(piece.dx) * scaleX;
-            const float right = left + static_cast<float>(piece.u1 - piece.u0) * scaleX;
+            const float right = left + static_cast<float>(std::abs(static_cast<int>(piece.u1) - static_cast<int>(piece.u0))) * scaleX * piece.scale;
             GSVertex corners[4] = {*topLeft, *topLeft, *topLeft, *topLeft};
             const float xs[4] = {left, right, left, right};
-            const float ys[4] = {top, top, bottom, bottom};
+            const float pieceBottom = top + piece.dy + (bottom - top) * piece.scale;            const float ys[4] = {top + piece.dy, top + piece.dy, pieceBottom, pieceBottom};
             const uint16_t us[4] = {piece.u0, piece.u1, piece.u0, piece.u1};
             const uint16_t vs[4] = {piece.v0, piece.v0, piece.v1, piece.v1};
             for (int i = 0; i < 4; ++i)
@@ -2931,6 +2974,13 @@ bool remapQuadTriangle(const GSPrimitiveBatch &batch, std::vector<GSPrimitiveBat
                 corners[i].y = ys[i];
                 corners[i].u = us[i];
                 corners[i].v = vs[i];
+                if (piece.color != 0u)
+                {
+                    corners[i].r = static_cast<uint8_t>(piece.color);
+                    corners[i].g = static_cast<uint8_t>(piece.color >> 8u);
+                    corners[i].b = static_cast<uint8_t>(piece.color >> 16u);
+                    corners[i].a = static_cast<uint8_t>(piece.color >> 24u);
+                }
             }
             const int order[2][3] = {{0, 1, 2}, {1, 2, 3}};
             for (const auto &tri : order)
@@ -3030,6 +3080,31 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &batch)
     case GS_PRIM_TRISTRIP:
     case GS_PRIM_TRIFAN:
     {
+        if (s_haveRemaps.load(std::memory_order_relaxed) && batch.state.prim.tme)
+        {
+            std::shared_ptr<const TexturePatch> patch;
+            {
+                std::lock_guard<std::mutex> lock(s_remapMutex);
+                patch = s_patch;
+            }
+            if (patch && patch->tbp0 == batch.state.context.tex0.tbp0 && patch->dbw == batch.state.context.tex0.tbw && s_patchDirty.load())
+            {
+                s_patchDirty.store(false);
+                s_patchWriting = true;
+                GSTransferCommand command;
+                command.bitbltbuf.dbp = patch->dbp;
+                command.bitbltbuf.dbw = patch->dbw;
+                command.bitbltbuf.dpsm = patch->dpsm;
+                command.trxpos.dsax = patch->x;
+                command.trxpos.dsay = patch->y;
+                command.trxreg.rrw = patch->width;
+                command.trxreg.rrh = patch->height;
+                command.direction = 0u;
+                BeginTransfer(command);
+                UploadImage(patch->data.data(), static_cast<uint32_t>(patch->data.size()));
+                s_patchWriting = false;
+            }
+        }
         thread_local std::vector<GSPrimitiveBatch> replacement;
         if (!remapQuadTriangle(batch, replacement))
             d.addTriangle(batch);
@@ -3065,6 +3140,13 @@ void GSGpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
 {
     Impl &d = *m_impl;
+    // A game upload into a patched texture: write the patch again before it is next drawn.
+    if (!s_patchWriting && command.direction == 0u && s_haveRemaps.load(std::memory_order_relaxed))
+    {
+        std::lock_guard<std::mutex> lock(s_remapMutex);
+        if (s_patch && command.bitbltbuf.dbp == s_patch->dbp)
+            s_patchDirty.store(true);
+    }
     if (command.direction == 2u)
         ++d.contentRevision;
     if (!d.ensure())

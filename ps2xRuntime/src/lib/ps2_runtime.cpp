@@ -79,6 +79,15 @@ namespace ps2_host_display
     {
         startMaximized = enabled;
     }
+
+    std::atomic<int> outputWidth{0};
+    std::atomic<int> outputHeight{0};
+
+    void setOutputSize(int width, int height)
+    {
+        outputWidth.store(std::max(width, 0), std::memory_order_relaxed);
+        outputHeight.store(std::max(height, 0), std::memory_order_relaxed);
+    }
 }
 
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
@@ -2728,7 +2737,44 @@ void main()
             }
             const Rectangle srcRect{0.0f, 0.0f, static_cast<float>(presentWidth), static_cast<float>(presentHeight)};
             const Rectangle dstRect{(screenWidth - dstWidth) * 0.5f, (screenHeight - dstHeight) * 0.5f, dstWidth, dstHeight};
-            const bool sharp = sharpTexSize >= 0;
+            // Output resolution: the frame at exactly that size first, then that image to the window.
+            static RenderTexture2D outputTarget{};
+            const int outputWidth = ps2_host_display::outputWidth.load(std::memory_order_relaxed);
+            const int outputHeight = ps2_host_display::outputHeight.load(std::memory_order_relaxed);
+            if (outputWidth > 0 && outputHeight > 0)
+            {
+                if (outputTarget.id == 0 || outputTarget.texture.width != outputWidth || outputTarget.texture.height != outputHeight)
+                {
+                    if (outputTarget.id != 0)
+                        UnloadRenderTexture(outputTarget);
+                    outputTarget = LoadRenderTexture(outputWidth, outputHeight);
+                    SetTextureFilter(outputTarget.texture, TEXTURE_FILTER_BILINEAR);
+                }
+                SetTextureFilter(displayTex, TEXTURE_FILTER_BILINEAR);
+                // The picture keeps its own aspect inside the output (a 16:9 game picture in a
+                // 21:9 output is pillarboxed), and the output keeps width:height in the window.
+                const auto fit = [](float boxWidth, float boxHeight, float aspect)
+                {
+                    float width = boxWidth;
+                    float height = boxWidth / aspect;
+                    if (height > boxHeight)
+                    {
+                        height = boxHeight;
+                        width = boxHeight * aspect;
+                    }
+                    return Rectangle{(boxWidth - width) * 0.5f, (boxHeight - height) * 0.5f, width, height};
+                };
+                BeginTextureMode(outputTarget);
+                ClearBackground(BLACK);
+                DrawTexturePro(displayTex, srcRect, fit(static_cast<float>(outputWidth), static_cast<float>(outputHeight), displayAspect),
+                               Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+                EndTextureMode();
+                Rectangle window = fit(screenWidth, screenHeight, static_cast<float>(outputWidth) / static_cast<float>(outputHeight));
+                DrawTexturePro(outputTarget.texture,
+                               Rectangle{0.0f, 0.0f, static_cast<float>(outputWidth), -static_cast<float>(outputHeight)}, window,
+                               Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+            }
+            const bool sharp = outputWidth <= 0 && sharpTexSize >= 0;
             if (sharp)
             {
                 SetTextureFilter(displayTex, TEXTURE_FILTER_BILINEAR);
@@ -2739,7 +2785,8 @@ void main()
                 SetShaderValue(sharpShader, sharpPrescale, prescale, SHADER_UNIFORM_VEC2);
                 BeginShaderMode(sharpShader);
             }
-            DrawTexturePro(displayTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+            if (outputWidth <= 0 || outputHeight <= 0)
+                DrawTexturePro(displayTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
             if (sharp)
                 EndShaderMode();
         }
