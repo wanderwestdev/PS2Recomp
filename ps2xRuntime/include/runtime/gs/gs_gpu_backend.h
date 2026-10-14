@@ -108,6 +108,9 @@ public:
         std::vector<uint8_t> data;
     };
     static void SetTexturePatch(std::shared_ptr<const TexturePatch> patch);
+    // Several patches (up to 4), each written into its own texture: a texture the game keeps in
+    // more than one place.
+    static void SetTexturePatches(std::vector<std::shared_ptr<const TexturePatch>> patches);
     void SetTexturePageCacheEnabled(bool enabled);
     void SetFastTriangleSetupEnabled(bool enabled);
     void SetHardwareRasterAllowed(bool allowed);

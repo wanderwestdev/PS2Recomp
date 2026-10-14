@@ -2870,17 +2870,29 @@ namespace
 
 namespace
 {
-    std::shared_ptr<const GSGpuBackend::TexturePatch> s_patch;
-    // Set when the game uploads into the patched texture again; cleared once the patch is written.
-    std::atomic<bool> s_patchDirty{true};
+    constexpr size_t kMaxPatches = 4u;
+    std::vector<std::shared_ptr<const GSGpuBackend::TexturePatch>> s_patches;
+    // Per patch: set when the game uploads into the patched texture again; cleared once the patch is written.
+    std::array<std::atomic<bool>, kMaxPatches> s_patchDirty{};
     bool s_patchWriting = false;
 }
 
 void GSGpuBackend::SetTexturePatch(std::shared_ptr<const TexturePatch> patch)
 {
+    std::vector<std::shared_ptr<const TexturePatch>> patches;
+    if (patch)
+        patches.push_back(std::move(patch));
+    SetTexturePatches(std::move(patches));
+}
+
+void GSGpuBackend::SetTexturePatches(std::vector<std::shared_ptr<const TexturePatch>> patches)
+{
     std::lock_guard<std::mutex> lock(s_remapMutex);
-    s_patch = std::move(patch);
-    s_patchDirty.store(true);
+    if (patches.size() > kMaxPatches)
+        patches.resize(kMaxPatches);
+    s_patches = std::move(patches);
+    for (auto &dirty : s_patchDirty)
+        dirty.store(true);
 }
 
 void GSGpuBackend::SetQuadRemaps(std::vector<QuadRemap> remaps)
@@ -2893,8 +2905,10 @@ void GSGpuBackend::SetQuadRemaps(std::vector<QuadRemap> remaps)
 
 // A triangle of a remapped quad: the half holding the quad's top-left UV corner becomes the pieces
 // (two triangles each); the other half is dropped. False when the triangle is not remapped.
-bool remapQuadTriangle(const GSPrimitiveBatch &batch, std::vector<GSPrimitiveBatch> &out)
+// wordMatched: a remap matched by UV took it, so the batch's texture is the remapped one.
+bool remapQuadTriangle(const GSPrimitiveBatch &batch, std::vector<GSPrimitiveBatch> &out, bool &wordMatched)
 {
+    wordMatched = false;
     if (!s_haveRemaps.load(std::memory_order_relaxed) || batch.vertexCount < 3u || !batch.state.prim.tme || !batch.state.prim.fst)
         return false;
     std::shared_ptr<const std::vector<GSGpuBackend::QuadRemap>> remaps;
@@ -2925,6 +2939,7 @@ bool remapQuadTriangle(const GSPrimitiveBatch &batch, std::vector<GSPrimitiveBat
                 continue;
         }
         out.clear();
+        wordMatched = remap.matchUv;
         if (remap.action == GSGpuBackend::QuadRemap::Action::Hide)
             return true;
         if (remap.action == GSGpuBackend::QuadRemap::Action::Move)
@@ -3080,19 +3095,30 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &batch)
     case GS_PRIM_TRISTRIP:
     case GS_PRIM_TRIFAN:
     {
-        if (s_haveRemaps.load(std::memory_order_relaxed) && batch.state.prim.tme)
+        thread_local std::vector<GSPrimitiveBatch> replacement;
+        bool wordMatched = false;
+        const bool remapped = remapQuadTriangle(batch, replacement, wordMatched);
+        // The patch goes in once a word of the remapped texture itself is drawn: another texture of
+        // the same size and format can sit at the same address (a menu's atlas and the screen
+        // behind it), and that one must not be written.
+        if (wordMatched)
         {
             std::shared_ptr<const TexturePatch> patch;
+            size_t slot = 0u;
             {
                 std::lock_guard<std::mutex> lock(s_remapMutex);
-                patch = s_patch;
+                for (; slot < s_patches.size(); ++slot)
+                    if (s_patches[slot]->tbp0 == batch.state.context.tex0.tbp0 && s_patches[slot]->dbw == batch.state.context.tex0.tbw)
+                    {
+                        patch = s_patches[slot];
+                        break;
+                    }
             }
             // Only between the game's own transfers: a transfer still in flight (an upload being fed,
             // a readback the game waits for) must not be replaced by ours.
-            if (patch && patch->tbp0 == batch.state.context.tex0.tbp0 && patch->dbw == batch.state.context.tex0.tbw && s_patchDirty.load() &&
-                d.transferState.direction == 3u)
+            if (patch && s_patchDirty[slot].load() && d.transferState.direction == 3u)
             {
-                s_patchDirty.store(false);
+                s_patchDirty[slot].store(false);
                 s_patchWriting = true;
                 GSTransferCommand command;
                 command.bitbltbuf.dbp = patch->dbp;
@@ -3108,8 +3134,7 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &batch)
                 s_patchWriting = false;
             }
         }
-        thread_local std::vector<GSPrimitiveBatch> replacement;
-        if (!remapQuadTriangle(batch, replacement))
+        if (!remapped)
             d.addTriangle(batch);
         else
             for (const GSPrimitiveBatch &piece : replacement)
@@ -3147,8 +3172,9 @@ void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
     if (!s_patchWriting && command.direction == 0u && s_haveRemaps.load(std::memory_order_relaxed))
     {
         std::lock_guard<std::mutex> lock(s_remapMutex);
-        if (s_patch && command.bitbltbuf.dbp == s_patch->dbp)
-            s_patchDirty.store(true);
+        for (size_t slot = 0u; slot < s_patches.size(); ++slot)
+            if (command.bitbltbuf.dbp == s_patches[slot]->dbp)
+                s_patchDirty[slot].store(true);
     }
     if (command.direction == 2u)
         ++d.contentRevision;
