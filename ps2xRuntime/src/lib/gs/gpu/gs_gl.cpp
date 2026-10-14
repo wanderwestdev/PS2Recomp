@@ -149,17 +149,33 @@ namespace GSSharedPresent
         if (!Active())
             return false;
         std::lock_guard<std::mutex> lock(s_sharedMutex);
+        // The next frame in order, not the newest: frames that arrive in a burst (two fields
+        // between two window flips) are shown one per flip instead of one being skipped. When
+        // more than kMaxBacklog are waiting, the window has fallen behind and jumps to the newest.
+        // PS2X_PRESENT_NEWEST=1: always the newest (the old behaviour, least latency).
+        constexpr int kMaxBacklog = 2;
+        static const bool newestOnly = []
+        {
+            const char *value = std::getenv("PS2X_PRESENT_NEWEST");
+            return value && value[0] == '1';
+        }();
+        const uint64_t current = s_readingSlot >= 0 ? s_sharedSlots[s_readingSlot].frame.sequence : 0u;
         int newest = -1;
-        uint64_t sequence = s_readingSlot >= 0 ? s_sharedSlots[s_readingSlot].frame.sequence : 0u;
+        int oldest = -1;
+        int waiting = 0;
         for (int i = 0; i < static_cast<int>(s_sharedSlots.size()); ++i)
         {
             const SharedSlot &slot = s_sharedSlots[i];
-            if (!slot.reading && slot.frame.sequence > sequence && slot.produced && completed(s_hostApi, slot.produced))
-            {
+            if (slot.reading || slot.frame.sequence <= current || !slot.produced || !completed(s_hostApi, slot.produced))
+                continue;
+            ++waiting;
+            if (newest < 0 || slot.frame.sequence > s_sharedSlots[newest].frame.sequence)
                 newest = i;
-                sequence = slot.frame.sequence;
-            }
+            if (oldest < 0 || slot.frame.sequence < s_sharedSlots[oldest].frame.sequence)
+                oldest = i;
         }
+        if (!newestOnly && waiting <= kMaxBacklog)
+            newest = oldest;
         if (newest >= 0)
         {
             releaseReading();

@@ -4,6 +4,7 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_async_vif.h"
 #include "GuestKernelMemory.h"
+#include "runtime/gs/gs_shared_present.h"
 
 #include <algorithm>
 #include <cassert>
@@ -122,6 +123,16 @@ namespace
             candidate = (candidate == std::numeric_limits<int>::max()) ? 1 : candidate + 1;
         } while (candidate != first);
         return 0;
+    }
+
+    bool presentOnVBlank()
+    {
+        static const bool enabled = []
+        {
+            const char *value = std::getenv("PS2X_PRESENT_ON_VBLANK");
+            return !(value && value[0] == '0');
+        }();
+        return enabled;
     }
 }
 
@@ -2174,6 +2185,13 @@ void EeScheduler::processEvent(const EeEvent &event)
         m_vsyncFlagAddress = 0u;
         m_vsyncTickAddress = 0u;
         completeVSync(m_vsyncTick);
+        // Present the field here, on the emulation's own clock. The window loop used to latch a
+        // frame per monitor flip when the field counter had moved; when the EE ran late and two
+        // vblanks were processed between two flips, one frame was never shown (2026-10-14: 52-56
+        // frames shown per second at the shrine while the game made 60). With shared presentation
+        // the latch only queues work for the GS thread. PS2X_PRESENT_ON_VBLANK=0: the old way.
+        if (presentOnVBlank() && GSSharedPresent::Active())
+            m_runtime.gs().latchHostPresentationFrame();
         if (m_gsVSyncCallback != 0u && m_runtime.hasFunction(m_gsVSyncCallback))
         {
             GuestInvocation invocation{};

@@ -7,6 +7,8 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <xmmintrin.h>
@@ -183,6 +185,17 @@ void GSThreadedBackend::WorkerLoop()
     ThreadNaming::SetCurrentThreadName("GSThread");
     ThreadPriority::RaiseCurrentThread(ThreadPriority::Level::AboveNormal);
     GSPrimitiveBatch draw;
+    // PS2X_GS_THREAD_STATS=1: every 2 s, how busy the worker was and how far the queue backed up.
+    // A busy worker with a growing queue presents frames late, in bursts, whatever the GPU does.
+    static const bool threadStats = []
+    {
+        const char *value = std::getenv("PS2X_GS_THREAD_STATS");
+        return value && *value && *value != '0';
+    }();
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point statsStart = Clock::now();
+    Clock::duration busy{};
+    size_t maxPending = 0u;
     for (;;)
     {
         std::vector<uint8_t> chunk;
@@ -195,12 +208,28 @@ void GSThreadedBackend::WorkerLoop()
                 m_inner.reset();
                 return;
             }
+            maxPending = std::max(maxPending, m_pending.size());
             chunk = std::move(m_pending.front());
             m_pending.pop_front();
         }
         {
             std::lock_guard<std::mutex> exec(m_execMutex);
+            const Clock::time_point start = threadStats ? Clock::now() : Clock::time_point{};
             Execute(chunk, draw);
+            if (threadStats)
+            {
+                const Clock::time_point now = Clock::now();
+                busy += now - start;
+                const double window = std::chrono::duration<double>(now - statsStart).count();
+                if (window >= 2.0)
+                {
+                    std::fprintf(stderr, "[gs-thread] busy %.0f%%, queue max %zu chunks\n",
+                                 100.0 * std::chrono::duration<double>(busy).count() / window, maxPending);
+                    statsStart = now;
+                    busy = {};
+                    maxPending = 0u;
+                }
+            }
         }
         {
             std::lock_guard<std::mutex> lock(m_queueMutex);
