@@ -3087,7 +3087,10 @@ void GSGpuBackend::Submit(const GSPrimitiveBatch &batch)
                 std::lock_guard<std::mutex> lock(s_remapMutex);
                 patch = s_patch;
             }
-            // Only between the game's own transfers: a transfer still in flight (an upload being fed,            // a readback the game waits for) must not be replaced by ours.            if (patch && patch->tbp0 == batch.state.context.tex0.tbp0 && patch->dbw == batch.state.context.tex0.tbw && s_patchDirty.load() &&                d.transferState.direction == 3u)
+            // Only between the game's own transfers: a transfer still in flight (an upload being fed,
+            // a readback the game waits for) must not be replaced by ours.
+            if (patch && patch->tbp0 == batch.state.context.tex0.tbp0 && patch->dbw == batch.state.context.tex0.tbw && s_patchDirty.load() &&
+                d.transferState.direction == 3u)
             {
                 s_patchDirty.store(false);
                 s_patchWriting = true;
