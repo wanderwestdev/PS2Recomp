@@ -227,6 +227,125 @@ void clutStore(uint version, uint index, uint value)
 }
 )GLSL";
 
+    // Internal resolution (SS > 1): every 32-bit word of GS memory has SS x SS samples in vramHi,
+    // sample (sx, sy) of a word holding sample (sx, sy) of each pixel packed in it, for every
+    // format. A high-resolution batch runs the HIRES raster, which draws the samples; sample 0 is
+    // the native sample point and also writes vram. Other batches run the native raster, and the
+    // backend copies their pages into the samples when they are needed. Textures whose first page
+    // was last drawn by the high-resolution raster (the state flag F_HITEX, set by the backend) are
+    // read from the samples, so render targets keep their detail; other textures keep native
+    // texel filtering.
+    const char *const kCommonHi = R"GLSL(
+layout(std430, binding = 11) buffer VramHiBuffer { uint vramHi[]; };
+const uint SS2 = SS * SS;
+const int SSI = int(SS);
+
+uint loadAtHi(uint f, uvec2 loc, uint smp)
+{
+    uint word = vramHi[(loc.x >> 2u) * SS2 + smp];
+    switch (FMT_KIND[f])
+    {
+    case KIND_32: return word;
+    case KIND_24: return word & 0x00FFFFFFu;
+    case KIND_16: return (word >> ((loc.x & 2u) * 8u)) & 0xFFFFu;
+    case KIND_8: return (word >> ((loc.x & 3u) * 8u)) & 0xFFu;
+    case KIND_4: return (word >> ((loc.x & 3u) * 8u + loc.y)) & 0x0Fu;
+    }
+    return 0u;
+}
+
+void storeAtHi(uint f, uvec2 loc, uint smp, uint value)
+{
+    uint index = (loc.x >> 2u) * SS2 + smp;
+    switch (FMT_KIND[f])
+    {
+    case KIND_32:
+        vramHi[index] = value;
+        break;
+    case KIND_24:
+        vramHi[index] = (vramHi[index] & 0xFF000000u) | (value & 0x00FFFFFFu);
+        break;
+    case KIND_16:
+    {
+        uint shift = (loc.x & 2u) * 8u;
+        atomicAnd(vramHi[index], ~(0xFFFFu << shift));
+        atomicOr(vramHi[index], (value & 0xFFFFu) << shift);
+        break;
+    }
+    case KIND_8:
+    {
+        uint shift = (loc.x & 3u) * 8u;
+        atomicAnd(vramHi[index], ~(0xFFu << shift));
+        atomicOr(vramHi[index], (value & 0xFFu) << shift);
+        break;
+    }
+    case KIND_4:
+    {
+        uint shift = (loc.x & 3u) * 8u + loc.y;
+        atomicAnd(vramHi[index], ~(0x0Fu << shift));
+        atomicOr(vramHi[index], (value & 0x0Fu) << shift);
+        break;
+    }
+    }
+}
+
+uint readPixelHi(uint psm, uint base, uint bw, uint x, uint y, uint smp)
+{
+    uint f = fmtOf(psm);
+    if (FMT_KIND[f] == KIND_INVALID)
+        return 0u;
+    return loadAtHi(f, locate(f, base, bw, x, y), smp);
+}
+
+void writePixelRawHi(uint psm, uint base, uint bw, uint x, uint y, uint smp, uint value)
+{
+    uint f = fmtOf(psm);
+    if (FMT_KIND[f] == KIND_INVALID)
+        return;
+    storeAtHi(f, locate(f, base, bw, x, y), smp, value);
+}
+
+int floorDivSS(int v)
+{
+    return v >= 0 ? v / SSI : -((-v + SSI - 1) / SSI);
+}
+)GLSL";
+
+    const char *const kReplicate = R"GLSL(
+layout(local_size_x = 256) in;
+layout(std430, binding = 7) readonly buffer DataBuffer { uint data[]; };
+
+// One work group per listed page: copy the native words to every sample (the page now holds data
+// written at native resolution: an upload, a copy, a clear).
+void main()
+{
+    uint page = data[gl_WorkGroupID.x];
+    uint base = page * 2048u;
+    for (uint i = gl_LocalInvocationID.x; i < 2048u; i += 256u)
+    {
+        uint value = vram[base + i];
+        uint out0 = (base + i) * SS2;
+        for (uint smp = 0u; smp < SS2; ++smp)
+            vramHi[out0 + smp] = value;
+    }
+}
+)GLSL";
+
+    const char *const kPageCopyHi = R"GLSL(
+layout(local_size_x = 256) in;
+layout(std430, binding = 7) readonly buffer DataBuffer { uint data[]; };
+
+void main()
+{
+    uint pair = data[gl_WorkGroupID.x];
+    uint source = (pair & 0xFFFFu);
+    uint target = (pair >> 16u);
+    uint words = 2048u * SS2;
+    for (uint i = gl_LocalInvocationID.x; i < words; i += 256u)
+        vramHi[target * words + i] = vramHi[source * words + i];
+}
+)GLSL";
+
     const char *const kRaster = R"GLSL(
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -235,6 +354,150 @@ layout(std430, binding = 4) readonly buffer StateBuffer { uint states[]; };
 layout(std430, binding = 5) readonly buffer TileBuffer { uvec4 tiles[]; };
 layout(std430, binding = 6) readonly buffer TileListBuffer { uint tileList[]; };
 uniform uvec4 uRaster;
+
+// A value the whole wave shares (the compiler then reads what it indexes with scalar loads).
+#if defined(GL_ARB_shader_ballot) && !defined(NO_WAVE_UNIFORM)
+#define WAVE_UNIFORM(v) readFirstInvocationARB(v)
+#else
+#define WAVE_UNIFORM(v) (v)
+#endif
+
+#ifdef HIRES
+// High-resolution pixel being drawn (in 1/SS native pixels) and its sample in the native word.
+int gX = 0;
+int gY = 0;
+uint gSmp = 0u;
+// Sample 0 sits exactly where the native pass samples the pixel, so it also writes the native
+// memory: that replaces a separate native pass for the readbacks, copies and native textures.
+void writePixelBoth(uint psm, uint base, uint bw, uint x, uint y, uint value)
+{
+    writePixelRawHi(psm, base, bw, x, y, gSmp, value);
+    if (gSmp == 0u)
+        writePixelRaw(psm, base, bw, x, y, value);
+}
+#define RAW_READ(psm, b, w, x, y) readPixelHi(psm, b, w, x, y, gSmp)
+#define RAW_WRITE(psm, b, w, x, y, v) writePixelBoth(psm, b, w, x, y, v)
+// Pixel position in native pixels, edge-test position in 1/16 units of the drawing grid, the
+// scale from vertex units to that grid, and the scale of barycentric areas.
+#define PIX_X (float(gX) / float(SS))
+#define PIX_Y (float(gY) / float(SS))
+#define SUB_X (gX * 16)
+#define SUB_Y (gY * 16)
+#define VSCALE SSI
+#define AREA_SCALE (1.0 / float(SS2))
+#else
+#define RAW_READ(psm, b, w, x, y) readPixel(psm, b, w, x, y)
+#define RAW_WRITE(psm, b, w, x, y, v) writePixelRaw(psm, b, w, x, y, v)
+#define PIX_X float(x)
+#define PIX_Y float(y)
+#define SUB_X (x * 16)
+#define SUB_Y (y * 16)
+#define VSCALE 1
+#define AREA_SCALE 1.0
+#endif
+
+#if defined(HW_TYPE) || defined(NO_PIXEL_CACHE)
+#define RPIX(psm, b, w, x, y) RAW_READ(psm, b, w, x, y)
+#define WPIX(psm, b, w, x, y, v) RAW_WRITE(psm, b, w, x, y, v)
+#else
+// A compute thread draws one pixel for the whole batch, and a batch has one frame and one depth
+// buffer that it never samples as a texture (the backend flushes on both), so the pixel's frame
+// and depth values stay in two register slots and reach memory once, when the thread ends.
+// Slots are keyed by psm, base and width.
+const uint NO_KEY = 0xFFFFFFFFu;
+uint cKey0 = NO_KEY;
+uint cKey1 = NO_KEY;
+uint cVal0 = 0u;
+uint cVal1 = 0u;
+bool cDirty0 = false;
+bool cDirty1 = false;
+uint cX = 0u;
+uint cY = 0u;
+
+uint cacheKey(uint psm, uint b, uint w) { return (psm & 0x3Fu) | ((b & 0x3FFFu) << 6u) | ((w & 0x3Fu) << 20u); }
+uint keyBase(uint k) { return (k >> 6u) & 0x3FFFu; }
+
+void flushSlot(uint k, uint v, bool dirty)
+{
+    if (dirty && k != NO_KEY)
+        RAW_WRITE(k & 0x3Fu, keyBase(k), (k >> 20u) & 0x3Fu, cX, cY, v);
+}
+
+void flushPixelCache()
+{
+    flushSlot(cKey0, cVal0, cDirty0);
+    flushSlot(cKey1, cVal1, cDirty1);
+    cKey0 = NO_KEY;
+    cKey1 = NO_KEY;
+    cDirty0 = false;
+    cDirty1 = false;
+}
+
+// The slot holding k, or a free or evicted slot for it. A key at the base of another cached key
+// (formats sharing memory) writes both slots back first.
+int cacheSlot(uint k, uint x, uint y)
+{
+    if (k == cKey0)
+        return 0;
+    if (k == cKey1)
+        return 1;
+    if ((cKey0 != NO_KEY && keyBase(cKey0) == keyBase(k)) || (cKey1 != NO_KEY && keyBase(cKey1) == keyBase(k)))
+        flushPixelCache();
+    cX = x;
+    cY = y;
+    if (cKey0 == NO_KEY)
+        return 0;
+    if (cKey1 == NO_KEY)
+        return 1;
+    flushSlot(cKey1, cVal1, cDirty1);
+    cKey1 = NO_KEY;
+    cDirty1 = false;
+    return 1;
+}
+
+uint cachedRead(uint psm, uint b, uint w, uint x, uint y)
+{
+    uint k = cacheKey(psm, b, w);
+    int slot = cacheSlot(k, x, y);
+    if (slot == 0)
+    {
+        if (cKey0 != k)
+        {
+            cKey0 = k;
+            cVal0 = RAW_READ(psm, b, w, x, y);
+            cDirty0 = false;
+        }
+        return cVal0;
+    }
+    if (cKey1 != k)
+    {
+        cKey1 = k;
+        cVal1 = RAW_READ(psm, b, w, x, y);
+        cDirty1 = false;
+    }
+    return cVal1;
+}
+
+void cachedWrite(uint psm, uint b, uint w, uint x, uint y, uint v)
+{
+    uint k = cacheKey(psm, b, w);
+    int slot = cacheSlot(k, x, y);
+    if (slot == 0)
+    {
+        cKey0 = k;
+        cVal0 = v;
+        cDirty0 = true;
+    }
+    else
+    {
+        cKey1 = k;
+        cVal1 = v;
+        cDirty1 = true;
+    }
+}
+#define RPIX(psm, b, w, x, y) cachedRead(psm, b, w, x, y)
+#define WPIX(psm, b, w, x, y, v) cachedWrite(psm, b, w, x, y, v)
+#endif
 
 const uint PRIM_WORDS = 40u;
 const uint STATE_WORDS = 32u;
@@ -274,6 +537,7 @@ const uint F_FST = 16u;
 const uint F_PABE = 32u;
 const uint F_LINEAR = 64u;
 const uint F_WRAP = 128u;
+const uint F_HITEX = 256u;
 
 uint st(uint s, uint i) { return states[s * STATE_WORDS + i]; }
 uint pw(uint p, uint i) { return prims[p * PRIM_WORDS + i]; }
@@ -392,7 +656,8 @@ uint lookupClut(uint s, uint index)
     return 0xFFFF00FFu;
 }
 
-uint samplePoint(uint s, int u, int v)
+// smp < 0: the native texel; otherwise sample smp of it (HIRES, rendered pages only).
+uint samplePointAt(uint s, int u, int v, int smp)
 {
     uint size = st(s, S_TEXSIZE);
     int texW = int(size & 0xFFFFu);
@@ -416,7 +681,11 @@ uint samplePoint(uint s, int u, int v)
         uint epoch = st(s, S_EPOCH);
         if (epoch < uRaster.x)
             loc.x = (pageMap[epoch * 512u + (loc.x >> 13u)] << 13u) | (loc.x & 0x1FFFu);
+#ifdef HIRES
+        raw = smp >= 0 ? loadAtHi(f, loc, uint(smp)) : loadAt(f, loc);
+#else
         raw = loadAt(f, loc);
+#endif
     }
     switch (psm)
     {
@@ -429,6 +698,31 @@ uint samplePoint(uint s, int u, int v)
     }
     return 0xFFFF00FFu;
 }
+
+uint samplePoint(uint s, int u, int v)
+{
+    return samplePointAt(s, u, v, -1);
+}
+
+#ifdef HIRES
+// A texel at high resolution: U, V in 1/SS texels.
+uint samplePointHi(uint s, int U, int V)
+{
+    int u = floorDivSS(U);
+    int v = floorDivSS(V);
+    return samplePointAt(s, u, v, (V - v * SSI) * SSI + (U - u * SSI));
+}
+
+// True when the texture's first page was last drawn at high resolution (a render target).
+bool textureIsRendered(uint s)
+{
+#ifdef HIRES_NATIVE_TEXTURES
+    return false;
+#else
+    return (st(s, S_FLAGS) & F_HITEX) != 0u;
+#endif
+}
+#endif
 
 uint lerpChannel(uint c00, uint c10, uint c01, uint c11, float fx, float fy)
 {
@@ -462,6 +756,30 @@ uint sampleTexture(uint s, float ss, float tt, float q, uint u, uint v)
         texUf = ss * invQ * texW;
         texVf = tt * invQ * texH;
     }
+#ifdef HIRES
+    if (textureIsRendered(s))
+    {
+        precise float hu = texUf * float(SS);
+        precise float hv = texVf * float(SS);
+        if ((flags & F_LINEAR) == 0u)
+            return samplePointHi(s, int(floor(hu)), int(floor(hv)));
+        precise float hsu = hu - 0.5;
+        precise float hsv = hv - 0.5;
+        int hu0 = int(floor(hsu));
+        int hv0 = int(floor(hsv));
+        precise float hfx = hsu - float(hu0);
+        precise float hfy = hsv - float(hv0);
+        uint h00 = samplePointHi(s, hu0, hv0);
+        uint h10 = samplePointHi(s, hu0 + 1, hv0);
+        uint h01 = samplePointHi(s, hu0, hv0 + 1);
+        uint h11 = samplePointHi(s, hu0 + 1, hv0 + 1);
+        uint hr = lerpChannel(h00 & 0xFFu, h10 & 0xFFu, h01 & 0xFFu, h11 & 0xFFu, hfx, hfy);
+        uint hg = lerpChannel((h00 >> 8u) & 0xFFu, (h10 >> 8u) & 0xFFu, (h01 >> 8u) & 0xFFu, (h11 >> 8u) & 0xFFu, hfx, hfy);
+        uint hb = lerpChannel((h00 >> 16u) & 0xFFu, (h10 >> 16u) & 0xFFu, (h01 >> 16u) & 0xFFu, (h11 >> 16u) & 0xFFu, hfx, hfy);
+        uint ha = lerpChannel(h00 >> 24u, h10 >> 24u, h01 >> 24u, h11 >> 24u, hfx, hfy);
+        return hr | (hg << 8u) | (hb << 16u) | (ha << 24u);
+    }
+#endif
     if ((flags & F_LINEAR) == 0u)
         return samplePoint(s, int(texUf), int(texVf));
 
@@ -563,7 +881,7 @@ void writePixel(uint s, int x, int y, uint z, uvec4 c, uint fog)
     uint fbrgba = 0u;
     if (frmw)
     {
-        raw = readPixel(fpsm, fbp, fbw, uint(x), uint(y));
+        raw = RPIX(fpsm, fbp, fbw, uint(x), uint(y));
         fbrgba = raw;
         if (bitsPerPixel(fpsm) == 16u)
             fbrgba = rgba5551To8888(fbrgba);
@@ -577,9 +895,9 @@ void writePixel(uint s, int x, int y, uint z, uvec4 c, uint fog)
     if (ztestMethod == 1u)
         zpass = true;
     else if (ztestMethod == 2u)
-        zpass = z >= readPixel(zpsm, zbp, fbw, uint(x), uint(y));
+        zpass = z >= RPIX(zpsm, zbp, fbw, uint(x), uint(y));
     else if (ztestMethod == 3u)
-        zpass = z > readPixel(zpsm, zbp, fbw, uint(x), uint(y));
+        zpass = z > RPIX(zpsm, zbp, fbw, uint(x), uint(y));
     if (!zpass)
         return;
 
@@ -623,10 +941,10 @@ void writePixel(uint s, int x, int y, uint z, uvec4 c, uint fog)
             pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
         if (bitsPerPixel(fpsm) == 16u)
             pixel = rgba8888To5551(pixel);
-        writePixelRaw(fpsm, fbp, fbw, uint(x), uint(y), pixel);
+        WPIX(fpsm, fbp, fbw, uint(x), uint(y), pixel);
     }
     if (writeDepth && st(s, S_ZMASK) == 0u)
-        writePixelRaw(zpsm, zbp, fbw, uint(x), uint(y), z);
+        WPIX(zpsm, zbp, fbw, uint(x), uint(y), z);
 }
 
 uvec4 unpackColor(uint c)
@@ -668,9 +986,9 @@ void drawSprite(uint p, uint s, int x, int y)
     float v0f = pf(p, 8u);
     float u1f = pf(p, 9u);
     float v1f = pf(p, 10u);
-    precise float ty = (float(y) - oy) * scaleY;
+    precise float ty = (PIX_Y - oy) * scaleY;
     precise float texVf = v0f + (v1f - v0f) * ty;
-    precise float tx = (float(x) - ox) * scaleX;
+    precise float tx = (PIX_X - ox) * scaleX;
     precise float texUf = u0f + (u1f - u0f) * tx;
     uint texel;
     if ((flags & F_FST) != 0u)
@@ -688,6 +1006,8 @@ void drawSprite(uint p, uint s, int x, int y)
 }
 
 )GLSL" R"GLSL(
+void triangleShade(uint p, uint s, vec3 e, out uint zi, out uvec4 color, out uint fog);
+
 void drawTriangle(uint p, uint s, int x, int y)
 {
     uint xr = pw(p, 1u);
@@ -698,13 +1018,12 @@ void drawTriangle(uint p, uint s, int x, int y)
     int vy[3];
     for (uint i = 0u; i < 3u; ++i)
     {
-        vx[i] = int(pw(p, 3u + i * 2u));
-        vy[i] = int(pw(p, 4u + i * 2u));
+        vx[i] = int(pw(p, 3u + i * 2u)) * VSCALE;
+        vy[i] = int(pw(p, 4u + i * 2u)) * VSCALE;
     }
     int sgn = int(pw(p, 9u));
-    float invArea = pf(p, 10u);
-    int sx = x * 16;
-    int sy = y * 16;
+    int sx = SUB_X;
+    int sy = SUB_Y;
     float e[3];
     for (uint i = 0u; i < 3u; ++i)
     {
@@ -725,20 +1044,48 @@ void drawTriangle(uint p, uint s, int x, int y)
             return;
         e[i] = float(hi) * 4294967296.0 + float(lo);
     }
+    uint z;
+    uvec4 color;
+    uint fog;
+    triangleShade(p, s, vec3(e[0], e[1], e[2]), z, color, fog);
+    writePixel(s, x, y, z, color, fog);
+}
+
+// Depth, color and fog of a triangle at a covered pixel, from its three edge values.
+void triangleShade(uint p, uint s, vec3 e, out uint zi, out uvec4 color, out uint fog)
+{
+    float invArea = pf(p, 10u) * float(AREA_SCALE);
     float w0 = e[0] * invArea;
     float w1 = e[1] * invArea;
     float w2 = e[2] * invArea;
 
+#ifdef DOUBLE_Z
     double z0 = pd(p, 11u);
     double z1 = pd(p, 13u);
     double z2 = pd(p, 15u);
     precise double z = z0 + (z1 - z0) * double(w1) + (z2 - z0) * double(w2);
+    zi = uint(clamp(z + 0.5, 0.0, 4294967295.0));
+#else
+    // Integer base plus float offset (fp64 runs at a small fraction of the float rate).
+    precise float dz = pf(p, 34u) + pf(p, 35u) * w1 + pf(p, 36u) * w2;
+    float rz = floor(dz + 0.5);
+    uint zBase = pw(p, 33u);
+    if (rz >= 0.0)
+    {
+        uint add = uint(min(rz, 4294967040.0));
+        zi = zBase + add < zBase ? 0xFFFFFFFFu : zBase + add;
+    }
+    else
+    {
+        uint sub = uint(min(-rz, 4294967040.0));
+        zi = sub > zBase ? 0u : zBase - sub;
+    }
+#endif
 
     uint flags = st(s, S_FLAGS);
     uvec4 c0 = unpackColor(pw(p, 17u));
     uvec4 c1 = unpackColor(pw(p, 18u));
     uvec4 c2 = unpackColor(pw(p, 19u));
-    uvec4 color;
     if ((flags & F_IIP) != 0u)
     {
         precise vec4 mixed = vec4(c0) * w0 + vec4(c1) * w1 + vec4(c2) * w2;
@@ -770,9 +1117,7 @@ void drawTriangle(uint p, uint s, int x, int y)
     }
     uint fogs = pw(p, 32u);
     precise float ffog = float(fogs & 0xFFu) * w0 + float((fogs >> 8u) & 0xFFu) * w1 + float((fogs >> 16u) & 0xFFu) * w2;
-    uint fog = clampU8(int(ffog));
-    double zc = clamp(z + 0.5, 0.0, 4294967295.0);
-    writePixel(s, x, y, uint(zc), color, fog);
+    fog = clampU8(int(ffog));
 }
 
 bool coversPixel(uint p, int x, int y)
@@ -788,16 +1133,16 @@ bool coversPixel(uint p, int x, int y)
     if (type != 2u)
         return true;
     int sgn = int(pw(p, 9u));
-    int sx = x * 16;
-    int sy = y * 16;
+    int sx = SUB_X;
+    int sy = SUB_Y;
     for (uint i = 0u; i < 3u; ++i)
     {
         uint a = (i + 1u) % 3u;
         uint b = (i + 2u) % 3u;
-        int vxa = int(pw(p, 3u + a * 2u));
-        int vya = int(pw(p, 4u + a * 2u));
-        int vxb = int(pw(p, 3u + b * 2u));
-        int vyb = int(pw(p, 4u + b * 2u));
+        int vxa = int(pw(p, 3u + a * 2u)) * VSCALE;
+        int vya = int(pw(p, 4u + a * 2u)) * VSCALE;
+        int vxb = int(pw(p, 3u + b * 2u)) * VSCALE;
+        int vyb = int(pw(p, 4u + b * 2u)) * VSCALE;
         int ea = -(vyb - vya) * sgn;
         int eb = (vxb - vxa) * sgn;
         int hi1, lo1, hi2, lo2;
@@ -827,26 +1172,92 @@ void drawPrim(uint p, int x, int y)
     }
 }
 
+#ifdef HIRES
+// The native main below is kept as written (the hardware-raster path cuts this source at the
+// first main); a HIRES build renames it and uses the sub-tile main after it.
+#define main nativeMain
+#endif
 void main()
 {
     uvec4 tile = tiles[gl_WorkGroupID.x];
     int x = int(tile.x * 16u + gl_LocalInvocationID.x);
     int y = int(tile.y * 16u + gl_LocalInvocationID.y);
-    for (uint base = 0u; base < tile.w; base += 32u)
+    // The whole work group walks the tile's list in order; the primitive is the same for every
+    // pixel, so its words and state are scalar loads.
+    for (uint i = 0u; i < tile.w; ++i)
     {
-        uint count = min(32u, tile.w - base);
-        uint mask = 0u;
-        for (uint k = 0u; k < count; ++k)
-            if (coversPixel(tileList[tile.z + base + k], x, y))
-                mask |= 1u << k;
-        while (mask != 0u)
-        {
-            uint k = uint(findLSB(mask));
-            mask &= mask - 1u;
-            drawPrim(tileList[tile.z + base + k], x, y);
-        }
+        uint p = WAVE_UNIFORM(tileList[tile.z + i]);
+        if (coversPixel(p, x, y))
+            drawPrim(p, x, y);
     }
+#ifndef NO_PIXEL_CACHE
+    flushPixelCache();
+#endif
 }
+#ifdef HIRES
+#undef main
+
+// Bounding box of a primitive in native pixels against a native rectangle.
+bool primOverlaps(uint p, int x0, int y0, int x1, int y1)
+{
+    uint type = pw(p, 0u) & 0xFFu;
+    uint xr = pw(p, 1u);
+    uint yr = pw(p, 2u);
+    if (type == 0u)
+        return int(xr) >= x0 && int(xr) <= x1 && int(yr) >= y0 && int(yr) <= y1;
+    return int(xr >> 16u) >= x0 && int(xr & 0xFFFFu) <= x1 && int(yr >> 16u) >= y0 && int(yr & 0xFFFFu) <= y1;
+}
+
+shared uint sMask[8];
+
+void main()
+{
+    uvec4 tile = tiles[gl_WorkGroupID.x];
+    // Work group y picks one of the SS x SS sub-tiles of 16 x 16 high-resolution pixels.
+    uint sub = gl_WorkGroupID.y;
+    int subX = int(tile.x * 16u * SS + (sub % SS) * 16u);
+    int subY = int(tile.y * 16u * SS + (sub / SS) * 16u);
+    gX = subX + int(gl_LocalInvocationID.x);
+    gY = subY + int(gl_LocalInvocationID.y);
+    gSmp = uint(gY % SSI) * SS + uint(gX % SSI);
+    int x = gX / SSI;
+    int y = gY / SSI;
+    int rx0 = subX / SSI;
+    int ry0 = subY / SSI;
+    int rx1 = (subX + 15) / SSI;
+    int ry1 = (subY + 15) / SSI;
+    uint lane = gl_LocalInvocationIndex;
+    // The tile's list holds every primitive that touches its 16 x 16 native pixels. Each chunk of
+    // 256 is first culled against this sub-tile's smaller rectangle, one primitive per thread, into
+    // a shared bit mask; pixels then walk the survivors in list order.
+    for (uint base = 0u; base < tile.w; base += 256u)
+    {
+        uint count = min(256u, tile.w - base);
+        if (lane < 8u)
+            sMask[lane] = 0u;
+        barrier();
+        if (lane < count && primOverlaps(tileList[tile.z + base + lane], rx0, ry0, rx1, ry1))
+            atomicOr(sMask[lane >> 5u], 1u << (lane & 31u));
+        barrier();
+        for (uint w = 0u; w < 8u; ++w)
+        {
+            uint mask = WAVE_UNIFORM(sMask[w]);
+            while (mask != 0u)
+            {
+                uint k = uint(findLSB(mask));
+                mask &= mask - 1u;
+                uint p = tileList[tile.z + base + w * 32u + k];
+                if (coversPixel(p, x, y))
+                    drawPrim(p, x, y);
+            }
+        }
+        barrier();
+    }
+#ifndef NO_PIXEL_CACHE
+    flushPixelCache();
+#endif
+}
+#endif
 )GLSL";
 
     const char *const kPageCopy = R"GLSL(
@@ -1097,11 +1508,24 @@ bool covers(uint c[12], int rx, int ry)
     return c[0] != 0u && rx >= int(c[6]) && rx < int(c[6]) + int(c[8]) && ry >= int(c[7]) && ry < int(c[7]) + int(c[9]);
 }
 
-uint readCircuit(uint c[12], int rx, int ry)
+uint readCircuit(uint c[12], int rx, int ry, float frx, float fry)
 {
+#ifdef HIRES
+    // frx, fry: the continuous display position. Pick the buffer pixel and the sample under it.
+    float bxf = (frx - float(int(c[6]))) / float(int(c[10]));
+    float byf = (fry - float(int(c[7]))) / float(int(c[11]));
+    int bxi = int(floor(bxf));
+    int byi = int(floor(byf));
+    uint sx = min(uint((bxf - float(bxi)) * float(SS)), SS - 1u);
+    uint sy = min(uint((byf - float(byi)) * float(SS)), SS - 1u);
+    uint bx = (uint(bxi) + c[4]) & 0x7FFu;
+    uint by = (uint(byi) + c[5]) & 0x7FFu;
+    return displayToRgba(c[3], readPixelHi(c[3], c[1] * 32u, c[2], bx, by, sy * SS + sx));
+#else
     uint bx = (uint((rx - int(c[6])) / int(c[10])) + c[4]) & 0x7FFu;
     uint by = (uint((ry - int(c[7])) / int(c[11])) + c[5]) & 0x7FFu;
     return displayToRgba(c[3], readPixel(c[3], c[1] * 32u, c[2], bx, by));
+#endif
 }
 
 uint blendChannel(uint src, uint dst, uint factor)
@@ -1122,8 +1546,18 @@ void main()
     int y0 = int(uOut.z >> 16u);
     int hstep = int(uOut.w & 0xFFFFu);
     int vstep = int(uOut.w >> 16u);
+#ifdef HIRES
+    // uOut holds the high-resolution size; each output pixel covers 1/SS of a native one.
+    float frx = float(x0) + (float(ox) + 0.5) * float(hstep) / float(SS);
+    float fry = float(y0) + (float(oy) + 0.5) * float(vstep) / float(SS);
+    int rx = int(floor(frx));
+    int ry = int(floor(fry));
+#else
     int ry = y0 + int(oy) * vstep + vstep / 2;
     int rx = x0 + int(ox) * hstep + hstep / 2;
+    float frx = float(rx);
+    float fry = float(ry);
+#endif
     uint c1[12] = uC1;
     uint c2[12] = uC2;
     bool in1 = covers(c1, rx, ry);
@@ -1140,14 +1574,14 @@ void main()
         uint alp = uMode.z;
         if (in2 && !slbg)
         {
-            uint color = readCircuit(c2, rx, ry);
+            uint color = readCircuit(c2, rx, ry, frx, fry);
             r = color & 0xFFu;
             g = (color >> 8u) & 0xFFu;
             b = (color >> 16u) & 0xFFu;
         }
         if (in1)
         {
-            uint color = readCircuit(c1, rx, ry);
+            uint color = readCircuit(c1, rx, ry, frx, fry);
             uint factor = mmod ? alp : min(255u, (color >> 24u) * 2u);
             r = blendChannel(color & 0xFFu, r, factor);
             g = blendChannel((color >> 8u) & 0xFFu, g, factor);

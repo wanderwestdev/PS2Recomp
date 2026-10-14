@@ -53,6 +53,10 @@ public:
     const Stats &GetStats() const { return m_stats; }
 
     static void SetAsyncPresentDefault(bool enabled);
+    // Internal resolution, 1 (native) to 4 times in each direction. A request from any thread takes
+    // effect on the GS thread at the next presented frame; InternalScale reports the latest request.
+    static void RequestInternalScale(uint32_t scale);
+    static uint32_t InternalScale();
     void SetTexturePageCacheEnabled(bool enabled);
     void SetFastTriangleSetupEnabled(bool enabled);
     void SetHardwareRasterAllowed(bool allowed);

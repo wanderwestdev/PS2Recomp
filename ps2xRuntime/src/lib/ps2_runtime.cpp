@@ -1,4 +1,5 @@
 #include "runtime/ps2_async_vif.h"
+#include "runtime/gs/gs_gpu_backend.h"
 #include "ps2_runtime.h"
 #include "runtime/ps2_save_state.h"
 #include "runtime/ps2_display_options.h"
@@ -2810,6 +2811,9 @@ void main()
             ps2x::savestate::requestQuickSave();
         if (IsKeyPressed(KEY_F9))
             ps2x::savestate::requestQuickLoad();
+        // F8: internal resolution native, 2x, 3x.
+        if (IsKeyPressed(KEY_F8))
+            GSGpuBackend::RequestInternalScale(GSGpuBackend::InternalScale() % 3u + 1u);
 
         if (WindowShouldClose())
         {
