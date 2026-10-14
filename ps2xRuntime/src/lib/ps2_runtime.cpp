@@ -523,12 +523,21 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         return;
     }
     s_lastPresentationTick = currentTick;
-    rt->gs().latchHostPresentationFrame();
     if (GSSharedPresent::Active())
     {
+        // With shared presentation each vblank latches its own frame (EeScheduler); the old way
+        // latched here, once per window flip, and lost a field when two came between flips.
+        static const bool onVBlank = []
+        {
+            const char *value = std::getenv("PS2X_PRESENT_ON_VBLANK");
+            return !(value && value[0] == '0');
+        }();
+        if (!onVBlank)
+            rt->gs().latchHostPresentationFrame();
         outWidth = outHeight = 0u;
         return;
     }
+    rt->gs().latchHostPresentationFrame();
 
     uint32_t width = 0u;
     uint32_t height = 0u;
