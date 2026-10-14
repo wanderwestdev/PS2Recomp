@@ -1008,6 +1008,101 @@ void drawSprite(uint p, uint s, int x, int y)
 )GLSL" R"GLSL(
 void triangleShade(uint p, uint s, vec3 e, out uint zi, out uvec4 color, out uint fog);
 
+// How far outside an edge a sample still counts, in 1/16 units of the drawing grid. Pieces of the
+// scene that are separate meshes (blocks of a wall, steps) meet along edges that miss each other
+// by a fraction of a pixel. The game places them so that no native sample falls in the gap, but
+// the extra samples at internal resolution do, and the sky shows through as a thin crack. So at
+// internal resolution a triangle reaches a quarter of a native pixel past its edges (the backend
+// sets prim word 37 for triangles at least 5 pixels long; small ones skip it). A sample in that
+// band is drawn only over something well behind it (bandFillsHole) and only where drawing it twice
+// gives the same pixel (bandBlend), so shared edges inside one mesh are unchanged.
+//
+// Perspective (STQ) triangles sample a native pixel's SS x SS samples centred on its sample
+// position (2x: -1/4 and +1/4; 3x: -1/3, 0, +1/3), not from it rightwards. Pieces of the scene
+// often meet along screen-aligned edges on half-pixel lines with a hairline gap between them;
+// native samples never fall there, and samples at +1/2 (the uncentred 2x grid) always did, which
+// drew cracks along every such joint. Screen-space triangles (FST: UI, full-screen layers) and
+// sprites keep the uncentred grid: their tiles and copies must line up sample for sample.
+// PS2X_GS_HI_DEFINES=NO_CENTER turns the centring off.
+int hiCentre(uint s)
+{
+#if defined(HIRES) && !defined(NO_CENTER)
+    return (st(s, S_FLAGS) & F_FST) != 0u ? 0 : (SSI - 1) * 8;
+#else
+    return 0;
+#endif
+}
+
+#ifndef EDGE_SLACK
+#define EDGE_SLACK 4u  // in 1/16 native pixels; PS2X_GS_HI_DEFINES="EDGE_SLACK 0u" turns it off
+#endif
+float edgeSlack(uint p, uint s)
+{
+#ifdef HIRES
+    return (st(s, S_FLAGS) & F_FST) != 0u || (pw(p, 37u) & 1u) == 0u ? 0.0 : float(EDGE_SLACK * SS);
+#else
+    return 0.0;
+#endif
+}
+
+// The edge test: 1 inside or on the edge under the top-left rule, 2 within slack of it, 0 outside.
+uint edgeCovers(int ea, int eb, int hi, uint lo, float slack)
+{
+    bool bias = ea > 0 || (ea == 0 && eb > 0);
+    bool positive = hi > 0 || (hi == 0 && lo != 0u);
+    bool zero = hi == 0 && lo == 0u;
+    if (positive || (zero && bias))
+        return 1u;
+    // Near misses only: a value below -2^32 is far outside.
+    if (slack <= 0.0 || hi != -1)
+        return 0u;
+    // |ea| + |eb| bounds the edge length from above: most samples near a triangle are rejected
+    // here, without the square root.
+    float miss = float(0u - lo);
+    if (miss > slack * float(abs(ea) + abs(eb)))
+        return 0u;
+    return miss <= slack * length(vec2(float(ea), float(eb))) ? 2u : 0u;
+}
+
+// A band sample is drawn only where drawing it twice gives the same pixel: no blending, or
+// Cs*A + Cd*(1-A) with A exactly 1.0. The blend setup is checked before shading (bandBlend: 0 no,
+// 1 yes, 2 only if the shaded alpha is 0x80); the alpha after it.
+uint bandBlend(uint s)
+{
+    uint flags = st(s, S_FLAGS);
+    if ((flags & F_ABE) == 0u)
+        return 1u;
+    uint alphaReg = st(s, S_ALPHA);
+    if ((alphaReg & 0xCFu) != 0x44u)
+        return (flags & F_PABE) != 0u ? 2u : 0u;
+    uint csel = (alphaReg >> 4u) & 3u;
+    if (csel == 0u)
+        return 2u;
+    return csel == 2u && (st(s, S_ALPHA_FIX) & 0xFFu) == 0x80u ? 1u : 0u;
+}
+
+bool bandAlphaSafe(uint s, uint a)
+{
+    uint flags = st(s, S_FLAGS);
+    if ((flags & F_PABE) != 0u && (a & 0x80u) == 0u)
+        return true;  // PABE: no blending for this pixel
+    return (st(s, S_ALPHA) & 0xCFu) == 0x44u && ((st(s, S_ALPHA) >> 4u) & 3u) == 0u && a == 0x80u;
+}
+
+// A band sample fills a crack, not a neighbour: it needs a depth test, and what is already there
+// must be well behind it (the sky or a far wall through the gap). At a convex edge the triangle's
+// plane runs just in front of the neighbouring face and would draw a light line along it.
+bool bandFillsHole(uint s, int x, int y, uint z)
+{
+    uint test = st(s, S_TEST);
+    if ((test & 0x10000u) == 0u || ((test >> 17u) & 3u) < 2u)
+        return false;
+    uint zb = RPIX(st(s, S_ZPSM), st(s, S_ZBP), st(s, S_FBW), uint(x), uint(y));
+    return z > zb && z - zb >= max(z >> 8u, 16u);
+}
+
+uint triangleDepth(uint p, vec3 e);
+
 void drawTriangle(uint p, uint s, int x, int y)
 {
     uint xr = pw(p, 1u);
@@ -1022,8 +1117,10 @@ void drawTriangle(uint p, uint s, int x, int y)
         vy[i] = int(pw(p, 4u + i * 2u)) * VSCALE;
     }
     int sgn = int(pw(p, 9u));
-    int sx = SUB_X;
-    int sy = SUB_Y;
+    int sx = SUB_X - hiCentre(s);
+    int sy = SUB_Y - hiCentre(s);
+    float slack = edgeSlack(p, s);
+    bool band = false;
     float e[3];
     for (uint i = 0u; i < 3u; ++i)
     {
@@ -1037,18 +1134,58 @@ void drawTriangle(uint p, uint s, int x, int y)
         uint carry;
         uint lo = uaddCarry(uint(lo1), uint(lo2), carry);
         int hi = hi1 + hi2 + int(carry);
-        bool bias = ea > 0 || (ea == 0 && eb > 0);
-        bool positive = hi > 0 || (hi == 0 && lo != 0u);
-        bool zero = hi == 0 && lo == 0u;
-        if (!(positive || (zero && bias)))
+        uint covered = edgeCovers(ea, eb, hi, lo, slack);
+        if (covered == 0u)
             return;
+        band = band || covered == 2u;
         e[i] = float(hi) * 4294967296.0 + float(lo);
+    }
+    // Band samples: the cheap tests (blend setup, depth) before any texturing.
+    uint blend = 1u;
+    if (band)
+    {
+        blend = bandBlend(s);
+        if (blend == 0u || !bandFillsHole(s, x, y, triangleDepth(p, vec3(e[0], e[1], e[2]))))
+            return;
     }
     uint z;
     uvec4 color;
     uint fog;
     triangleShade(p, s, vec3(e[0], e[1], e[2]), z, color, fog);
+    if (blend == 2u && !bandAlphaSafe(s, color.a))
+        return;
     writePixel(s, x, y, z, color, fog);
+}
+
+// Depth of a triangle at a pixel, from its three edge values.
+uint triangleDepth(uint p, vec3 e)
+{
+    float invArea = pf(p, 10u) * float(AREA_SCALE);
+    float w1 = e[1] * invArea;
+    float w2 = e[2] * invArea;
+    uint zi;
+#ifdef DOUBLE_Z
+    double z0 = pd(p, 11u);
+    double z1 = pd(p, 13u);
+    double z2 = pd(p, 15u);
+    precise double z = z0 + (z1 - z0) * double(w1) + (z2 - z0) * double(w2);
+    zi = uint(clamp(z + 0.5, 0.0, 4294967295.0));
+#else
+    precise float dz = pf(p, 34u) + pf(p, 35u) * w1 + pf(p, 36u) * w2;
+    float rz = floor(dz + 0.5);
+    uint zBase = pw(p, 33u);
+    if (rz >= 0.0)
+    {
+        uint add = uint(min(rz, 4294967040.0));
+        zi = zBase + add < zBase ? 0xFFFFFFFFu : zBase + add;
+    }
+    else
+    {
+        uint sub = uint(min(-rz, 4294967040.0));
+        zi = sub > zBase ? 0u : zBase - sub;
+    }
+#endif
+    return zi;
 }
 
 // Depth, color and fog of a triangle at a covered pixel, from its three edge values.
@@ -1133,8 +1270,9 @@ bool coversPixel(uint p, int x, int y)
     if (type != 2u)
         return true;
     int sgn = int(pw(p, 9u));
-    int sx = SUB_X;
-    int sy = SUB_Y;
+    int sx = SUB_X - hiCentre(header >> 8u);
+    int sy = SUB_Y - hiCentre(header >> 8u);
+    float slack = edgeSlack(p, header >> 8u);
     for (uint i = 0u; i < 3u; ++i)
     {
         uint a = (i + 1u) % 3u;
@@ -1151,10 +1289,7 @@ bool coversPixel(uint p, int x, int y)
         uint carry;
         uint lo = uaddCarry(uint(lo1), uint(lo2), carry);
         int hi = hi1 + hi2 + int(carry);
-        bool bias = ea > 0 || (ea == 0 && eb > 0);
-        bool positive = hi > 0 || (hi == 0 && lo != 0u);
-        bool zero = hi == 0 && lo == 0u;
-        if (!(positive || (zero && bias)))
+        if (edgeCovers(ea, eb, hi, lo, slack) == 0u)
             return false;
     }
     return true;
