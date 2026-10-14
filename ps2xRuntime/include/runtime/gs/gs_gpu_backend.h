@@ -57,6 +57,24 @@ public:
     // effect on the GS thread at the next presented frame; InternalScale reports the latest request.
     static void RequestInternalScale(uint32_t scale);
     static uint32_t InternalScale();
+
+    // A textured quad (two triangles with FST UVs) whose UVs cover exactly [u0, u1] x [v0, v1]
+    // of the texture at tbp0 is drawn as these pieces instead: each piece is a UV rectangle of
+    // the same texture placed dx (1/16 texel) right of the quad's left edge, at the quad's scale,
+    // height and colour. Lets a game layer relabel text built from a font atlas. UVs are in
+    // 1/16 texel units, as the GS UV register.
+    struct QuadRemap
+    {
+        struct Piece
+        {
+            uint16_t u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+            int32_t dx = 0;
+        };
+        uint32_t tbp0 = 0;
+        uint16_t u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+        std::vector<Piece> pieces;
+    };
+    static void SetQuadRemaps(std::vector<QuadRemap> remaps);
     void SetTexturePageCacheEnabled(bool enabled);
     void SetFastTriangleSetupEnabled(bool enabled);
     void SetHardwareRasterAllowed(bool allowed);
