@@ -63,18 +63,51 @@ public:
     // the same texture placed dx (1/16 texel) right of the quad's left edge, at the quad's scale,
     // height and colour. Lets a game layer relabel text built from a font atlas. UVs are in
     // 1/16 texel units, as the GS UV register.
+    // Remaps can also match by screen rectangle (GS primitive coordinates in pixels, the
+    // triangle's centre inside it), and instead of pieces either move every matching triangle by
+    // (dx, dy) pixels or hide it. The first matching remap applies.
     struct QuadRemap
     {
         struct Piece
         {
-            uint16_t u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+            uint16_t u0 = 0, v0 = 0, u1 = 0, v1 = 0; // v0 > v1 flips the piece vertically
             int32_t dx = 0;
+            float dy = 0.0f;      // pixels below the quad's top edge
+            uint32_t color = 0u;  // RGBA (r in the low byte) instead of the quad's, when not 0
+            float scale = 1.0f;   // size of the piece relative to the quad's texel scale
+        };
+        enum class Action
+        {
+            Pieces,
+            Move,
+            Hide
         };
         uint32_t tbp0 = 0;
+        bool matchUv = true;
         uint16_t u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+        bool matchScreen = false;
+        uint16_t maxUvHeight = 0;  // when not 0, only triangles at most this tall in V (1/16 texel)
+        uint8_t tbw = 0;           // when not 0, only this texture buffer width
+        float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
+        Action action = Action::Pieces;
+        float dx = 0.0f, dy = 0.0f;
         std::vector<Piece> pieces;
     };
     static void SetQuadRemaps(std::vector<QuadRemap> remaps);
+
+    // Texels a game layer adds to a texture the game uploads itself (new glyphs in a font atlas):
+    // written as a host-to-local transfer once per presented frame, before the first textured
+    // triangle that reads tbp0. data is packed in psm's host layout (two texels a byte for PSMT4).
+    struct TexturePatch
+    {
+        uint32_t tbp0 = 0;
+        uint32_t dbp = 0;
+        uint8_t dbw = 0;
+        uint8_t dpsm = 0;
+        uint16_t x = 0, y = 0, width = 0, height = 0;
+        std::vector<uint8_t> data;
+    };
+    static void SetTexturePatch(std::shared_ptr<const TexturePatch> patch);
     void SetTexturePageCacheEnabled(bool enabled);
     void SetFastTriangleSetupEnabled(bool enabled);
     void SetHardwareRasterAllowed(bool allowed);
