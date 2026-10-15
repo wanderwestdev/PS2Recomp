@@ -1739,7 +1739,10 @@ void GS::vertexKick(bool drawing)
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
         m_backend->Submit(batch);
-        if (gsTrace().file && gsTrace().lastTick == UINT64_MAX)
+        // The first traced draw dumps GS memory, so it has to be current; sync only then, not on
+        // every draw before the trace window (that stalled the game to a few frames a minute).
+        if (gsTrace().file && gsTrace().lastTick == UINT64_MAX && m_privRegs &&
+            m_privRegs->vsyncTick.load(std::memory_order_acquire) >= gsTrace().firstTick)
         {
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::DebugReadback);
