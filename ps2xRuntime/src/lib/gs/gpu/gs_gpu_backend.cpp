@@ -78,7 +78,7 @@ namespace
         SFogCol,
         SClut,
         SEpoch,
-        SMip,       // TEX1 when MXL > 0: LCM, MXL, MMAG, MMIN (bits 0-8), L (9-10), K (16-27); else 0
+        SMip,       // TEX1 when the LOD matters: LCM, MXL, MMAG, MMIN (bits 0-8), L (9-10), set (15), K (16-27); else 0
         SMipTbp1Lo, // MIPTBP1 (levels 1-3), 64 bits
         SMipTbp1Hi,
         SMipTbp2Lo, // MIPTBP2 (levels 4-6), 64 bits
@@ -2135,11 +2135,17 @@ struct GSGpuBackend::Impl
             s[STexa] = static_cast<uint32_t>(state.texa.ta0) | (state.texa.aem ? 0x100u : 0u) | (static_cast<uint32_t>(state.texa.ta1) << 16u);
             s[SClut] = clutSlot;
             s[SEpoch] = epoch;
+            // The GS picks MMAG or MMIN per pixel from the LOD, with or without mip levels; the
+            // shader does too whenever the two filters differ or MXL > 0.
             const uint64_t tex1 = ctx.tex1;
-            if (mipmapping && ((tex1 >> 2u) & 7u) != 0u)
-            {
+            const uint32_t mxl = static_cast<uint32_t>((tex1 >> 2u) & 7u);
+            const uint32_t mmin = static_cast<uint32_t>((tex1 >> 6u) & 7u);
+            const bool minLinear = mmin == 1u || mmin == 4u || mmin == 5u;
+            if (mipmapping && (mxl != 0u || ((tex1 >> 5u) & 1u) != (minLinear ? 1u : 0u)))
                 s[SMip] = static_cast<uint32_t>(tex1 & 0x1FDu) | (static_cast<uint32_t>((tex1 >> 19u) & 3u) << 9u) |
-                          (static_cast<uint32_t>((tex1 >> 32u) & 0xFFFu) << 16u);
+                          (static_cast<uint32_t>((tex1 >> 32u) & 0xFFFu) << 16u) | 0x8000u;
+            if (mipmapping && mxl != 0u)
+            {
                 const uint64_t mip1 = mipTbp1(ctx);
                 s[SMipTbp1Lo] = static_cast<uint32_t>(mip1);
                 s[SMipTbp1Hi] = static_cast<uint32_t>(mip1 >> 32u);
