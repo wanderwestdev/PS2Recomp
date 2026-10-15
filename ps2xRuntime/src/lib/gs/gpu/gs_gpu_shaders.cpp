@@ -858,9 +858,9 @@ uint sampleTexture(uint s, float ss, float tt, float q, uint u, uint v)
         texVf = tt * invQ * texH;
     }
     uint mip = st(s, S_MIP);
-    uint mxl = (mip >> 2u) & 7u;
-    if (mxl == 0u)
+    if (mip == 0u)
         return sampleLevel0(s, texUf, texVf, (flags & F_LINEAR) != 0u);
+    uint mxl = (mip >> 2u) & 7u;
     // GS LOD: K alone (LCM = 1), or (log2(1/|Q|) << L) + K; K is signed 7.4 fixed point.
     precise float lod = float(int(mip << 4u) >> 20) / 16.0;
     if ((mip & 1u) == 0u && (flags & F_FST) == 0u)
@@ -869,7 +869,7 @@ uint sampleTexture(uint s, float ss, float tt, float q, uint u, uint v)
         return sampleLevel0(s, texUf, texVf, ((mip >> 5u) & 1u) != 0u);
     uint mmin = (mip >> 6u) & 7u;
     bool linear = mmin == 1u || mmin == 4u || mmin == 5u;
-    if (mmin < 2u || mmin > 5u)
+    if (mmin < 2u || mmin > 5u || mxl == 0u)
         return sampleLevel0(s, texUf, texVf, linear);
     lod = min(lod, float(mxl));
     if (mmin == 3u || mmin == 5u)
