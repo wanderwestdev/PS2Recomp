@@ -78,6 +78,11 @@ namespace
         SFogCol,
         SClut,
         SEpoch,
+        SMip,       // TEX1 when MXL > 0: LCM, MXL, MMAG, MMIN (bits 0-8), L (9-10), K (16-27); else 0
+        SMipTbp1Lo, // MIPTBP1 (levels 1-3), 64 bits
+        SMipTbp1Hi,
+        SMipTbp2Lo, // MIPTBP2 (levels 4-6), 64 bits
+        SMipTbp2Hi,
     };
 
     constexpr uint32_t FIip = 1u;
@@ -376,6 +381,7 @@ struct GSGpuBackend::Impl
     GLuint pageMapBuffer = 0;
     std::bitset<kPages> readPages;
     bool cacheTexturePages = true;
+    bool mipmapping = true; // PS2X_GS_MIPMAP=0: sample level 0 only, as before
     bool fastTriangleSetup = true;
     bool texturePagesValid = false;
     std::array<uint32_t, 6> texturePagesKey{};
@@ -2072,6 +2078,30 @@ struct GSGpuBackend::Impl
         resetBatch();
     }
 
+    // MIPTBP1, or with TEX1.MTBA set the base pointers the GS derives for levels 1-3: each level
+    // follows the previous one in memory, half as wide.
+    static uint64_t mipTbp1(const GSContext &ctx)
+    {
+        if (((ctx.tex1 >> 9u) & 1u) == 0u)
+            return ctx.miptbp1;
+        const uint32_t psm = ctx.tex0.psm;
+        const uint32_t bits = psm == GS_PSM_T4 ? 4u : psm == GS_PSM_T8 ? 8u : (psm & 0xFu) == GS_PSM_CT16 || (psm & 0xFu) == GS_PSM_CT16S ? 16u : 32u;
+        uint64_t packed = 0;
+        uint32_t tbp = ctx.tex0.tbp0;
+        uint32_t tbw = ctx.tex0.tbw;
+        uint32_t tw = ctx.tex0.tw;
+        uint32_t th = ctx.tex0.th;
+        for (uint32_t level = 1u; level <= 3u; ++level)
+        {
+            tbp += std::max<uint32_t>(((1u << tw) * (1u << th) * bits / 8u) / 256u, 1u);
+            tbw = std::max<uint32_t>(tbw / 2u, 1u);
+            tw = tw > 0u ? tw - 1u : 0u;
+            th = th > 0u ? th - 1u : 0u;
+            packed |= static_cast<uint64_t>((tbp & 0x3FFFu) | ((tbw & 0x3Fu) << 14u)) << ((level - 1u) * 20u);
+        }
+        return packed;
+    }
+
     uint32_t addState(const GSDrawState &state)
     {
         const GSContext &ctx = state.context;
@@ -2105,6 +2135,17 @@ struct GSGpuBackend::Impl
             s[STexa] = static_cast<uint32_t>(state.texa.ta0) | (state.texa.aem ? 0x100u : 0u) | (static_cast<uint32_t>(state.texa.ta1) << 16u);
             s[SClut] = clutSlot;
             s[SEpoch] = epoch;
+            const uint64_t tex1 = ctx.tex1;
+            if (mipmapping && ((tex1 >> 2u) & 7u) != 0u)
+            {
+                s[SMip] = static_cast<uint32_t>(tex1 & 0x1FDu) | (static_cast<uint32_t>((tex1 >> 19u) & 3u) << 9u) |
+                          (static_cast<uint32_t>((tex1 >> 32u) & 0xFFFu) << 16u);
+                const uint64_t mip1 = mipTbp1(ctx);
+                s[SMipTbp1Lo] = static_cast<uint32_t>(mip1);
+                s[SMipTbp1Hi] = static_cast<uint32_t>(mip1 >> 32u);
+                s[SMipTbp2Lo] = static_cast<uint32_t>(ctx.miptbp2);
+                s[SMipTbp2Hi] = static_cast<uint32_t>(ctx.miptbp2 >> 32u);
+            }
         }
         s[SAlpha] = static_cast<uint32_t>(ctx.alpha);
         s[SAlphaFix] = static_cast<uint32_t>(ctx.alpha >> 32u);
@@ -2155,6 +2196,19 @@ struct GSGpuBackend::Impl
                 texturePages = read;
                 texturePagesKey = key;
                 texturePagesValid = true;
+            }
+            const uint32_t mxl = static_cast<uint32_t>((ctx.tex1 >> 2u) & 7u);
+            if (mipmapping && mxl != 0u)
+            {
+                const uint64_t mip1 = mipTbp1(ctx);
+                for (uint32_t level = 1u; level <= std::min<uint32_t>(mxl, 6u); ++level)
+                {
+                    const uint64_t packed = level <= 3u ? mip1 >> ((level - 1u) * 20u) : ctx.miptbp2 >> ((level - 4u) * 20u);
+                    const uint32_t tbp = static_cast<uint32_t>(packed & 0x3FFFu);
+                    const uint32_t tbw = std::max<uint32_t>(static_cast<uint32_t>((packed >> 14u) & 0x3Fu), 1u);
+                    markPages(read, ctx.tex0.psm, tbp, tbw, 0, 0, regionU ? 1023 : std::max(maxU >> level, 0),
+                              regionV ? 1023 : std::max(maxV >> level, 0));
+                }
             }
         }
         if ((read & writePages).any() || (write & readPages).any())
@@ -3055,6 +3109,8 @@ GSGpuBackend::GSGpuBackend()
     m_impl->cacheTexturePages = !setting || std::string_view(setting) != "0";
     setting = std::getenv("PS2X_GS_FAST_TRIANGLE_SETUP");
     m_impl->fastTriangleSetup = !setting || std::string_view(setting) != "0";
+    setting = std::getenv("PS2X_GS_MIPMAP");
+    m_impl->mipmapping = !setting || std::string_view(setting) != "0";
 }
 
 GSGpuBackend::~GSGpuBackend() = default;
