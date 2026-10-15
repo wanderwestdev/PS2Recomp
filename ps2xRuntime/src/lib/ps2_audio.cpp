@@ -106,6 +106,14 @@ struct PS2AudioBackend::Impl
     int32_t concealPos = 0;
     int32_t concealHead = 0;
     bool conceal = true; // PS2X_AUDIO_CONCEAL=0: old behavior (85 ms re-prime, fade to silence)
+    // Rate control: audio is produced per emulated field, so a few seconds of slow emulation (VU1
+    // spikes, 57 fields/s in Dirge's fight) drain the queue faster than it fills. Only when the queue
+    // is about to run dry does playback read the ring slower (up to 6%, interpolating between
+    // samples), so a short slowdown costs a brief pitch drop instead of a cut; otherwise the rate is
+    // exactly the game's. PS2X_AUDIO_STRETCH=0: fixed rate always.
+    bool stretch = true;
+    double readStep = 1.0;
+    double readFrac = 0.0;
     bool primed = false;
     int32_t fadePosition = 0;
     int32_t gapRemaining = 0;
@@ -125,6 +133,7 @@ struct PS2AudioBackend::Impl
     uint64_t missingFrames = 0u;
     uint64_t underruns = 0u;
     uint64_t droppedFrames = 0u;
+    uint64_t slowedFrames = 0u;  // output frames played below the game's rate (rate control)
     std::chrono::steady_clock::time_point statsStart = std::chrono::steady_clock::now();
     static Impl *streamOwner;
 
@@ -138,6 +147,27 @@ struct PS2AudioBackend::Impl
             return;
         std::lock_guard<std::mutex> lock(owner->pcmMutex);
         owner->requestedFrames += frames;
+        if (owner->stretch && owner->primed)
+        {
+            // Aim at the start-up queue; the step moves a little per block (10.7 ms), so the pitch
+            // glides rather than jumps.
+            // The original pitch is kept whenever possible: the rate is exactly 1.0 unless the
+            // queue is below 40% of the start-up 85 ms (a cut is near), and only then slows, by
+            // up to 6%. A queue that grows past 2.5x drains at 1% faster (the ring would trim it).
+            const double queued = static_cast<double>(owner->queued);
+            double want = 1.0;
+            if (queued < kPrimeSamples * 0.4)
+                want = std::max(0.94, 1.0 - 0.1 * (kPrimeSamples * 0.4 - queued) / (kPrimeSamples * 0.4) - 0.02);
+            else if (queued > kPrimeSamples * 2.5)
+                want = 1.01;
+            owner->readStep += (want - owner->readStep) * 0.2;
+            if (std::abs(owner->readStep - 1.0) < 0.0005 && want == 1.0)
+                owner->readStep = 1.0;
+        }
+        else
+            owner->readStep = 1.0;
+        if (owner->readStep < 1.0)
+            owner->slowedFrames += frames;
         for (size_t frame = 0u; frame < frames; ++frame)
         {
             if (!owner->primed && owner->queued >= (owner->everPrimed && owner->conceal ? kRePrimeSamples : kPrimeSamples))
@@ -160,15 +190,25 @@ struct PS2AudioBackend::Impl
             {
                 owner->fadePosition = std::min(owner->fadePosition + 1, kFadeFrames);
                 const int32_t fade = owner->fadePosition;
+                const double frac = owner->queued >= 4u ? owner->readFrac : 0.0;
                 for (size_t channel = 0u; channel < 2u; ++channel)
                 {
-                    const int32_t sample = owner->ring[(owner->read + channel) % kRingSamples];
+                    const int32_t a = owner->ring[(owner->read + channel) % kRingSamples];
+                    const int32_t b = owner->queued >= 4u ? owner->ring[(owner->read + 2u + channel) % kRingSamples] : a;
+                    const int32_t sample = static_cast<int32_t>(a + (b - a) * frac);
                     owner->lastOutput[channel] = static_cast<int16_t>((sample * fade + owner->fadeSource[channel] * (kFadeFrames - fade)) / kFadeFrames);
                     owner->history[owner->historyPos * 2 + channel] = owner->lastOutput[channel];
                 }
                 owner->historyPos = (owner->historyPos + 1) % kGrainFrames;
-                owner->read = (owner->read + 2u) % kRingSamples;
-                owner->queued -= 2u;
+                owner->readFrac += owner->readStep;
+                while (owner->readFrac >= 1.0 && owner->queued >= 2u)
+                {
+                    owner->readFrac -= 1.0;
+                    owner->read = (owner->read + 2u) % kRingSamples;
+                    owner->queued -= 2u;
+                }
+                if (owner->readFrac >= 1.0)
+                    owner->readFrac = 0.0;
             }
             else if (owner->everPrimed && !owner->conceal)
             {
@@ -269,6 +309,8 @@ void PS2AudioBackend::setAudioReady(bool ready)
             SetMasterVolume(0.0f);
         const char *concealValue = std::getenv("PS2X_AUDIO_CONCEAL");
         m_impl->conceal = !(concealValue && *concealValue == '0');
+        const char *stretchValue = std::getenv("PS2X_AUDIO_STRETCH");
+        m_impl->stretch = !(stretchValue && *stretchValue == '0');
         if (const char *outPath = std::getenv("PS2X_AUDIO_OUT_DUMP"); outPath && *outPath)
             m_impl->outDump = std::fopen(outPath, "wb");
         SetAudioStreamBufferSizeDefault(512);
@@ -369,10 +411,12 @@ void PS2AudioBackend::submitPcm(std::span<const int16_t> samples)
         const double elapsed = std::chrono::duration<double>(now - m_impl->statsStart).count();
         if (elapsed >= 2.0)
         {
-            std::fprintf(stderr, "[audio] %.0f produced/s, %.0f requested/s, %.2f ms queued, %llu missing frames, %llu underruns, %llu dropped frames\n",
+            std::fprintf(stderr, "[audio] %.0f produced/s, %.0f requested/s, %.2f ms queued, %llu missing frames, %llu underruns, %llu dropped frames, %llu slowed frames\n",
                          m_impl->producedFrames / elapsed, m_impl->requestedFrames / elapsed,
                          m_impl->queued / 96.0, static_cast<unsigned long long>(m_impl->missingFrames),
-                         static_cast<unsigned long long>(m_impl->underruns), static_cast<unsigned long long>(m_impl->droppedFrames));
+                         static_cast<unsigned long long>(m_impl->underruns), static_cast<unsigned long long>(m_impl->droppedFrames),
+                         static_cast<unsigned long long>(m_impl->slowedFrames));
+            m_impl->slowedFrames = 0u;
             m_impl->producedFrames = 0u;
             m_impl->requestedFrames = 0u;
             m_impl->missingFrames = 0u;
