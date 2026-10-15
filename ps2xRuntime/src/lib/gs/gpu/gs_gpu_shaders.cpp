@@ -528,6 +528,11 @@ const uint S_TEXA = 22u;
 const uint S_FOGCOL = 23u;
 const uint S_CLUT = 24u;
 const uint S_EPOCH = 25u;
+const uint S_MIP = 26u;
+const uint S_MIPTBP1_LO = 27u;
+const uint S_MIPTBP1_HI = 28u;
+const uint S_MIPTBP2_LO = 29u;
+const uint S_MIPTBP2_HI = 30u;
 
 const uint F_IIP = 1u;
 const uint F_TME = 2u;
@@ -656,20 +661,21 @@ uint lookupClut(uint s, uint index)
     return 0xFFFF00FFu;
 }
 
-// smp < 0: the native texel; otherwise sample smp of it (HIRES, rendered pages only).
-uint samplePointAt(uint s, int u, int v, int smp)
+// A texel of mip level `level` (base tbp, width tbw); smp < 0: the native texel, otherwise
+// sample smp of it (HIRES, rendered pages only).
+uint samplePointLevel(uint s, int u, int v, int smp, uint level, uint tbp, uint tbw)
 {
     uint size = st(s, S_TEXSIZE);
-    int texW = int(size & 0xFFFFu);
-    int texH = int(size >> 16u);
+    int texW = max(int(size & 0xFFFFu) >> level, 1);
+    int texH = max(int(size >> 16u) >> level, 1);
     uint lo = st(s, S_CLAMP_LO);
     uint hi = st(s, S_CLAMP_HI);
     uint wrapU = lo & 3u;
     uint wrapV = (lo >> 2u) & 3u;
-    uint minU = (lo >> 4u) & 0x3FFu;
-    uint maxU = (lo >> 14u) & 0x3FFu;
-    uint minV = (lo >> 24u) | ((hi & 0x3u) << 8u);
-    uint maxV = (hi >> 2u) & 0x3FFu;
+    uint minU = ((lo >> 4u) & 0x3FFu) >> level;
+    uint maxU = ((lo >> 14u) & 0x3FFu) >> level;
+    uint minV = ((lo >> 24u) | ((hi & 0x3u) << 8u)) >> level;
+    uint maxV = ((hi >> 2u) & 0x3FFu) >> level;
     u = wrapCoordinate(u, texW, wrapU, minU, maxU);
     v = wrapCoordinate(v, texH, wrapV, minV, maxV);
     uint psm = st(s, S_TPSM);
@@ -677,7 +683,7 @@ uint samplePointAt(uint s, int u, int v, int smp)
     uint f = fmtOf(psm);
     if (FMT_KIND[f] != KIND_INVALID)
     {
-        uvec2 loc = locate(f, st(s, S_TBP0), st(s, S_TBW), uint(u), uint(v));
+        uvec2 loc = locate(f, tbp, tbw, uint(u), uint(v));
         uint epoch = st(s, S_EPOCH);
         if (epoch < uRaster.x)
             loc.x = (pageMap[epoch * 512u + (loc.x >> 13u)] << 13u) | (loc.x & 0x1FFFu);
@@ -697,6 +703,11 @@ uint samplePointAt(uint s, int u, int v, int smp)
         return lookupClut(s, raw & 0xFFu);
     }
     return 0xFFFF00FFu;
+}
+
+uint samplePointAt(uint s, int u, int v, int smp)
+{
+    return samplePointLevel(s, u, v, smp, 0u, st(s, S_TBP0), st(s, S_TBW));
 }
 
 uint samplePoint(uint s, int u, int v)
@@ -737,6 +748,96 @@ float fabsQ(float q)
     return abs(q) > 1.0e-8 ? q : 1.0;
 }
 
+// Level 0 of the texture at texel coordinates texUf, texVf.
+uint sampleLevel0(uint s, float texUf, float texVf, bool linear)
+{
+#ifdef HIRES
+    if (textureIsRendered(s))
+    {
+        precise float hu = texUf * float(SS);
+        precise float hv = texVf * float(SS);
+        if (!linear)
+            return samplePointHi(s, int(floor(hu)), int(floor(hv)));
+        precise float hsu = hu - 0.5;
+        precise float hsv = hv - 0.5;
+        int hu0 = int(floor(hsu));
+        int hv0 = int(floor(hsv));
+        precise float hfx = hsu - float(hu0);
+        precise float hfy = hsv - float(hv0);
+        uint h00 = samplePointHi(s, hu0, hv0);
+        uint h10 = samplePointHi(s, hu0 + 1, hv0);
+        uint h01 = samplePointHi(s, hu0, hv0 + 1);
+        uint h11 = samplePointHi(s, hu0 + 1, hv0 + 1);
+        uint hr = lerpChannel(h00 & 0xFFu, h10 & 0xFFu, h01 & 0xFFu, h11 & 0xFFu, hfx, hfy);
+        uint hg = lerpChannel((h00 >> 8u) & 0xFFu, (h10 >> 8u) & 0xFFu, (h01 >> 8u) & 0xFFu, (h11 >> 8u) & 0xFFu, hfx, hfy);
+        uint hb = lerpChannel((h00 >> 16u) & 0xFFu, (h10 >> 16u) & 0xFFu, (h01 >> 16u) & 0xFFu, (h11 >> 16u) & 0xFFu, hfx, hfy);
+        uint ha = lerpChannel(h00 >> 24u, h10 >> 24u, h01 >> 24u, h11 >> 24u, hfx, hfy);
+        return hr | (hg << 8u) | (hb << 16u) | (ha << 24u);
+    }
+#endif
+    if (!linear)
+        return samplePoint(s, int(texUf), int(texVf));
+
+    precise float sampleU = texUf - 0.5;
+    precise float sampleV = texVf - 0.5;
+    int u0 = int(floor(sampleU));
+    int v0 = int(floor(sampleV));
+    precise float fx = sampleU - float(u0);
+    precise float fy = sampleV - float(v0);
+    uint c00 = samplePoint(s, u0, v0);
+    uint c10 = samplePoint(s, u0 + 1, v0);
+    uint c01 = samplePoint(s, u0, v0 + 1);
+    uint c11 = samplePoint(s, u0 + 1, v0 + 1);
+    uint r = lerpChannel(c00 & 0xFFu, c10 & 0xFFu, c01 & 0xFFu, c11 & 0xFFu, fx, fy);
+    uint g = lerpChannel((c00 >> 8u) & 0xFFu, (c10 >> 8u) & 0xFFu, (c01 >> 8u) & 0xFFu, (c11 >> 8u) & 0xFFu, fx, fy);
+    uint b = lerpChannel((c00 >> 16u) & 0xFFu, (c10 >> 16u) & 0xFFu, (c01 >> 16u) & 0xFFu, (c11 >> 16u) & 0xFFu, fx, fy);
+    uint a = lerpChannel(c00 >> 24u, c10 >> 24u, c01 >> 24u, c11 >> 24u, fx, fy);
+    return r | (g << 8u) | (b << 16u) | (a << 24u);
+}
+
+uint lerpTexel(uint c0, uint c1, float f)
+{
+    uint r = lerpChannel(c0 & 0xFFu, c1 & 0xFFu, 0u, 0u, f, 0.0);
+    uint g = lerpChannel((c0 >> 8u) & 0xFFu, (c1 >> 8u) & 0xFFu, 0u, 0u, f, 0.0);
+    uint b = lerpChannel((c0 >> 16u) & 0xFFu, (c1 >> 16u) & 0xFFu, 0u, 0u, f, 0.0);
+    uint a = lerpChannel(c0 >> 24u, c1 >> 24u, 0u, 0u, f, 0.0);
+    return r | (g << 8u) | (b << 16u) | (a << 24u);
+}
+
+// Mip level `level` (1-6) at level-0 texel coordinates texUf, texVf. Levels past 0 are never
+// render targets, so they are always read at native resolution.
+uint sampleMipLevel(uint s, float texUf, float texVf, uint level, bool linear)
+{
+    if (level == 0u)
+        return sampleLevel0(s, texUf, texVf, linear);
+    uint shift = (level <= 3u ? level - 1u : level - 4u) * 20u;
+    uint lo = st(s, level <= 3u ? S_MIPTBP1_LO : S_MIPTBP2_LO);
+    uint hi = st(s, level <= 3u ? S_MIPTBP1_HI : S_MIPTBP2_HI);
+    uint packed = shift == 0u ? lo : shift == 20u ? ((lo >> 20u) | (hi << 12u)) : (hi >> 8u);
+    uint tbp = packed & 0x3FFFu;
+    uint tbw = max((packed >> 14u) & 0x3Fu, 1u);
+    precise float scale = 1.0 / float(1u << level);
+    precise float lu = texUf * scale;
+    precise float lv = texVf * scale;
+    if (!linear)
+        return samplePointLevel(s, int(lu), int(lv), -1, level, tbp, tbw);
+    precise float sampleU = lu - 0.5;
+    precise float sampleV = lv - 0.5;
+    int u0 = int(floor(sampleU));
+    int v0 = int(floor(sampleV));
+    precise float fx = sampleU - float(u0);
+    precise float fy = sampleV - float(v0);
+    uint c00 = samplePointLevel(s, u0, v0, -1, level, tbp, tbw);
+    uint c10 = samplePointLevel(s, u0 + 1, v0, -1, level, tbp, tbw);
+    uint c01 = samplePointLevel(s, u0, v0 + 1, -1, level, tbp, tbw);
+    uint c11 = samplePointLevel(s, u0 + 1, v0 + 1, -1, level, tbp, tbw);
+    uint r = lerpChannel(c00 & 0xFFu, c10 & 0xFFu, c01 & 0xFFu, c11 & 0xFFu, fx, fy);
+    uint g = lerpChannel((c00 >> 8u) & 0xFFu, (c10 >> 8u) & 0xFFu, (c01 >> 8u) & 0xFFu, (c11 >> 8u) & 0xFFu, fx, fy);
+    uint b = lerpChannel((c00 >> 16u) & 0xFFu, (c10 >> 16u) & 0xFFu, (c01 >> 16u) & 0xFFu, (c11 >> 16u) & 0xFFu, fx, fy);
+    uint a = lerpChannel(c00 >> 24u, c10 >> 24u, c01 >> 24u, c11 >> 24u, fx, fy);
+    return r | (g << 8u) | (b << 16u) | (a << 24u);
+}
+
 uint sampleTexture(uint s, float ss, float tt, float q, uint u, uint v)
 {
     uint size = st(s, S_TEXSIZE);
@@ -756,48 +857,31 @@ uint sampleTexture(uint s, float ss, float tt, float q, uint u, uint v)
         texUf = ss * invQ * texW;
         texVf = tt * invQ * texH;
     }
-#ifdef HIRES
-    if (textureIsRendered(s))
+    uint mip = st(s, S_MIP);
+    uint mxl = (mip >> 2u) & 7u;
+    if (mxl == 0u)
+        return sampleLevel0(s, texUf, texVf, (flags & F_LINEAR) != 0u);
+    // GS LOD: K alone (LCM = 1), or (log2(1/|Q|) << L) + K; K is signed 7.4 fixed point.
+    precise float lod = float(int(mip << 4u) >> 20) / 16.0;
+    if ((mip & 1u) == 0u && (flags & F_FST) == 0u)
+        lod += -log2(abs(fabsQ(q))) * float(1u << ((mip >> 9u) & 3u));
+    if (lod <= 0.0)
+        return sampleLevel0(s, texUf, texVf, ((mip >> 5u) & 1u) != 0u);
+    uint mmin = (mip >> 6u) & 7u;
+    bool linear = mmin == 1u || mmin == 4u || mmin == 5u;
+    if (mmin < 2u || mmin > 5u)
+        return sampleLevel0(s, texUf, texVf, linear);
+    lod = min(lod, float(mxl));
+    if (mmin == 3u || mmin == 5u)
     {
-        precise float hu = texUf * float(SS);
-        precise float hv = texVf * float(SS);
-        if ((flags & F_LINEAR) == 0u)
-            return samplePointHi(s, int(floor(hu)), int(floor(hv)));
-        precise float hsu = hu - 0.5;
-        precise float hsv = hv - 0.5;
-        int hu0 = int(floor(hsu));
-        int hv0 = int(floor(hsv));
-        precise float hfx = hsu - float(hu0);
-        precise float hfy = hsv - float(hv0);
-        uint h00 = samplePointHi(s, hu0, hv0);
-        uint h10 = samplePointHi(s, hu0 + 1, hv0);
-        uint h01 = samplePointHi(s, hu0, hv0 + 1);
-        uint h11 = samplePointHi(s, hu0 + 1, hv0 + 1);
-        uint hr = lerpChannel(h00 & 0xFFu, h10 & 0xFFu, h01 & 0xFFu, h11 & 0xFFu, hfx, hfy);
-        uint hg = lerpChannel((h00 >> 8u) & 0xFFu, (h10 >> 8u) & 0xFFu, (h01 >> 8u) & 0xFFu, (h11 >> 8u) & 0xFFu, hfx, hfy);
-        uint hb = lerpChannel((h00 >> 16u) & 0xFFu, (h10 >> 16u) & 0xFFu, (h01 >> 16u) & 0xFFu, (h11 >> 16u) & 0xFFu, hfx, hfy);
-        uint ha = lerpChannel(h00 >> 24u, h10 >> 24u, h01 >> 24u, h11 >> 24u, hfx, hfy);
-        return hr | (hg << 8u) | (hb << 16u) | (ha << 24u);
+        uint level = uint(floor(lod));
+        precise float frac = lod - float(level);
+        uint c0 = sampleMipLevel(s, texUf, texVf, level, linear);
+        if (level >= mxl || frac <= 0.0)
+            return c0;
+        return lerpTexel(c0, sampleMipLevel(s, texUf, texVf, level + 1u, linear), frac);
     }
-#endif
-    if ((flags & F_LINEAR) == 0u)
-        return samplePoint(s, int(texUf), int(texVf));
-
-    precise float sampleU = texUf - 0.5;
-    precise float sampleV = texVf - 0.5;
-    int u0 = int(floor(sampleU));
-    int v0 = int(floor(sampleV));
-    precise float fx = sampleU - float(u0);
-    precise float fy = sampleV - float(v0);
-    uint c00 = samplePoint(s, u0, v0);
-    uint c10 = samplePoint(s, u0 + 1, v0);
-    uint c01 = samplePoint(s, u0, v0 + 1);
-    uint c11 = samplePoint(s, u0 + 1, v0 + 1);
-    uint r = lerpChannel(c00 & 0xFFu, c10 & 0xFFu, c01 & 0xFFu, c11 & 0xFFu, fx, fy);
-    uint g = lerpChannel((c00 >> 8u) & 0xFFu, (c10 >> 8u) & 0xFFu, (c01 >> 8u) & 0xFFu, (c11 >> 8u) & 0xFFu, fx, fy);
-    uint b = lerpChannel((c00 >> 16u) & 0xFFu, (c10 >> 16u) & 0xFFu, (c01 >> 16u) & 0xFFu, (c11 >> 16u) & 0xFFu, fx, fy);
-    uint a = lerpChannel(c00 >> 24u, c10 >> 24u, c01 >> 24u, c11 >> 24u, fx, fy);
-    return r | (g << 8u) | (b << 16u) | (a << 24u);
+    return sampleMipLevel(s, texUf, texVf, min(uint(floor(lod + 0.5)), mxl), linear);
 }
 
 uvec4 combineTexture(uint s, uvec4 vc, uint texel)

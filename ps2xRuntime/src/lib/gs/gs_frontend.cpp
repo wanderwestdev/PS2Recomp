@@ -1889,7 +1889,7 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
     batch.state.linearFilter = mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
     // PS2X_GS_MIP_STATS=1: every 600 textured draws, how many asked for mipmaps (TEX1.MXL > 0) and
-    // which minification filters they used. The GPU backend samples level 0 only.
+    // which minification filters they used (the GPU backend mipmaps them; PS2X_GS_MIPMAP=0 turns it off).
     static const bool mipStats = []
     {
         const char *value = std::getenv("PS2X_GS_MIP_STATS");
