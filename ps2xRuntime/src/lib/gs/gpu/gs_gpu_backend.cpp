@@ -3386,6 +3386,42 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
             return at;
         }();
         ++presentIndex;
+        // PS2X_GS_PRESENT_DUMP_FIELDS=<dir>:<field>,<field>...: the first frame presented at or
+        // after each field, as <dir>/field-<field>.ppm. It does not need the window: test runs
+        // while the display is off (the window loop pauses when minimized) still get pictures.
+        static std::vector<uint64_t> fieldDumps = []
+        {
+            std::vector<uint64_t> at;
+            if (const char *value = std::getenv("PS2X_GS_PRESENT_DUMP_FIELDS"))
+            {
+                const char *colon = std::strrchr(value, ':');
+                for (const char *c = colon ? colon + 1 : value; c && *c;)
+                {
+                    at.push_back(std::strtoull(c, nullptr, 10));
+                    c = std::strchr(c, ',');
+                    if (c)
+                        ++c;
+                }
+            }
+            std::sort(at.begin(), at.end());
+            return at;
+        }();
+        if (!fieldDumps.empty() && request.vsyncTick >= fieldDumps.front())
+        {
+            std::string dir = std::getenv("PS2X_GS_PRESENT_DUMP_FIELDS");
+            dir = dir.substr(0, dir.rfind(':'));
+            std::vector<uint8_t> rgba(static_cast<size_t>(width) * height * 4u);
+            d.readData(rgba.data(), rgba.size());
+            const std::string path = dir + "/field-" + std::to_string(fieldDumps.front()) + ".ppm";
+            if (std::FILE *file = std::fopen(path.c_str(), "wb"))
+            {
+                std::fprintf(file, "P6\n%u %u\n255\n", width, height);
+                for (size_t i = 0; i < rgba.size(); i += 4u)
+                    std::fwrite(&rgba[i], 1u, 3u, file);
+                std::fclose(file);
+            }
+            fieldDumps.erase(fieldDumps.begin());
+        }
         if (std::find(dumpAt.begin(), dumpAt.end(), presentIndex) != dumpAt.end())
         {
             std::string prefix = std::getenv("PS2X_GS_PRESENT_DUMP");
