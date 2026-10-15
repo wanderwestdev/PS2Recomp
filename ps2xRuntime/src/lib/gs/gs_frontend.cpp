@@ -1888,6 +1888,30 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
     const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
     batch.state.linearFilter = mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
+    // PS2X_GS_MIP_STATS=1: every 600 textured draws, how many asked for mipmaps (TEX1.MXL > 0) and
+    // which minification filters they used. The GPU backend samples level 0 only.
+    static const bool mipStats = []
+    {
+        const char *value = std::getenv("PS2X_GS_MIP_STATS");
+        return value && *value && *value != '0';
+    }();
+    if (mipStats && batch.state.prim.tme)
+    {
+        static uint64_t textured = 0, mipped = 0, byMin[8] = {};
+        ++textured;
+        if (((tex1 >> 2u) & 0x7u) != 0u)
+        {
+            ++mipped;
+            ++byMin[mmin];
+        }
+        if (textured % 600u == 0u)
+        {
+            std::fprintf(stderr, "[gs-mip] %llu of %llu textured draws use mipmaps (MMIN 2-5: %llu %llu %llu %llu)\n",
+                         static_cast<unsigned long long>(mipped), static_cast<unsigned long long>(textured),
+                         static_cast<unsigned long long>(byMin[2]), static_cast<unsigned long long>(byMin[3]),
+                         static_cast<unsigned long long>(byMin[4]), static_cast<unsigned long long>(byMin[5]));
+        }
+    }
     return batch;
 }
 
