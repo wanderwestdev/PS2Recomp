@@ -841,6 +841,13 @@ uint sampleMipLevel(uint s, float texUf, float texVf, uint level, bool linear)
     return r | (g << 8u) | (b << 16u) | (a << 24u);
 }
 
+// Internal resolution only: the smallest mip level a perspective triangle's sample may use, from
+// how far the texture moves between neighbouring samples on screen (set by triangleShade). The GS
+// picks the level from Q alone, which under-filters surfaces seen at a grazing angle (floors, stair
+// faces); at native that is blocky noise, at internal resolution every row became a thin bright
+// streak. Using the larger of the two keeps facing surfaces as sharp as the GS rule.
+float gLodFloor = -1000.0;
+
 uint sampleTexture(uint s, float ss, float tt, float q, uint u, uint v)
 {
     uint size = st(s, S_TEXSIZE);
@@ -868,6 +875,10 @@ uint sampleTexture(uint s, float ss, float tt, float q, uint u, uint v)
     precise float lod = float(int(mip << 4u) >> 20) / 16.0;
     if ((mip & 1u) == 0u && (flags & F_FST) == 0u)
         lod += -log2(abs(fabsQ(q))) * float(1u << ((mip >> 9u) & 3u));
+#ifdef HIRES
+    if ((flags & F_FST) == 0u)
+        lod = max(lod, gLodFloor);
+#endif
     if (lod <= 0.0)
         return sampleLevel0(s, texUf, texVf, ((mip >> 5u) & 1u) != 0u);
     uint mmin = (mip >> 6u) & 7u;
@@ -1352,7 +1363,43 @@ void triangleShade(uint p, uint s, vec3 e, out uint zi, out uvec4 color, out uin
             precise float is = pf(p, 20u) * w0 + pf(p, 23u) * w1 + pf(p, 26u) * w2;
             precise float it = pf(p, 21u) * w0 + pf(p, 24u) * w1 + pf(p, 27u) * w2;
             precise float iq = pf(p, 22u) * w0 + pf(p, 25u) * w1 + pf(p, 28u) * w2;
+#ifdef HIRES
+            {
+                // Vertex weights one sample right and one sample down: each weight is an edge
+                // function, which changes by its coefficient (times 16 sub-units per sample).
+                int vx[3];
+                int vy[3];
+                for (uint i = 0u; i < 3u; ++i)
+                {
+                    vx[i] = int(pw(p, 3u + i * 2u)) * VSCALE;
+                    vy[i] = int(pw(p, 4u + i * 2u)) * VSCALE;
+                }
+                float sgn = float(int(pw(p, 9u)));
+                vec3 dwx, dwy;
+                for (uint i = 0u; i < 3u; ++i)
+                {
+                    uint a = (i + 1u) % 3u;
+                    uint b = (i + 2u) % 3u;
+                    dwx[i] = -float(vy[b] - vy[a]) * sgn * 16.0 * invArea;
+                    dwy[i] = float(vx[b] - vx[a]) * sgn * 16.0 * invArea;
+                }
+                vec3 sv = vec3(pf(p, 20u), pf(p, 23u), pf(p, 26u));
+                vec3 tv = vec3(pf(p, 21u), pf(p, 24u), pf(p, 27u));
+                vec3 qv = vec3(pf(p, 22u), pf(p, 25u), pf(p, 28u));
+                vec3 w = vec3(w0, w1, w2);
+                uint size = st(s, S_TEXSIZE);
+                vec2 texSize = vec2(float(size & 0xFFFFu), float(size >> 16u));
+                vec2 uv = vec2(dot(sv, w), dot(tv, w)) / fabsQ(dot(qv, w)) * texSize;
+                vec2 uvx = vec2(dot(sv, w + dwx), dot(tv, w + dwx)) / fabsQ(dot(qv, w + dwx)) * texSize;
+                vec2 uvy = vec2(dot(sv, w + dwy), dot(tv, w + dwy)) / fabsQ(dot(qv, w + dwy)) * texSize;
+                float texStep = max(length(uvx - uv), length(uvy - uv));
+                gLodFloor = texStep > 0.0 ? log2(texStep) : -1000.0;
+            }
+#endif
             texel = sampleTexture(s, is, it, iq, 0u, 0u);
+#ifdef HIRES
+            gLodFloor = -1000.0;
+#endif
         }
         color = combineTexture(s, color, texel);
     }
