@@ -333,6 +333,7 @@ struct GSGpuBackend::Impl
         std::bitset<kPages> validPages;
         std::bitset<kPages> dirtyPages;
         uint64_t used = 0u;
+        uint32_t scale = 1u;
     };
     std::vector<std::unique_ptr<Target>> targets;
     bool hwTargets = false;
@@ -1506,7 +1507,7 @@ struct GSGpuBackend::Impl
         g.ActiveTexture(kTexture0);
         g.BindTexture(kTexture2D, t.texture);
         g.Uniform4ui(tgStore.loc[0], t.psm, t.base, t.bw, t.depth ? 1u : 0u);
-        g.Uniform4ui(tgStore.loc[1], tgScale, 0u, 0u, 0u);
+        g.Uniform4ui(tgStore.loc[1], t.scale, 0u, 0u, 0u);
         const GLuint profStore = profBegin();
         g.DispatchCompute(static_cast<GLuint>(tgRects.size() / 2u), 1u, 1u);
         profEnd(9u, profStore);
@@ -1531,7 +1532,7 @@ struct GSGpuBackend::Impl
         g.BindFramebuffer(kFramebuffer, tgFramebuffer);
         g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, t.depth ? 0u : t.texture, 0);
         g.FramebufferTexture2D(kFramebuffer, kDepthAttachment, kTexture2D, t.depth ? t.texture : 0u, 0);
-        g.Viewport(0, 0, static_cast<GLsizei>(kTargetSize * tgScale), static_cast<GLsizei>(kTargetSize * tgScale));
+        g.Viewport(0, 0, static_cast<GLsizei>(kTargetSize * t.scale), static_cast<GLsizei>(kTargetSize * t.scale));
         g.Disable(kBlend);
         g.ColorMask(1, 1, 1, 1);
         if (t.depth)
@@ -1545,7 +1546,7 @@ struct GSGpuBackend::Impl
         g.BindVertexArray(hwVertexArray);
         g.UseProgram(tgLoad.id);
         g.Uniform4ui(tgLoad.loc[0], t.psm, t.base, t.bw, t.depth ? 1u : 0u);
-        g.Uniform4ui(tgLoad.loc[1], tgScale, 0u, 0u, 0u);
+        g.Uniform4ui(tgLoad.loc[1], t.scale, 0u, 0u, 0u);
         const GLuint profLoad = profBegin();
         g.DrawArrays(kTriangles, 0, static_cast<GLsizei>(tgRects.size() / 2u * 6u));
         profEnd(8u, profLoad);
@@ -1639,8 +1640,17 @@ struct GSGpuBackend::Impl
         const Api &g = gl();
         g.GenTextures(1, &t->texture);
         g.BindTexture(kTexture2D, t->texture);
-        g.TexStorage2D(kTexture2D, 1, depth ? kDepthComponent32F : kRgba8, static_cast<GLsizei>(t->bw * 64u * tgScale),
-                       static_cast<GLsizei>(kTargetHeight * tgScale));
+        // PS2X_GS_TARGETS_NATIVE_SMALL=1: buffers narrower than the 512-pixel frame (shadow maps,
+        // blur and glare chains) stay at scale 1, like PCSX2's native scaling. Off by default:
+        // it did not fix the 3x shadows and the fights got slower (2026-10-16).
+        static const bool nativeSmall = []
+        {
+            const char *value = std::getenv("PS2X_GS_TARGETS_NATIVE_SMALL");
+            return value && *value == '1';
+        }();
+        t->scale = !nativeSmall || t->bw * 64u >= 512u ? tgScale : 1u;
+        g.TexStorage2D(kTexture2D, 1, depth ? kDepthComponent32F : kRgba8, static_cast<GLsizei>(t->bw * 64u * t->scale),
+                       static_cast<GLsizei>(kTargetHeight * t->scale));
         g.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
         g.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
         g.BindTexture(kTexture2D, 0u);
@@ -1823,7 +1833,9 @@ struct GSGpuBackend::Impl
         {
             const uint32_t w = (p[1] >> 16u) - (p[1] & 0xFFFFu) + 1u;
             const uint32_t h = (p[2] >> 16u) - (p[2] & 0xFFFFu) + 1u;
-            if (policy == 3u || w * h >= 4096u)
+            // Post-processing samples a texture; untextured sprites (fog and light layers) are
+            // drawn once and stay fixed-function.
+            if (policy == 3u || ((s[SFlags] & FTme) != 0u && w * h >= 4096u))
                 return 5u;
             // A sprite that samples an earlier render target is post-processing too.
             if ((s[SFlags] & FTme) != 0u)
@@ -1868,7 +1880,7 @@ struct GSGpuBackend::Impl
 
     // Applies the depth, blend and mask state of one state word set for a pass (0: pixels that
     // pass the alpha test, 1: pixels that fail it, drawn with the AFAIL masks).
-    void applyTargetState(const uint32_t *s, uint32_t pass, bool haveDepth, bool exact)
+    void applyTargetState(const uint32_t *s, uint32_t pass, bool haveDepth, bool exact, uint32_t targetScale)
     {
         const Api &g = gl();
         const uint32_t test = s[STest];
@@ -1905,7 +1917,7 @@ struct GSGpuBackend::Impl
         const uint32_t sx = s[SScissorX];
         const uint32_t sy = s[SScissorY];
         g.Enable(kScissorTest);
-        const int scale = static_cast<int>(tgScale);
+        const int scale = static_cast<int>(targetScale);
         g.Scissor(static_cast<GLint>(sx & 0xFFFFu) * scale, static_cast<GLint>(sy & 0xFFFFu) * scale,
                   static_cast<GLsizei>(std::max<int>(static_cast<int>(sx >> 16u) - static_cast<int>(sx & 0xFFFFu) + 1, 0) * scale),
                   static_cast<GLsizei>(std::max<int>(static_cast<int>(sy >> 16u) - static_cast<int>(sy & 0xFFFFu) + 1, 0) * scale));
@@ -1959,6 +1971,14 @@ struct GSGpuBackend::Impl
         }
         const uint32_t clampMode = s[SClampLo];
         if ((clampMode & 3u) >= 2u || ((clampMode >> 2u) & 3u) >= 2u)
+            return nullptr;
+        // PS2X_GS_TARGETS_SOURCE_ONLY=<base>: only that target is read as a source (bisecting).
+        static const long onlyBase = []
+        {
+            const char *value = std::getenv("PS2X_GS_TARGETS_SOURCE_ONLY");
+            return value ? std::strtol(value, nullptr, 16) : -1L;
+        }();
+        if (onlyBase >= 0 && static_cast<long>(s[STbp0]) != onlyBase)
             return nullptr;
         for (const std::unique_ptr<Target> &t : targets)
             if (!t->depth && t->base != colorBase && t->base != depthBase && t->base == s[STbp0] &&
@@ -2159,6 +2179,11 @@ struct GSGpuBackend::Impl
                 run.source->used = ++tgClock;
         Target &color = findTarget(s0[SFbp], s0[SFbw], s0[SFpsm], false);
         Target *depth = depthUsed ? &findTarget(s0[SZbp], s0[SFbw], s0[SZpsm], true) : nullptr;
+        if (depth && depth->scale != color.scale)
+        {
+            ++tgStats.reasons[8u];
+            return false;
+        }
         const std::bitset<kCells> colorCells = targetCells(color, x0, y0, x1, y1);
         std::bitset<kCells> depthCells;
         std::bitset<kPages> colorPages;
@@ -2214,7 +2239,7 @@ struct GSGpuBackend::Impl
         g.BindFramebuffer(kFramebuffer, tgFramebuffer);
         g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, color.texture, 0);
         g.FramebufferTexture2D(kFramebuffer, kDepthAttachment, kTexture2D, depth ? depth->texture : 0u, 0);
-        g.Viewport(0, 0, static_cast<GLsizei>(kTargetSize * tgScale), static_cast<GLsizei>(kTargetSize * tgScale));
+        g.Viewport(0, 0, static_cast<GLsizei>(kTargetSize * color.scale), static_cast<GLsizei>(kTargetSize * color.scale));
         g.BindVertexArray(hwVertexArray);
         g.ActiveTexture(kTexture0 + 1u);
         g.BindTexture(kTexture2D, color.texture);
@@ -2232,10 +2257,10 @@ struct GSGpuBackend::Impl
                 // ATST NEVER: nothing passes, so only the AFAIL pass draws.
                 if (pass == 0u && (test & 0xFu) == 1u)
                     continue;
-                applyTargetState(s, pass, depth != nullptr, run.exact);
+                applyTargetState(s, pass, depth != nullptr, run.exact, color.scale);
                 g.UseProgram(run.program->id);
                 g.Uniform4ui(run.program->loc[0], epoch, 0u, 0u, 0u);
-                g.Uniform4ui(run.program->loc[1], 0u, tgScale, run.source ? 1u : 0u, 0u);
+                g.Uniform4ui(run.program->loc[1], 0u, run.source ? run.source->scale : 1u, run.source ? 1u : 0u, 0u);
                 g.ActiveTexture(kTexture0 + 2u);
                 g.BindTexture(kTexture2D, run.source ? run.source->texture : 0u);
                 g.ActiveTexture(kTexture0);
@@ -4126,6 +4151,7 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     std::array<GLuint, 2> circuitTextures{};
     uint32_t outScale = 1u;
     if (d.hwTargets && d.tgScale > 1u && nativeWidth * d.tgScale <= 4096u && nativeHeight * d.tgScale <= 4096u)
+        // Both circuits must agree on one scale; a scale-1 target is read from GS memory.
         for (size_t i = 0; i < 2u; ++i)
         {
             const CrtcCircuit &c = circuits[i];
@@ -4137,8 +4163,8 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
                 const int h = (c.dh + c.vdiv - 1) / c.vdiv;
                 const auto cells = d.targetCells(*t, static_cast<int>(c.dbx), static_cast<int>(c.dby), static_cast<int>(c.dbx) + w - 1,
                                                  static_cast<int>(c.dby) + h - 1);
-                if (static_cast<int>(c.dbx) + w <= static_cast<int>(t->bw * 64u) && static_cast<int>(c.dby) + h <= static_cast<int>(Impl::kTargetHeight) &&
-                    (cells & ~t->valid).none())
+                if (t->scale == d.tgScale && static_cast<int>(c.dbx) + w <= static_cast<int>(t->bw * 64u) &&
+                    static_cast<int>(c.dby) + h <= static_cast<int>(Impl::kTargetHeight) && (cells & ~t->valid).none())
                 {
                     circuitTextures[i] = t->texture;
                     outScale = d.tgScale;
