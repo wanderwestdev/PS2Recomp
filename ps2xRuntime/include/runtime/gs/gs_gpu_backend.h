@@ -54,6 +54,11 @@ public:
 
     static void SetAsyncPresentDefault(bool enabled);
 
+    // Internal resolution through upscaled render targets (ADR-0009). 1 is the native compute
+    // renderer; 2-6 draw the targets at that scale. Takes effect at the next presented frame.
+    static void RequestRenderScale(uint32_t scale);
+    static uint32_t RenderScale();
+
     // A textured quad (two triangles with FST UVs) whose UVs cover exactly [u0, u1] x [v0, v1]
     // of the texture at tbp0 is drawn as these pieces instead: each piece is a UV rectangle of
     // the same texture placed dx (1/16 texel) right of the quad's left edge, at the quad's scale,

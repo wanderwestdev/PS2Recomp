@@ -122,6 +122,8 @@ namespace
     };
 
     std::atomic<bool> s_asyncPresent{false};
+    std::atomic<uint32_t> s_requestedScale{0u};
+    std::atomic<uint32_t> s_renderScale{1u};
     // Internal resolution requested by the host (0 = not yet; PS2X_GS_SCALE at start) and in effect.
 
     constexpr size_t kRingChunk = 16u * 1024u * 1024u;
@@ -337,6 +339,8 @@ struct GSGpuBackend::Impl
     };
     std::vector<std::unique_ptr<Target>> targets;
     bool hwTargets = false;
+    bool tgReady = false;  // the target programs are compiled (setupTargets)
+    std::string tgPrefix;
     uint32_t tgScale = 1u; // PS2X_GS_TARGETS_SCALE
     std::string tgFragmentBody;
     GLuint tgFramebuffer = 0u;
@@ -1265,8 +1269,9 @@ struct GSGpuBackend::Impl
         const char *targetSetting = std::getenv("PS2X_GS_TARGETS");
         const bool interlock = !(setting && *setting == '0') && hwAllowed;
         const bool wantTargets = targetSetting && *targetSetting == '1' && gl().targets;
-        if (!gl().graphics || (!interlock && !wantTargets))
+        if (!gl().graphics)
             return false;
+        tgPrefix = prefix;
         const std::string version = "#version 460 core\n";
         std::string body = GSGpuShaders::kRaster;
         const std::string layout = "layout(local_size_x = 16, local_size_y = 16) in;";
@@ -1416,6 +1421,8 @@ struct GSGpuBackend::Impl
         gl().ClipControl(kLowerLeft, kZeroToOne);
         gl().Enable(kDepthClamp);
         hwTargets = true;
+        tgReady = true;
+        s_renderScale.store(tgScale, std::memory_order_relaxed);
         return true;
     }
 
@@ -2329,6 +2336,36 @@ struct GSGpuBackend::Impl
         stats.batches += 1u;
         stats.prims += primCount;
         return true;
+    }
+
+    // RequestRenderScale, applied on the GS thread between frames: every target goes back to GS
+    // memory and is dropped; scale 1 returns to the compute renderer.
+    void applyRequestedScale()
+    {
+        const uint32_t want = s_requestedScale.exchange(0u, std::memory_order_relaxed);
+        if (want == 0u || (want == tgScale && (hwTargets || want == 1u)))
+            return;
+        flushBatch();
+        if (hwTargets)
+            syncAllTargets();
+        for (const std::unique_ptr<Target> &t : targets)
+            gl().DeleteTextures(1, &t->texture);
+        targets.clear();
+        if (want == 1u)
+        {
+            hwTargets = false;
+            tgScale = 1u;
+        }
+        else
+        {
+            if (!tgReady && (tgPrefix.empty() || !gl().targets || !setupTargets(tgPrefix)))
+                return;
+            hwTargets = true;
+            tgScale = want;
+        }
+        s_renderScale.store(tgScale, std::memory_order_relaxed);
+        std::fprintf(stderr, "[gs-gpu] render scale %u\n", tgScale);
+        std::fflush(stderr);
     }
 
     void reportTargets()
@@ -3703,6 +3740,16 @@ void GSGpuBackend::SetAsyncPresentDefault(bool enabled)
     s_asyncPresent.store(enabled, std::memory_order_relaxed);
 }
 
+void GSGpuBackend::RequestRenderScale(uint32_t scale)
+{
+    s_requestedScale.store(std::clamp<uint32_t>(scale, 1u, 6u), std::memory_order_relaxed);
+}
+
+uint32_t GSGpuBackend::RenderScale()
+{
+    return s_renderScale.load(std::memory_order_relaxed);
+}
+
 namespace
 {
     std::mutex s_remapMutex;
@@ -4092,6 +4139,7 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     if (!d.ensure())
         return result;
     d.flushBatch();
+    d.applyRequestedScale();
     if (d.hwTargets)
     {
         ++d.tgStats.presents;
