@@ -108,10 +108,20 @@ struct PS2AudioBackend::Impl
     bool conceal = true; // PS2X_AUDIO_CONCEAL=0: old behavior (85 ms re-prime, fade to silence)
     // Rate control: audio is produced per emulated field, so a few seconds of slow emulation (VU1
     // spikes, 57 fields/s in Dirge's fight) drain the queue faster than it fills. Only when the queue
-    // is about to run dry does playback read the ring slower (up to 6%, interpolating between
-    // samples), so a short slowdown costs a brief pitch drop instead of a cut; otherwise the rate is
-    // exactly the game's. PS2X_AUDIO_STRETCH=0: fixed rate always.
+    // is about to run dry does playback stretch the sound (up to 6% longer, pitch kept: see the
+    // splices below), so a short slowdown costs a slight tempo change instead of a cut; otherwise
+    // the rate is exactly the game's. PS2X_AUDIO_STRETCH=0: fixed rate always.
     bool stretch = true;
+    // Slowing down keeps the pitch: instead of reading the ring slower, playback replays the last
+    // kSpliceBack frames it played (crossfaded in and out over kSpliceFade), which adds
+    // kSpliceBack - 2 * kSpliceFade frames of sound at the original pitch, as PCSX2's time
+    // stretch does. Splices are spaced so the tempo drops by at most 6%.
+    static constexpr int32_t kSpliceBack = 720;  // 15 ms
+    static constexpr int32_t kSpliceFade = 96;   // 2 ms
+    int32_t splicePhase = 0;                     // 0 none, 1 fade to replay, 2 replay, 3 fade back
+    int32_t spliceStep = 0;
+    int32_t sinceSplice = 0;
+    double slowWanted = 0.0;                     // fraction of extra time wanted (0..0.06)
     double readStep = 1.0;
     double readFrac = 0.0;
     bool primed = false;
@@ -156,8 +166,9 @@ struct PS2AudioBackend::Impl
             // up to 6%. A queue that grows past 2.5x drains at 1% faster (the ring would trim it).
             const double queued = static_cast<double>(owner->queued);
             double want = 1.0;
+            owner->slowWanted = 0.0;
             if (queued < kPrimeSamples * 0.4)
-                want = std::max(0.94, 1.0 - 0.1 * (kPrimeSamples * 0.4 - queued) / (kPrimeSamples * 0.4) - 0.02);
+                owner->slowWanted = std::min(0.06, 0.1 * (kPrimeSamples * 0.4 - queued) / (kPrimeSamples * 0.4) + 0.02);
             else if (queued > kPrimeSamples * 2.5)
                 want = 1.01;
             owner->readStep += (want - owner->readStep) * 0.2;
@@ -165,8 +176,11 @@ struct PS2AudioBackend::Impl
                 owner->readStep = 1.0;
         }
         else
+        {
             owner->readStep = 1.0;
-        if (owner->readStep < 1.0)
+            owner->slowWanted = 0.0;
+        }
+        if (owner->slowWanted > 0.0 || owner->splicePhase != 0)
             owner->slowedFrames += frames;
         for (size_t frame = 0u; frame < frames; ++frame)
         {
@@ -191,16 +205,49 @@ struct PS2AudioBackend::Impl
                 owner->fadePosition = std::min(owner->fadePosition + 1, kFadeFrames);
                 const int32_t fade = owner->fadePosition;
                 const double frac = owner->queued >= 4u ? owner->readFrac : 0.0;
+                // Start a splice when the queue is short: spaced so it adds slowWanted of time.
+                if (owner->splicePhase == 0)
+                {
+                    ++owner->sinceSplice;
+                    const int32_t added = kSpliceBack - 2 * kSpliceFade;
+                    if (owner->slowWanted > 0.0 && owner->sinceSplice >= static_cast<int32_t>(added / owner->slowWanted) - kSpliceBack)
+                    {
+                        owner->splicePhase = 1;
+                        owner->spliceStep = 0;
+                        owner->sinceSplice = 0;
+                    }
+                }
+                const int32_t phase = owner->splicePhase;
+                const int32_t k = owner->spliceStep;
+                const int32_t back = (owner->historyPos + kGrainFrames - kSpliceBack) % kGrainFrames;
                 for (size_t channel = 0u; channel < 2u; ++channel)
                 {
                     const int32_t a = owner->ring[(owner->read + channel) % kRingSamples];
                     const int32_t b = owner->queued >= 4u ? owner->ring[(owner->read + 2u + channel) % kRingSamples] : a;
-                    const int32_t sample = static_cast<int32_t>(a + (b - a) * frac);
+                    int32_t sample = static_cast<int32_t>(a + (b - a) * frac);
+                    const int32_t replay = owner->history[back * 2 + channel];
+                    if (phase == 1)
+                        sample = (sample * (kSpliceFade - k) + replay * k) / kSpliceFade;
+                    else if (phase == 2)
+                        sample = replay;
+                    else if (phase == 3)
+                        sample = (replay * (kSpliceFade - k) + sample * k) / kSpliceFade;
                     owner->lastOutput[channel] = static_cast<int16_t>((sample * fade + owner->fadeSource[channel] * (kFadeFrames - fade)) / kFadeFrames);
                     owner->history[owner->historyPos * 2 + channel] = owner->lastOutput[channel];
                 }
                 owner->historyPos = (owner->historyPos + 1) % kGrainFrames;
-                owner->readFrac += owner->readStep;
+                if (phase != 0)
+                {
+                    const int32_t length = phase == 2 ? kSpliceBack - 2 * kSpliceFade : kSpliceFade;
+                    if (++owner->spliceStep >= length)
+                    {
+                        owner->splicePhase = phase == 3 ? 0 : phase + 1;
+                        owner->spliceStep = 0;
+                    }
+                }
+                // While replaying, the ring is not read: that is the time the splice adds.
+                if (phase != 2)
+                    owner->readFrac += owner->readStep;
                 while (owner->readFrac >= 1.0 && owner->queued >= 2u)
                 {
                     owner->readFrac -= 1.0;
