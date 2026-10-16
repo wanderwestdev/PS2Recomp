@@ -1527,4 +1527,332 @@ void main()
     endInvocationInterlockARB();
 }
 )GLSL";
+
+    // Render targets (PS2X_GS_TARGETS): the fragment shader shades exactly as the compute path and
+    // leaves the depth test, blending and write masks to the fixed-function stages, which keep
+    // primitive order without an interlock. uTarget.x selects the pixels that pass the alpha test
+    // (0) or the ones that fail it (1, drawn with the AFAIL write masks).
+    const char *const kTargetFragmentMain = R"GLSL(
+flat in uint vPrim;
+layout(location = 0, index = 0) out vec4 oColor;
+layout(location = 0, index = 1) out vec4 oFactor;
+// uTarget.y = 1: exact GS blending in the shader against uDest, the frame target itself; the
+// backend draws such runs so that no pixel is covered twice between texture barriers.
+layout(binding = 1) uniform sampler2D uDest;
+uniform uvec4 uTarget;
+
+uint targetBlendExact(uint s, uint flags, int r, int g, int b, int a, uint fbrgba)
+{
+    if ((flags & F_ABE) != 0u && !((flags & F_PABE) != 0u && (a & 0x80) == 0))
+    {
+        int dr = int(fbrgba & 0xFFu);
+        int dg = int((fbrgba >> 8u) & 0xFFu);
+        int db = int((fbrgba >> 16u) & 0xFFu);
+        int da = int(fbrgba >> 24u);
+        uint alphaReg = st(s, S_ALPHA);
+        uint asel = alphaReg & 3u;
+        uint bsel = (alphaReg >> 2u) & 3u;
+        uint csel = (alphaReg >> 4u) & 3u;
+        uint dsel = (alphaReg >> 6u) & 3u;
+        int fix = int(st(s, S_ALPHA_FIX) & 0xFFu);
+        int cAlpha = csel == 0u ? a : (csel == 1u ? da : fix);
+        int br = ((pickRgb(asel, r, dr) - pickRgb(bsel, r, dr)) * cAlpha >> 7) + pickRgb(dsel, r, dr);
+        int bg = ((pickRgb(asel, g, dg) - pickRgb(bsel, g, dg)) * cAlpha >> 7) + pickRgb(dsel, g, dg);
+        int bb = ((pickRgb(asel, b, db) - pickRgb(bsel, b, db)) * cAlpha >> 7) + pickRgb(dsel, b, db);
+        if ((flags & F_WRAP) != 0u)
+        {
+            r = br & 0xFF;
+            g = bg & 0xFF;
+            b = bb & 0xFF;
+        }
+        else
+        {
+            r = int(clampU8(br));
+            g = int(clampU8(bg));
+            b = int(clampU8(bb));
+        }
+    }
+    if ((st(s, S_FBA) & 1u) != 0u && st(s, S_FPSM) != 1u)
+        a = a | 0x80;
+    uint pixel = uint(r) | (uint(g) << 8u) | (uint(b) << 16u) | (uint(a & 0xFF) << 24u);
+    uint fbmsk = st(s, S_FBMSK);
+    if (fbmsk != 0u)
+        pixel = (pixel & ~fbmsk) | (fbrgba & fbmsk);
+    return pixel;
+}
+
+noperspective in vec4 vColor;
+flat in uint vColorFlat;
+noperspective in vec3 vStq;
+noperspective in vec2 vUv;
+noperspective in float vFog;
+noperspective in float vDz;
+
+void main()
+{
+    int x = int(gl_FragCoord.x);
+    int y = int(gl_FragCoord.y);
+    // The rasterizer decides coverage; the attributes arrive interpolated (kTargetVertex).
+    uint p = vPrim;
+    uint header = pw(p, 0u);
+    uint s = header >> 8u;
+    uint type = header & 0xFFu;
+    uint flags = st(s, S_FLAGS);
+    uint z;
+    uvec4 c;
+    uint fog;
+    if (type == 2u)
+    {
+        float dz = floor(vDz + 0.5);
+        uint zBase = pw(p, 33u);
+        if (dz >= 0.0)
+        {
+            uint add = uint(min(dz, 4294967040.0));
+            z = zBase + add < zBase ? 0xFFFFFFFFu : zBase + add;
+        }
+        else
+        {
+            uint sub = uint(min(-dz, 4294967040.0));
+            z = sub > zBase ? 0u : zBase - sub;
+        }
+        c = (flags & F_IIP) != 0u ? uvec4(clampU8(int(vColor.r)), clampU8(int(vColor.g)), clampU8(int(vColor.b)), clampU8(int(vColor.a)))
+                                  : unpackColor(vColorFlat);
+        fog = clampU8(int(vFog));
+        if ((flags & F_TME) != 0u)
+        {
+            uint texel;
+            if ((flags & F_FST) != 0u)
+                texel = sampleTexture(s, 0.0, 0.0, 1.0, uint(int(vUv.x)) & 0xFFFFu, uint(int(vUv.y)) & 0xFFFFu);
+            else
+                texel = sampleTexture(s, vStq.x, vStq.y, vStq.z, 0u, 0u);
+            c = combineTexture(s, c, texel);
+        }
+    }
+    else if (type == 1u)
+    {
+        z = pw(p, 13u);
+        c = unpackColor(pw(p, 14u));
+        fog = pw(p, 15u);
+        if ((flags & F_TME) != 0u)
+        {
+            uint texel;
+            if ((flags & F_FST) != 0u)
+                texel = sampleTexture(s, 0.0, 0.0, 1.0, uint(clamp(int(vUv.x * 16.0 + 0.5), 0, 0xFFFF)),
+                                      uint(clamp(int(vUv.y * 16.0 + 0.5), 0, 0xFFFF)));
+            else
+            {
+                uint size = st(s, S_TEXSIZE);
+                texel = sampleTexture(s, vUv.x / float(size & 0xFFFFu), vUv.y / float(size >> 16u), 1.0, 0u, 0u);
+            }
+            c = combineTexture(s, c, texel);
+        }
+    }
+    else
+    {
+        z = pw(p, 3u);
+        c = unpackColor(pw(p, 4u));
+        fog = pw(p, 5u);
+    }
+    uint sx = st(s, S_SCISSOR_X);
+    uint sy = st(s, S_SCISSOR_Y);
+    if (x < int(sx & 0xFFFFu) || x > int(sx >> 16u) || y < int(sy & 0xFFFFu) || y > int(sy >> 16u))
+        discard;
+    uint r = c.r;
+    uint g = c.g;
+    uint b = c.b;
+    uint a = c.a;
+    if ((flags & F_FGE) != 0u)
+    {
+        uint fogColor = st(s, S_FOGCOL);
+        uint inverseFog = 255u - fog;
+        r = (((fog * r) >> 8u) + ((inverseFog * (fogColor & 0xFFu)) >> 8u)) & 0xFFu;
+        g = (((fog * g) >> 8u) + ((inverseFog * ((fogColor >> 8u) & 0xFFu)) >> 8u)) & 0xFFu;
+        b = (((fog * b) >> 8u) + ((inverseFog * ((fogColor >> 16u) & 0xFFu)) >> 8u)) & 0xFFu;
+    }
+    if (passesAlphaTest(st(s, S_TEST), a) == (uTarget.x != 0u))
+        discard;
+    uint zpsmExact = st(s, S_ZPSM) & 0xFu;
+    uint zmaxExact = zpsmExact == 1u ? 0xFFFFFFu : (zpsmExact == 0u ? 0xFFFFFFFFu : 0xFFFFu);
+    if (uTarget.y != 0u)
+    {
+        uvec4 d = uvec4(texelFetch(uDest, ivec2(x, y), 0) * 255.0 + 0.5);
+        uint fbrgba = d.r | (d.g << 8u) | (d.b << 16u) | (d.a << 24u);
+        if (!passesDestinationAlphaTest(st(s, S_TEST), st(s, S_FPSM), fbrgba))
+            discard;
+        uint pixel = targetBlendExact(s, flags, int(r), int(g), int(b), int(a), fbrgba);
+        gl_FragDepth = float(min(z, zmaxExact)) * (1.0 / 16777216.0);
+        oColor = vec4(float(pixel & 0xFFu), float((pixel >> 8u) & 0xFFu), float((pixel >> 16u) & 0xFFu), float(pixel >> 24u)) / 255.0;
+        oFactor = vec4(1.0);
+        return;
+    }
+    float factor = float(a) / 128.0;
+    if ((flags & F_PABE) != 0u && (a & 0x80u) == 0u)
+        factor = 1.0;
+    if ((st(s, S_FBA) & 1u) != 0u && st(s, S_FPSM) != 1u)
+        a |= 0x80u;
+    uint zpsm = st(s, S_ZPSM) & 0xFu;
+    uint zmax = zpsm == 1u ? 0xFFFFFFu : (zpsm == 0u ? 0xFFFFFFFFu : 0xFFFFu);
+    gl_FragDepth = float(min(z, zmax)) * (1.0 / 16777216.0);
+    oColor = vec4(float(r), float(g), float(b), float(a & 0xFFu)) / 255.0;
+    oFactor = vec4(factor);
+}
+)GLSL";
+
+    // Six vertices per primitive, pulled from the primitive buffer: a triangle's three (the
+    // other three collapse onto the last) or a sprite's or point's two triangles. GS position P
+    // lands at P + 0.5 so the pixel centre samples the GS integer position. Attributes are
+    // interpolated linearly in screen space, as the GS does.
+    const char *const kTargetVertex = R"GLSL(
+layout(std430, binding = 3) readonly buffer PrimBuffer { uint prims[]; };
+flat out uint vPrim;
+noperspective out vec4 vColor;
+flat out uint vColorFlat;
+noperspective out vec3 vStq;
+noperspective out vec2 vUv;
+noperspective out float vFog;
+noperspective out float vDz;
+
+uint pw(uint p, uint i) { return prims[p * 40u + i]; }
+float pf(uint p, uint i) { return uintBitsToFloat(prims[p * 40u + i]); }
+
+void emit(vec2 at)
+{
+    gl_Position = vec4(at.x / 1024.0 - 1.0, at.y / 1024.0 - 1.0, 0.0, 1.0);
+}
+
+void main()
+{
+    uint p = uint(gl_VertexID) / 6u;
+    uint c = uint(gl_VertexID) % 6u;
+    uint header = pw(p, 0u);
+    uint type = header & 0xFFu;
+    vPrim = p;
+    vColor = vec4(0.0);
+    vColorFlat = 0u;
+    vStq = vec3(0.0, 0.0, 1.0);
+    vUv = vec2(0.0);
+    vFog = 0.0;
+    vDz = 0.0;
+    if (type == 2u)
+    {
+        uint i = min(c, 2u);
+        uint col = pw(p, 17u + i);
+        vColor = vec4(float(col & 0xFFu), float((col >> 8u) & 0xFFu), float((col >> 16u) & 0xFFu), float(col >> 24u));
+        vColorFlat = pw(p, 19u);
+        vStq = vec3(pf(p, 20u + i * 3u), pf(p, 21u + i * 3u), pf(p, 22u + i * 3u));
+        uint uv = pw(p, 29u + i);
+        vUv = vec2(float(uv & 0xFFFFu), float(uv >> 16u));
+        vFog = float((pw(p, 32u) >> (i * 8u)) & 0xFFu);
+        vDz = pf(p, 34u) + (i == 1u ? pf(p, 35u) : (i == 2u ? pf(p, 36u) : 0.0));
+        emit(vec2(float(int(pw(p, 3u + i * 2u))), float(int(pw(p, 4u + i * 2u)))) / 16.0 + 0.5);
+        return;
+    }
+    uint xr = pw(p, 1u);
+    uint yr = pw(p, 2u);
+    float x0;
+    float x1;
+    float y0;
+    float y1;
+    if (type == 0u)
+    {
+        x0 = float(xr);
+        x1 = x0 + 1.0;
+        y0 = float(yr);
+        y1 = y0 + 1.0;
+    }
+    else
+    {
+        x0 = float(xr & 0xFFFFu);
+        x1 = float(xr >> 16u) + 1.0;
+        y0 = float(yr & 0xFFFFu);
+        y1 = float(yr >> 16u) + 1.0;
+    }
+    bool right = c == 1u || c == 3u || c == 4u;
+    bool bottom = c == 2u || c == 4u || c == 5u;
+    vec2 at = vec2(right ? x1 : x0, bottom ? y1 : y0);
+    if (type == 1u)
+    {
+        // The sprite's texture coordinate is linear in the GS position (drawSprite): evaluate it
+        // at this corner, whose GS position is half a pixel left of and above the GL position.
+        float tx = (at.x - 0.5 - pf(p, 3u)) * pf(p, 5u);
+        float ty = (at.y - 0.5 - pf(p, 4u)) * pf(p, 6u);
+        vUv = vec2(pf(p, 7u) + (pf(p, 9u) - pf(p, 7u)) * tx, pf(p, 8u) + (pf(p, 10u) - pf(p, 8u)) * ty);
+    }
+    emit(at);
+}
+)GLSL";
+
+    // Draws the listed cells of a target from GS memory: one quad per cell (data: x0 | y0 << 16,
+    // x1 | y1 << 16, exclusive ends), positions on the 2048 x 2048 target grid.
+    const char *const kTargetLoadVertex = R"GLSL(
+layout(std430, binding = 7) readonly buffer DataBuffer { uint data[]; };
+
+void main()
+{
+    uint cell = uint(gl_VertexID) / 6u;
+    uint c = uint(gl_VertexID) % 6u;
+    uint lo = data[cell * 2u];
+    uint hi = data[cell * 2u + 1u];
+    bool right = c == 1u || c == 3u || c == 4u;
+    bool bottom = c == 2u || c == 4u || c == 5u;
+    float x = float(right ? (hi & 0xFFFFu) : (lo & 0xFFFFu));
+    float y = float(bottom ? (hi >> 16u) : (lo >> 16u));
+    gl_Position = vec4(x / 1024.0 - 1.0, y / 1024.0 - 1.0, 0.0, 1.0);
+}
+)GLSL";
+
+    // uLoad: psm, base, buffer width, 1 for a depth target.
+    const char *const kTargetLoadFragment = R"GLSL(
+uniform uvec4 uLoad;
+layout(location = 0) out vec4 oColor;
+
+void main()
+{
+    uint x = uint(gl_FragCoord.x);
+    uint y = uint(gl_FragCoord.y);
+    uint v = readPixel(uLoad.x, uLoad.y, uLoad.z, x, y);
+    if (uLoad.w != 0u)
+    {
+        gl_FragDepth = float(v) * (1.0 / 16777216.0);
+        oColor = vec4(0.0);
+        return;
+    }
+    gl_FragDepth = 0.0;
+    if (bitsPerPixel(uLoad.x) == 16u)
+        v = rgba5551To8888(v);
+    else if ((uLoad.x & 0xFu) == 1u)
+        v |= 0x80000000u;
+    oColor = vec4(float(v & 0xFFu), float((v >> 8u) & 0xFFu), float((v >> 16u) & 0xFFu), float(v >> 24u)) / 255.0;
+}
+)GLSL";
+
+    // Writes the listed cells of a target back to GS memory, one work group per cell.
+    const char *const kTargetStore = R"GLSL(
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 7) readonly buffer DataBuffer { uint data[]; };
+layout(binding = 0) uniform sampler2D uTex;
+uniform uvec4 uStore;
+
+void main()
+{
+    uint lo = data[gl_WorkGroupID.x * 2u];
+    uint hi = data[gl_WorkGroupID.x * 2u + 1u];
+    for (uint y = (lo >> 16u) + gl_LocalInvocationID.y; y < (hi >> 16u); y += 16u)
+        for (uint x = (lo & 0xFFFFu) + gl_LocalInvocationID.x; x < (hi & 0xFFFFu); x += 16u)
+        {
+            vec4 t = texelFetch(uTex, ivec2(x, y), 0);
+            uint v;
+            if (uStore.w != 0u)
+                v = uint(clamp(t.r * 16777216.0 + 0.5, 0.0, 4294967295.0));
+            else
+            {
+                uvec4 c = uvec4(clamp(t * 255.0 + 0.5, 0.0, 255.0));
+                v = c.r | (c.g << 8u) | (c.b << 16u) | (c.a << 24u);
+                if (bitsPerPixel(uStore.x) == 16u)
+                    v = rgba8888To5551(v);
+            }
+            writePixelRaw(uStore.x, uStore.y, uStore.z, x, y, v);
+        }
+}
+)GLSL";
 }

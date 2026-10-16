@@ -277,7 +277,7 @@ struct GSGpuBackend::Impl
     GLuint hwVertexShader = 0;
     std::string hwFragmentHead;
     std::string hwFragmentBody;
-    using HwKey = std::array<uint32_t, 11>;
+    using HwKey = std::array<uint32_t, 12>;
     std::map<HwKey, Program> hwVariants;
     struct CompileJob
     {
@@ -311,6 +311,64 @@ struct GSGpuBackend::Impl
     double hwRingWaitMs = 0.0;
     double hwVariantMs = 0.0;
     std::string hwVertexSource;
+
+    // Render targets (PS2X_GS_TARGETS=1, ADR-0009): frame and depth buffers that hardware draws
+    // write live in GPU textures; GS memory stays the reference and the two are kept in step per
+    // cell (one GS page of the target's format). A cell is valid when the texture holds what GS
+    // memory holds, dirty when the texture is newer.
+    static constexpr uint32_t kTargetSize = 2048u;
+    static constexpr uint32_t kCellColumns = 32u;
+    static constexpr uint32_t kCells = 2048u;
+    struct Target
+    {
+        uint32_t base = 0u;
+        uint32_t bw = 1u;
+        uint32_t psm = 0u;
+        bool depth = false;
+        GLuint texture = 0u;
+        std::bitset<kCells> valid;
+        std::bitset<kCells> dirty;
+        std::bitset<kPages> validPages;
+        std::bitset<kPages> dirtyPages;
+        uint64_t used = 0u;
+    };
+    std::vector<std::unique_ptr<Target>> targets;
+    bool hwTargets = false;
+    std::string tgFragmentBody;
+    GLuint tgFramebuffer = 0u;
+    Program tgProgram;
+    Program tgLoad;
+    Program tgStore;
+    uint64_t tgClock = 0u;
+    uint32_t tgFrame = 0u;
+    uint32_t tgFrameBatch = 0u;
+    std::vector<uint32_t> tgRects;
+    struct TargetRun
+    {
+        const Program *program;
+        uint32_t first;
+        uint32_t last;
+        uint32_t state;
+        bool exact;
+    };
+    std::vector<TargetRun> tgRuns;
+    std::vector<std::pair<uint32_t, uint32_t>> tgGroups;
+    struct TargetStats
+    {
+        uint64_t batches = 0u;
+        uint64_t prims = 0u;
+        uint64_t fallbackBatches = 0u;
+        uint64_t fallbackPrims = 0u;
+        std::array<uint64_t, 10> reasons{};
+        std::array<uint64_t, 8> exactReasons{};
+        uint64_t exactDraws = 0u;
+        double cpuMs = 0.0;
+        uint64_t presents = 0u;
+        uint64_t loadedCells = 0u;
+        uint64_t storedCells = 0u;
+        uint64_t passes = 0u;
+        std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+    } tgStats;
 
     std::vector<uint32_t> prims;
     uint32_t primCount = 0u;
@@ -400,8 +458,8 @@ struct GSGpuBackend::Impl
         bool enabled = false;
         std::vector<GLuint> freeQueries;
         std::vector<Pending> pending;
-        std::array<uint64_t, 8> ns{};
-        std::array<uint64_t, 8> count{};
+        std::array<uint64_t, 10> ns{};
+        std::array<uint64_t, 10> count{};
         uint64_t pairs = 0u;
         uint64_t tiles = 0u;
         uint64_t maxBin = 0u;
@@ -483,9 +541,9 @@ struct GSGpuBackend::Impl
     void profReport()
     {
         prof.frames = std::max<uint64_t>(prof.frames, 1u);
-        static const char *kNames[8] = {"raster", "clut", "upload", "copyRead", "copyWrite", "present", "clear", "other"};
+        static const char *kNames[10] = {"raster", "clut", "upload", "copyRead", "copyWrite", "present", "clear", "other", "targetLoad", "targetStore"};
         std::fprintf(stderr, "[gs-gpu-prof] per frame:");
-        for (uint32_t kind = 0; kind < 8u; ++kind)
+        for (uint32_t kind = 0; kind < 10u; ++kind)
             if (prof.count[kind] != 0u)
                 std::fprintf(stderr, " %s %.2f ms (%.0f)", kNames[kind], prof.ns[kind] / 1e6 / prof.frames,
                              static_cast<double>(prof.count[kind]) / prof.frames);
@@ -831,7 +889,7 @@ struct GSGpuBackend::Impl
         const uint32_t header = prims[static_cast<size_t>(prim) * kPrimWords];
         const uint32_t *s = states.data() + static_cast<size_t>(header >> 8u) * kStateWords;
         return {header & 0xFFu, s[SFlags], s[SFpsm], s[SZpsm], s[SZmask], s[STpsm], s[STexMode], s[SAlpha], s[STest] & ~0xFF0u,
-                s[SClampLo] & 0xFu, s[SFba]};
+                s[SClampLo] & 0xFu, s[SFba], 0u};
     }
 
     std::filesystem::path hardwareCachePath(const std::string &key) const
@@ -916,10 +974,12 @@ struct GSGpuBackend::Impl
     std::string hardwareFragmentSource(const HwKey &key) const
     {
         static const char *const kNames[] = {"K_TYPE", "K_FLAGS", "K_FPSM", "K_ZPSM", "K_ZMASK", "K_TPSM", "K_TEXMODE", "K_ALPHA",
-                                             "K_TEST", "K_CLAMPLO", "K_FBA"};
+                                             "K_TEST", "K_CLAMPLO", "K_FBA", "K_MODE"};
         std::string defines = "#define HW_SPECIALIZED 1\n#define HW_TYPE(h) K_TYPE\n";
         for (size_t i = 0; i < key.size(); ++i)
             defines += "#define " + std::string(kNames[i]) + " " + std::to_string(key[i]) + "u\n";
+        if (key[11] == 1u)
+            return "#version 460 core\n" + defines + tgFragmentBody;
         return hwFragmentHead + defines + hwFragmentBody;
     }
 
@@ -928,6 +988,7 @@ struct GSGpuBackend::Impl
         program.id = id;
         program.loc[0] = gl().GetUniformLocation(id, "uRaster");
         program.loc[1] = gl().GetUniformLocation(id, "uHw");
+        program.loc[2] = gl().GetUniformLocation(id, "uTarget");
     }
 
     void drainCompiledVariants()
@@ -1196,7 +1257,10 @@ struct GSGpuBackend::Impl
     bool setupHardwareRaster(const std::string &prefix)
     {
         const char *setting = std::getenv("PS2X_GS_HW_RASTER");
-        if ((setting && *setting == '0') || !gl().graphics || !hwAllowed)
+        const char *targetSetting = std::getenv("PS2X_GS_TARGETS");
+        const bool interlock = !(setting && *setting == '0') && hwAllowed;
+        const bool wantTargets = targetSetting && *targetSetting == '1' && gl().targets;
+        if (!gl().graphics || (!interlock && !wantTargets))
             return false;
         const std::string version = "#version 460 core\n";
         std::string body = GSGpuShaders::kRaster;
@@ -1244,6 +1308,9 @@ struct GSGpuBackend::Impl
             return false;
         common.replace(common.find(vramDeclaration), vramDeclaration.size(), "layout(std430, binding = 0) coherent buffer VramBuffer");
         hwFragmentBody = prefix.substr(version.size()) + common + body + GSGpuShaders::kHwFragmentMain;
+        tgFragmentBody = prefix.substr(version.size()) + GSGpuShaders::kCommon + body + GSGpuShaders::kTargetFragmentMain;
+        if (wantTargets && !setupTargets(prefix))
+            return false;
         if (gl().MaxShaderCompilerThreads)
             gl().MaxShaderCompilerThreads(0xFFFFFFFFu);
         hwVertexSource = version + GSGpuShaders::kHwVertex;
@@ -1262,9 +1329,808 @@ struct GSGpuBackend::Impl
         gl().FramebufferParameteri(kFramebuffer, kFramebufferDefaultWidth, 2048);
         gl().FramebufferParameteri(kFramebuffer, kFramebufferDefaultHeight, 2048);
         gl().GenVertexArrays(1, &hwVertexArray);
-        std::fprintf(stderr, "[gs-gpu] hardware rasterization active%s\n", hwConservative ? ", expanded triangles" : "");
+        if (hwTargets)
+            std::fprintf(stderr, "[gs-gpu] render targets active (PS2X_GS_TARGETS)\n");
+        if (interlock)
+            std::fprintf(stderr, "[gs-gpu] hardware rasterization active%s\n", hwConservative ? ", expanded triangles" : "");
         std::fflush(stderr);
+        return interlock;
+    }
+
+    // ---- Render targets (PS2X_GS_TARGETS=1) ----
+
+    bool setupTargets(const std::string &prefix)
+    {
+        if (!compile(tgStore, prefix, GSGpuShaders::kTargetStore, {"uStore"}))
+            return false;
+        const std::string version = "#version 460 core\n";
+        const GLuint vertex = compileStage(kVertexShader, version + GSGpuShaders::kTargetLoadVertex);
+        const GLuint fragment = compileStage(kFragmentShader, prefix + GSGpuShaders::kCommon + GSGpuShaders::kTargetLoadFragment);
+        if (!vertex || !fragment)
+            return false;
+        tgLoad.id = gl().CreateProgram();
+        gl().AttachShader(tgLoad.id, vertex);
+        gl().AttachShader(tgLoad.id, fragment);
+        gl().LinkProgram(tgLoad.id);
+        gl().DeleteShader(vertex);
+        gl().DeleteShader(fragment);
+        GLint ok = 0;
+        gl().GetProgramiv(tgLoad.id, kLinkStatus, &ok);
+        if (!ok)
+        {
+            std::fprintf(stderr, "[gs-gpu] render target load program failed to link\n");
+            return false;
+        }
+        tgLoad.loc[0] = gl().GetUniformLocation(tgLoad.id, "uLoad");
+
+        // One shader for every state, like the compute rasterizer: specialized variants take 6-20 s
+        // each to compile on the AMD driver and stall the GS thread while they do.
+        const std::string drawVertex = version + GSGpuShaders::kTargetVertex;
+        const std::string drawFragment = version + "#define HW_TYPE(h) ((h) & 0xFFu)\n" + tgFragmentBody;
+        const std::string cacheKey = std::string(reinterpret_cast<const char *>(gl().GetString(kRenderer))) + "\n" +
+                                     reinterpret_cast<const char *>(gl().GetString(kVersion)) + "\n" + drawVertex + "\n" + drawFragment;
+        const std::filesystem::path cachePath = hardwareCachePath(cacheKey);
+        const auto started = std::chrono::steady_clock::now();
+        GLuint program = loadHardwareBinary(cachePath, cacheKey);
+        if (!program)
+        {
+            const GLuint v = compileStage(kVertexShader, drawVertex);
+            const GLuint f = compileStage(kFragmentShader, drawFragment);
+            if (!v || !f)
+                return false;
+            program = gl().CreateProgram();
+            gl().ProgramParameteri(program, kProgramBinaryRetrievableHint, 1);
+            gl().AttachShader(program, v);
+            gl().AttachShader(program, f);
+            gl().LinkProgram(program);
+            gl().DeleteShader(v);
+            gl().DeleteShader(f);
+            gl().GetProgramiv(program, kLinkStatus, &ok);
+            if (!ok)
+            {
+                std::fprintf(stderr, "[gs-gpu] render target program failed to link\n");
+                return false;
+            }
+            storeHardwareBinary(cachePath, cacheKey, program);
+        }
+        finishVariant(tgProgram, program);
+        std::fprintf(stderr, "[gs-gpu] render target shader ready in %.0f ms\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+        gl().GenFramebuffers(1, &tgFramebuffer);
+        hwTargets = true;
         return true;
+    }
+
+    static bool targetSixteen(uint32_t psm)
+    {
+        const uint32_t f = psm & 0xFu;
+        return f == 2u || f == 0xAu;
+    }
+
+    uint32_t targetCellHeight(const Target &t) const
+    {
+        return targetSixteen(t.psm) ? 64u : 32u;
+    }
+
+    uint32_t targetRows(const Target &t) const
+    {
+        return kTargetSize / targetCellHeight(t);
+    }
+
+    void targetCellPages(const Target &t, uint32_t cell, std::bitset<kPages> &out) const
+    {
+        const uint32_t page = (t.base >> 5u) + (cell / kCellColumns) * t.bw + (cell % kCellColumns);
+        out.set(page % kPages);
+        if ((t.base & 31u) != 0u)
+            out.set((page + 1u) % kPages);
+    }
+
+    bool targetCellTouches(const Target &t, uint32_t cell, const std::bitset<kPages> &pages) const
+    {
+        const uint32_t page = (t.base >> 5u) + (cell / kCellColumns) * t.bw + (cell % kCellColumns);
+        if (pages.test(page % kPages))
+            return true;
+        return (t.base & 31u) != 0u && pages.test((page + 1u) % kPages);
+    }
+
+    void targetRecount(Target &t) const
+    {
+        t.validPages.reset();
+        t.dirtyPages.reset();
+        for (uint32_t cell = 0; cell < kCells; ++cell)
+        {
+            if (t.valid.test(cell))
+                targetCellPages(t, cell, t.validPages);
+            if (t.dirty.test(cell))
+                targetCellPages(t, cell, t.dirtyPages);
+        }
+    }
+
+    void targetCellRect(const Target &t, uint32_t cell)
+    {
+        const uint32_t h = targetCellHeight(t);
+        const uint32_t x0 = (cell % kCellColumns) * 64u;
+        const uint32_t y0 = (cell / kCellColumns) * h;
+        tgRects.push_back(x0 | (y0 << 16u));
+        tgRects.push_back((x0 + 64u) | ((y0 + h) << 16u));
+    }
+
+    // PS2X_GS_TARGETS_WATCH=<page>: log what happens to the cells holding one GS page.
+    void watchCells(const char *what, const Target &t, const std::bitset<kCells> &cells) const
+    {
+        static const int page = []
+        {
+            const char *value = std::getenv("PS2X_GS_TARGETS_WATCH");
+            return value ? static_cast<int>(std::strtol(value, nullptr, 0)) : -1;
+        }();
+        if (page < 0)
+            return;
+        std::bitset<kPages> watched;
+        watched.set(static_cast<size_t>(page));
+        for (uint32_t cell = 0; cell < kCells; ++cell)
+            if (cells.test(cell) && targetCellTouches(t, cell, watched))
+                std::fprintf(stderr, "[gs-watch] frame %u batch %u %s target base %x bw %u psm %x%s cell %u,%u\n", tgFrame, tgFrameBatch, what, t.base >> 5u,
+                             t.bw, t.psm, t.depth ? " depth" : "", cell % kCellColumns, cell / kCellColumns);
+    }
+
+    // Texture to GS memory for the listed cells.
+    void storeTargetCells(Target &t, const std::bitset<kCells> &cells)
+    {
+        watchCells("store", t, cells);
+        tgRects.clear();
+        for (uint32_t cell = 0; cell < kCells; ++cell)
+            if (cells.test(cell))
+                targetCellRect(t, cell);
+        if (tgRects.empty())
+            return;
+        const Api &g = gl();
+        uploadData(tgRects.data(), tgRects.size() * sizeof(uint32_t));
+        g.UseProgram(tgStore.id);
+        g.ActiveTexture(kTexture0);
+        g.BindTexture(kTexture2D, t.texture);
+        g.Uniform4ui(tgStore.loc[0], t.psm, t.base, t.bw, t.depth ? 1u : 0u);
+        const GLuint profStore = profBegin();
+        g.DispatchCompute(static_cast<GLuint>(tgRects.size() / 2u), 1u, 1u);
+        profEnd(9u, profStore);
+        g.BindTexture(kTexture2D, 0u);
+        barrier();
+        tgStats.storedCells += tgRects.size() / 2u;
+        t.dirty &= ~cells;
+    }
+
+    // GS memory to texture for the listed cells.
+    void loadTargetCells(Target &t, const std::bitset<kCells> &cells)
+    {
+        watchCells("load", t, cells);
+        tgRects.clear();
+        for (uint32_t cell = 0; cell < kCells; ++cell)
+            if (cells.test(cell))
+                targetCellRect(t, cell);
+        if (tgRects.empty())
+            return;
+        const Api &g = gl();
+        uploadData(tgRects.data(), tgRects.size() * sizeof(uint32_t));
+        g.BindFramebuffer(kFramebuffer, tgFramebuffer);
+        g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, t.depth ? 0u : t.texture, 0);
+        g.FramebufferTexture2D(kFramebuffer, kDepthAttachment, kTexture2D, t.depth ? t.texture : 0u, 0);
+        g.Viewport(0, 0, kTargetSize, kTargetSize);
+        g.Disable(kBlend);
+        g.ColorMask(1, 1, 1, 1);
+        if (t.depth)
+        {
+            g.Enable(kDepthTest);
+            g.DepthFunc(kAlways);
+            g.DepthMask(1);
+        }
+        else
+            g.Disable(kDepthTest);
+        g.BindVertexArray(hwVertexArray);
+        g.UseProgram(tgLoad.id);
+        g.Uniform4ui(tgLoad.loc[0], t.psm, t.base, t.bw, t.depth ? 1u : 0u);
+        const GLuint profLoad = profBegin();
+        g.DrawArrays(kTriangles, 0, static_cast<GLsizei>(tgRects.size() / 2u * 6u));
+        profEnd(8u, profLoad);
+        tgStats.loadedCells += tgRects.size() / 2u;
+        t.valid |= cells;
+    }
+
+    // Writes back every dirty cell (of targets other than the two excepted) that holds one of
+    // the pages, so GS memory is current there.
+    void syncTargetPages(const std::bitset<kPages> &pages, const Target *exceptA = nullptr, const Target *exceptB = nullptr)
+    {
+        for (const std::unique_ptr<Target> &owned : targets)
+        {
+            Target &t = *owned;
+            if (&t == exceptA || &t == exceptB || !(t.dirtyPages & pages).any())
+                continue;
+            std::bitset<kCells> cells;
+            for (uint32_t cell = 0; cell < kCells; ++cell)
+                if (t.dirty.test(cell) && targetCellTouches(t, cell, pages))
+                    cells.set(cell);
+            storeTargetCells(t, cells);
+            targetRecount(t);
+        }
+    }
+
+    void syncAllTargets()
+    {
+        for (const std::unique_ptr<Target> &owned : targets)
+            if (owned->dirty.any())
+            {
+                storeTargetCells(*owned, owned->dirty);
+                targetRecount(*owned);
+            }
+    }
+
+    // GS memory changed on these pages outside the target: its cells there must be loaded again.
+    void invalidateTargetPages(const std::bitset<kPages> &pages, const Target *exceptA = nullptr, const Target *exceptB = nullptr)
+    {
+        for (const std::unique_ptr<Target> &owned : targets)
+        {
+            Target &t = *owned;
+            if (&t == exceptA || &t == exceptB || !(t.validPages & pages).any())
+                continue;
+            std::bitset<kCells> cells;
+            for (uint32_t cell = 0; cell < kCells; ++cell)
+                if (t.valid.test(cell) && targetCellTouches(t, cell, pages))
+                    cells.set(cell);
+            if ((cells & t.dirty).any())
+                storeTargetCells(t, cells & t.dirty);
+            watchCells("invalidate", t, cells);
+            t.valid &= ~cells;
+            targetRecount(t);
+        }
+    }
+
+    void invalidateAllTargets()
+    {
+        for (const std::unique_ptr<Target> &owned : targets)
+        {
+            owned->valid.reset();
+            owned->dirty.reset();
+            owned->validPages.reset();
+            owned->dirtyPages.reset();
+        }
+    }
+
+    Target &findTarget(uint32_t base, uint32_t bw, uint32_t psm, bool depth)
+    {
+        ++tgClock;
+        for (const std::unique_ptr<Target> &owned : targets)
+            if (owned->base == base && owned->bw == bw && owned->psm == psm && owned->depth == depth)
+            {
+                owned->used = tgClock;
+                return *owned;
+            }
+        if (targets.size() >= 24u)
+        {
+            auto oldest = std::min_element(targets.begin(), targets.end(),
+                                           [](const std::unique_ptr<Target> &a, const std::unique_ptr<Target> &b) { return a->used < b->used; });
+            if ((*oldest)->dirty.any())
+                storeTargetCells(**oldest, (*oldest)->dirty);
+            gl().DeleteTextures(1, &(*oldest)->texture);
+            targets.erase(oldest);
+        }
+        auto t = std::make_unique<Target>();
+        t->base = base;
+        t->bw = std::clamp<uint32_t>(bw, 1u, kCellColumns);
+        t->psm = psm;
+        t->depth = depth;
+        t->used = tgClock;
+        const Api &g = gl();
+        g.GenTextures(1, &t->texture);
+        g.BindTexture(kTexture2D, t->texture);
+        g.TexStorage2D(kTexture2D, 1, depth ? kDepthComponent32F : kRgba8, kTargetSize, kTargetSize);
+        g.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
+        g.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
+        g.BindTexture(kTexture2D, 0u);
+        targets.push_back(std::move(t));
+        return *targets.back();
+    }
+
+    // Cells of the target under a pixel rectangle (inclusive).
+    std::bitset<kCells> targetCells(const Target &t, int x0, int y0, int x1, int y1) const
+    {
+        std::bitset<kCells> cells;
+        const uint32_t h = targetCellHeight(t);
+        const uint32_t cx0 = static_cast<uint32_t>(std::clamp(x0, 0, static_cast<int>(kTargetSize) - 1)) / 64u;
+        const uint32_t cx1 = std::min(static_cast<uint32_t>(std::clamp(x1, 0, static_cast<int>(kTargetSize) - 1)) / 64u, t.bw - 1u);
+        const uint32_t cy0 = static_cast<uint32_t>(std::clamp(y0, 0, static_cast<int>(kTargetSize) - 1)) / h;
+        const uint32_t cy1 = static_cast<uint32_t>(std::clamp(y1, 0, static_cast<int>(kTargetSize) - 1)) / h;
+        for (uint32_t cy = cy0; cy <= cy1 && cy < targetRows(t); ++cy)
+            for (uint32_t cx = cx0; cx <= cx1; ++cx)
+                cells.set(cy * kCellColumns + cx);
+        return cells;
+    }
+
+    // GS blending, (A - B) * C >> 7 + D, as a fixed-function blend: false when it needs a factor
+    // above one or destination alpha.
+    struct TargetBlend
+    {
+        GLenum equation = kFuncAdd;
+        GLenum source = kOne;
+        GLenum destination = kZero;
+    };
+
+    static bool targetBlend(uint32_t alpha, TargetBlend &out)
+    {
+        uint32_t a = alpha & 3u;
+        uint32_t b = (alpha >> 2u) & 3u;
+        const uint32_t c = (alpha >> 4u) & 3u;
+        uint32_t d = (alpha >> 6u) & 3u;
+        a = std::min(a, 2u);
+        b = std::min(b, 2u);
+        d = std::min(d, 2u);
+        if (c == 1u || c == 3u)
+            return false;
+        const GLenum f = c == 0u ? kSrc1Alpha : kConstantAlpha;
+        const GLenum inv = c == 0u ? kOneMinusSrc1Alpha : kOneMinusConstantAlpha;
+        auto set = [&](GLenum eq, GLenum src, GLenum dst)
+        {
+            out.equation = eq;
+            out.source = src;
+            out.destination = dst;
+            return true;
+        };
+        const uint32_t cs = 0u, cd = 1u, zero = 2u;
+        if (a == b)
+            return d == cs ? set(kFuncAdd, kOne, kZero) : d == cd ? set(kFuncAdd, kZero, kOne) : set(kFuncAdd, kZero, kZero);
+        if (a == cs && b == cd)
+            return d == cd ? set(kFuncAdd, f, inv) : d == zero ? set(kFuncSubtract, f, f) : false;
+        if (a == cs && b == zero)
+            return d == cd ? set(kFuncAdd, f, kOne) : d == zero ? set(kFuncAdd, f, kZero) : false;
+        if (a == cd && b == cs)
+            return d == cs ? set(kFuncAdd, inv, f) : d == zero ? set(kFuncReverseSubtract, f, f) : false;
+        if (a == cd && b == zero)
+            return d == cs ? set(kFuncAdd, kOne, f) : d == zero ? set(kFuncAdd, kZero, f) : false;
+        if (a == zero && b == cs)
+            return d == cd ? set(kFuncReverseSubtract, f, kOne) : d == cs ? set(kFuncAdd, inv, kZero) : set(kFuncAdd, kZero, kZero);
+        // a == zero && b == cd
+        return d == cs ? set(kFuncSubtract, kOne, f) : d == cd ? set(kFuncAdd, kZero, inv) : set(kFuncAdd, kZero, kZero);
+    }
+
+    // 0 when the state can be drawn into render targets, otherwise why not (stats index).
+    uint32_t targetRefusal(const uint32_t *s) const
+    {
+        // PS2X_GS_TARGETS_REFUSE=<bits> sends states to the compute rasterizer, for bisecting:
+        // 1 blended, 2 depth tested or written, 4 textured, 8 alpha tested, 16 fogged.
+        static const uint32_t refuse = []
+        {
+            const char *value = std::getenv("PS2X_GS_TARGETS_REFUSE");
+            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
+        }();
+        if (refuse != 0u)
+        {
+            const uint32_t t = s[STest];
+            if (((refuse & 1u) && (s[SFlags] & FAbe)) || ((refuse & 2u) && (((t >> 17u) & 3u) != 1u || s[SZmask] == 0u)) ||
+                ((refuse & 4u) && (s[SFlags] & FTme)) || ((refuse & 8u) && (t & 1u)) || ((refuse & 16u) && (s[SFlags] & FFge)))
+                return 9u;
+        }
+        const uint32_t fpsm = s[SFpsm];
+        if (fpsm != 0u && fpsm != 1u)
+            return 1u;
+        const uint32_t test = s[STest];
+        const uint32_t ztst = (test >> 17u) & 3u;
+        if (ztst != 1u || s[SZmask] == 0u)
+        {
+            const uint32_t z = s[SZpsm] & 0xFu;
+            if (z != 1u && z != 2u && z != 0xAu)
+                return 2u;
+        }
+        return 0u;
+    }
+
+    // Whether a state needs the shader to blend against the target (exact GS blending) instead
+    // of the fixed-function blender. 0 when fixed-function is right, else the stats index.
+    // PS2X_GS_TARGETS_EXACT: 0 only what fixed-function can't express, 1 (default) also sprites
+    // blended by source alpha, which SotC's glare passes push above 0x80 (a factor above one,
+    // clamped by fixed-function blending), 2 also triangles blended by source alpha.
+    uint32_t targetExact(const uint32_t *s, uint32_t type) const
+    {
+        static const uint32_t policy = []
+        {
+            const char *value = std::getenv("PS2X_GS_TARGETS_EXACT");
+            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 1u;
+        }();
+        const uint32_t fpsm = s[SFpsm];
+        if (((s[STest] >> 14u) & 1u) != 0u && fpsm == 0u)
+            return 3u;
+        const uint32_t mask = s[SFbmsk] | (fpsm == 1u ? 0xFF000000u : 0u);
+        for (uint32_t byte = 0; byte < 4u; ++byte)
+        {
+            const uint32_t m = (mask >> (byte * 8u)) & 0xFFu;
+            if (m != 0u && m != 0xFFu)
+                return 4u;
+        }
+        if ((s[SFlags] & FAbe) == 0u)
+            return 0u;
+        TargetBlend blend;
+        if (!targetBlend(s[SAlpha], blend))
+            return 5u;
+        // Without COLCLAMP the GS wraps where fixed-function blending clamps. A sum (B = 0) only
+        // differs past 255, which SotC's glow volumes stay below; a difference can go below zero.
+        const uint32_t bsel = std::min((s[SAlpha] >> 2u) & 3u, 2u);
+        if ((s[SFlags] & FWrap) != 0u && bsel != 2u && std::min(s[SAlpha] & 3u, 2u) != bsel)
+            return 6u;
+        if ((s[SFlags] & FPabe) != 0u && (s[SAlpha] & 0xFFu) != 0x44u)
+            return 7u;
+        const uint32_t c = (s[SAlpha] >> 4u) & 3u;
+        if (c == 2u && (s[SAlphaFix] & 0xFFu) > 0x80u)
+            return 5u;
+        if (c == 0u && (policy >= 2u || (policy >= 1u && type != PrimTriangle)))
+            return 5u;
+        return 0u;
+    }
+
+    // Splits prims first..last into draws whose boxes don't overlap, so no pixel is covered twice
+    // between two texture barriers.
+    void exactGroups(uint32_t first, uint32_t last, std::vector<std::pair<uint32_t, uint32_t>> &out) const
+    {
+        out.clear();
+        std::vector<std::array<int, 4>> boxes;
+        uint32_t start = first;
+        for (uint32_t prim = first; prim < last; ++prim)
+        {
+            const uint32_t *p = prims.data() + static_cast<size_t>(prim) * kPrimWords;
+            std::array<int, 4> box;
+            if ((p[0] & 0xFFu) == PrimPoint)
+                box = {static_cast<int>(p[1]), static_cast<int>(p[2]), static_cast<int>(p[1]), static_cast<int>(p[2])};
+            else
+                box = {static_cast<int>(p[1] & 0xFFFFu), static_cast<int>(p[2] & 0xFFFFu), static_cast<int>(p[1] >> 16u),
+                       static_cast<int>(p[2] >> 16u)};
+            bool overlaps = boxes.size() >= 64u;
+            for (const std::array<int, 4> &b : boxes)
+                if (!overlaps && box[0] <= b[2] && b[0] <= box[2] && box[1] <= b[3] && b[1] <= box[3])
+                    overlaps = true;
+            if (overlaps)
+            {
+                out.push_back({start, prim});
+                start = prim;
+                boxes.clear();
+            }
+            boxes.push_back(box);
+        }
+        if (start < last)
+            out.push_back({start, last});
+    }
+
+    // Applies the depth, blend and mask state of one state word set for a pass (0: pixels that
+    // pass the alpha test, 1: pixels that fail it, drawn with the AFAIL masks).
+    void applyTargetState(const uint32_t *s, uint32_t pass, bool haveDepth, bool exact)
+    {
+        const Api &g = gl();
+        const uint32_t test = s[STest];
+        const uint32_t fpsm = s[SFpsm];
+        bool writeRgb = true;
+        bool writeAlpha = fpsm != 1u;
+        bool writeDepth = s[SZmask] == 0u;
+        if (pass == 1u)
+        {
+            switch ((test >> 12u) & 3u)
+            {
+            case 1u:
+                writeDepth = false;
+                break;
+            case 2u:
+                writeRgb = false;
+                writeAlpha = false;
+                break;
+            case 3u:
+                writeDepth = false;
+                if (fpsm == 0u)
+                    writeAlpha = false;
+                break;
+            default:
+                break;
+            }
+        }
+        // Exact blending merges the frame mask in the shader.
+        const uint32_t mask = exact ? 0u : s[SFbmsk];
+        g.ColorMask(writeRgb && (mask & 0xFFu) == 0u, writeRgb && (mask & 0xFF00u) == 0u, writeRgb && (mask & 0xFF0000u) == 0u,
+                    writeAlpha && (mask & 0xFF000000u) == 0u);
+        const uint32_t ztst = (test >> 17u) & 3u;
+        if (!haveDepth || (ztst == 1u && !writeDepth))
+            g.Disable(kDepthTest);
+        else
+        {
+            g.Enable(kDepthTest);
+            g.DepthFunc(ztst == 0u ? kNever : ztst == 1u ? kAlways : ztst == 2u ? kGequal : kGreater);
+            g.DepthMask(writeDepth ? 1 : 0);
+        }
+        TargetBlend blend;
+        if (!exact && (s[SFlags] & FAbe) != 0u && targetBlend(s[SAlpha], blend))
+        {
+            g.Enable(kBlend);
+            g.BlendEquationSeparate(blend.equation, kFuncAdd);
+            g.BlendFuncSeparate(blend.source, blend.destination, kOne, kZero);
+            g.BlendColor(0.0f, 0.0f, 0.0f, static_cast<float>(s[SAlphaFix] & 0xFFu) / 128.0f);
+        }
+        else
+            g.Disable(kBlend);
+    }
+
+    // Draws the batch into render targets. False leaves it to the compute rasterizer.
+    bool drawTargets()
+    {
+        // PS2X_GS_TARGETS_ONLY=<first>:<end>: only those batches of each frame (bisecting), and
+        // PS2X_GS_TARGETS_DUMP=1 prints each batch of one frame in 30 with its frame index.
+        static const std::pair<uint32_t, uint32_t> only = []
+        {
+            const char *value = std::getenv("PS2X_GS_TARGETS_ONLY");
+            if (!value)
+                return std::pair<uint32_t, uint32_t>(0u, UINT32_MAX);
+            const char *colon = std::strchr(value, ':');
+            return std::pair<uint32_t, uint32_t>(static_cast<uint32_t>(std::strtoul(value, nullptr, 0)),
+                                                 colon ? static_cast<uint32_t>(std::strtoul(colon + 1, nullptr, 0)) : UINT32_MAX);
+        }();
+        static const bool dump = std::getenv("PS2X_GS_TARGETS_DUMP") != nullptr;
+        const uint32_t frameBatch = tgFrameBatch++;
+        if (dump && tgFrame % 30u == 0u)
+        {
+            const uint32_t *d = states.data() + static_cast<size_t>(prims[0] >> 8u) * kStateWords;
+            std::fprintf(stderr, "[gs-targets] frame %u batch %u fbp %x fbw %u fpsm %x zbp %x zpsm %x prims %u type %u flags %x alpha %x fix %x test %x fbmsk %x tex %x tpsm %x\n",
+                         tgFrame, frameBatch, d[SFbp] >> 5u, d[SFbw], d[SFpsm], d[SZbp] >> 5u, d[SZpsm], primCount, prims[0] & 0xFFu, d[SFlags],
+                         d[SAlpha], d[SAlphaFix], d[STest], d[SFbmsk], d[STbp0], d[STpsm]);
+            static const uint32_t detail = []
+            {
+                const char *value = std::getenv("PS2X_GS_TARGETS_DUMP");
+                return static_cast<uint32_t>(std::strtoul(value ? value : "0", nullptr, 0));
+            }();
+            if (detail != 0u && frameBatch + 1u == detail)
+                for (uint32_t i = 0; i < primCount && i < 40u; ++i)
+                {
+                    const uint32_t *q = prims.data() + static_cast<size_t>(i) * kPrimWords;
+                    const uint32_t *qs = states.data() + static_cast<size_t>(q[0] >> 8u) * kStateWords;
+                    float uv[4] = {};
+                    std::memcpy(uv, q + 7, sizeof(uv));
+                    std::fprintf(stderr, "[gs-targets]   prim %u type %u x %u-%u y %u-%u z %08x color %08x zmask %u scissor %08x %08x fba %u uv %.1f,%.1f-%.1f,%.1f flags %x alpha %x test %x tex %x tbw %u tpsm %x size %08x mode %x clamp %x\n",
+                                 i, q[0] & 0xFFu, q[1] & 0xFFFFu, q[1] >> 16u, q[2] & 0xFFFFu, q[2] >> 16u, q[13], q[14], qs[SZmask], qs[SScissorX],
+                                 qs[SScissorY], qs[SFba], uv[0], uv[1], uv[2], uv[3], qs[SFlags], qs[SAlpha], qs[STest], qs[STbp0], qs[STbw], qs[STpsm],
+                                 qs[STexSize], qs[STexMode], qs[SClampLo]);
+                }
+        }
+        if (frameBatch < only.first || frameBatch >= only.second)
+        {
+            ++tgStats.reasons[9u];
+            return false;
+        }
+        uint32_t refusal = 0u;
+        int x0 = INT32_MAX, y0 = INT32_MAX, x1 = INT32_MIN, y1 = INT32_MIN;
+        bool depthUsed = false;
+        bool depthWritten = false;
+        tgRuns.clear();
+        uint32_t runState = UINT32_MAX;
+        uint32_t exactState = UINT32_MAX;
+        uint32_t exactType = UINT32_MAX;
+        bool exact = false;
+        uint32_t checkedState = UINT32_MAX;
+        for (uint32_t prim = 0u; prim < primCount; ++prim)
+        {
+            const uint32_t *p = prims.data() + static_cast<size_t>(prim) * kPrimWords;
+            const uint32_t stateIndex = p[0] >> 8u;
+            const uint32_t *s = states.data() + static_cast<size_t>(stateIndex) * kStateWords;
+            if (stateIndex != checkedState)
+            {
+                checkedState = stateIndex;
+                refusal = targetRefusal(s);
+                if (refusal != 0u)
+                    break;
+                const uint32_t test = s[STest];
+                depthUsed = depthUsed || ((test >> 17u) & 3u) != 1u || s[SZmask] == 0u;
+                depthWritten = depthWritten || s[SZmask] == 0u;
+            }
+            if ((p[0] & 0xFFu) == PrimPoint)
+            {
+                x0 = std::min(x0, static_cast<int>(p[1]));
+                x1 = std::max(x1, static_cast<int>(p[1]));
+                y0 = std::min(y0, static_cast<int>(p[2]));
+                y1 = std::max(y1, static_cast<int>(p[2]));
+            }
+            else
+            {
+                x0 = std::min(x0, static_cast<int>(p[1] & 0xFFFFu));
+                x1 = std::max(x1, static_cast<int>(p[1] >> 16u));
+                y0 = std::min(y0, static_cast<int>(p[2] & 0xFFFFu));
+                y1 = std::max(y1, static_cast<int>(p[2] >> 16u));
+            }
+            const uint32_t type = p[0] & 0xFFu;
+            if (stateIndex != exactState || type != exactType)
+            {
+                exactState = stateIndex;
+                exactType = type;
+                const uint32_t why = targetExact(s, type);
+                exact = why != 0u;
+                if (exact)
+                    ++tgStats.exactReasons[why];
+            }
+            // A run shares the fixed-function state (depth test, blending, write masks) and the
+            // blending mode.
+            if (prim != 0u && exact == tgRuns.back().exact)
+            {
+                if (stateIndex == runState)
+                    continue;
+                const uint32_t *r = states.data() + static_cast<size_t>(runState) * kStateWords;
+                bool same = true;
+                for (uint32_t word : {SFlags, SAlpha, SAlphaFix, STest, SZmask, SFbmsk, SFpsm})
+                    same = same && r[word] == s[word];
+                if (same)
+                    continue;
+            }
+            if (!tgRuns.empty())
+                tgRuns.back().last = prim;
+            tgRuns.push_back({&tgProgram, prim, primCount, stateIndex, exact});
+            runState = stateIndex;
+        }
+        if (refusal != 0u)
+        {
+            ++tgStats.reasons[refusal];
+            return false;
+        }
+        if (dump && tgFrame % 30u == 0u)
+            for (const TargetRun &run : tgRuns)
+                if (run.exact)
+                {
+                    const uint32_t *r = states.data() + static_cast<size_t>(run.state) * kStateWords;
+                    exactGroups(run.first, run.last, tgGroups);
+                    std::fprintf(stderr, "[gs-targets]   exact run %u-%u (%zu draws) type %u flags %x alpha %x fix %x test %x fbmsk %x fpsm %x texmode %x why %u\n",
+                                 run.first, run.last, tgGroups.size(), prims[static_cast<size_t>(run.first) * kPrimWords] & 0xFFu, r[SFlags], r[SAlpha],
+                                 r[SAlphaFix], r[STest], r[SFbmsk], r[SFpsm], r[STexMode],
+                                 targetExact(r, prims[static_cast<size_t>(run.first) * kPrimWords] & 0xFFu));
+                }
+        const uint32_t *s0 = states.data() + static_cast<size_t>(prims[0] >> 8u) * kStateWords;
+        Target &color = findTarget(s0[SFbp], s0[SFbw], s0[SFpsm], false);
+        Target *depth = depthUsed ? &findTarget(s0[SZbp], s0[SFbw], s0[SZpsm], true) : nullptr;
+        const std::bitset<kCells> colorCells = targetCells(color, x0, y0, x1, y1);
+        std::bitset<kCells> depthCells;
+        std::bitset<kPages> colorPages;
+        std::bitset<kPages> depthPages;
+        for (uint32_t cell = 0; cell < kCells; ++cell)
+            if (colorCells.test(cell))
+                targetCellPages(color, cell, colorPages);
+        if (depth)
+        {
+            // SotC keeps its 448-line depth buffer right below the frame buffer in memory: a
+            // batch whose box reaches line 448 would hold the same page in both textures.
+            depthCells = targetCells(*depth, x0, y0, x1, y1);
+            for (uint32_t cell = 0; cell < kCells; ++cell)
+                if (depthCells.test(cell))
+                    targetCellPages(*depth, cell, depthPages);
+            if ((colorPages & depthPages).any())
+            {
+                ++tgStats.reasons[8u];
+                return false;
+            }
+        }
+        // Every other copy of these pages, the other one of this pair included, goes back to GS
+        // memory before the batch and is reloaded after it.
+        syncTargetPages(colorPages, &color);
+        invalidateTargetPages(colorPages, &color);
+        if (depth)
+        {
+            syncTargetPages(depthPages, depth);
+            if (depthWritten)
+                invalidateTargetPages(depthPages, depth);
+        }
+        loadTargetCells(color, colorCells & ~color.valid);
+        if (depth)
+            loadTargetCells(*depth, depthCells & ~depth->valid);
+
+        const Api &g = gl();
+        bindUpload(3u, primBuffer, prims.data(), prims.size() * sizeof(uint32_t));
+        bindUpload(4u, stateBuffer, states.data(), states.size() * sizeof(uint32_t));
+        g.BindFramebuffer(kFramebuffer, tgFramebuffer);
+        g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, color.texture, 0);
+        g.FramebufferTexture2D(kFramebuffer, kDepthAttachment, kTexture2D, depth ? depth->texture : 0u, 0);
+        g.Viewport(0, 0, kTargetSize, kTargetSize);
+        g.BindVertexArray(hwVertexArray);
+        g.ActiveTexture(kTexture0 + 1u);
+        g.BindTexture(kTexture2D, color.texture);
+        g.ActiveTexture(kTexture0);
+        const GLuint profRaster = profBegin();
+        // Both passes of a run before the next run: a run's AFAIL pixels (a depth clear drawn with
+        // ATST NEVER + ZB_ONLY, say) come before the draws after it.
+        for (const TargetRun &run : tgRuns)
+            for (uint32_t pass = 0u; pass < 2u; ++pass)
+            {
+                const uint32_t *s = states.data() + static_cast<size_t>(run.state) * kStateWords;
+                const uint32_t test = s[STest];
+                if (pass == 1u && ((test & 1u) == 0u || ((test >> 12u) & 3u) == 0u || (test & 0xFu) == 3u))
+                    continue;
+                // ATST NEVER: nothing passes, so only the AFAIL pass draws.
+                if (pass == 0u && (test & 0xFu) == 1u)
+                    continue;
+                applyTargetState(s, pass, depth != nullptr, run.exact);
+                g.UseProgram(run.program->id);
+                g.Uniform4ui(run.program->loc[0], epoch, 0u, 0u, 0u);
+                g.Uniform4ui(run.program->loc[1], hwConservative ? 1u : 0u, 0u, 0u, 0u);
+                g.Uniform4ui(run.program->loc[2], pass, run.exact ? 1u : 0u, 0u, 0u);
+                if (!run.exact)
+                {
+                    g.DrawArrays(kTriangles, static_cast<GLint>(run.first * 6u), static_cast<GLsizei>((run.last - run.first) * 6u));
+                    ++tgStats.passes;
+                    continue;
+                }
+                // The shader reads the target it draws into: one cover per pixel per draw, and a
+                // barrier before each draw makes the previous draws visible to it.
+                exactGroups(run.first, run.last, tgGroups);
+                for (const std::pair<uint32_t, uint32_t> &group : tgGroups)
+                {
+                    g.TextureBarrier();
+                    g.DrawArrays(kTriangles, static_cast<GLint>(group.first * 6u), static_cast<GLsizei>((group.second - group.first) * 6u));
+                    ++tgStats.exactDraws;
+                }
+                ++tgStats.passes;
+            }
+        profEnd(0u, profRaster);
+        g.Disable(kBlend);
+        g.Disable(kDepthTest);
+        g.ColorMask(1, 1, 1, 1);
+        g.DepthMask(1);
+        g.BindFramebuffer(kFramebuffer, 0u);
+        g.ActiveTexture(kTexture0 + 1u);
+        g.BindTexture(kTexture2D, 0u);
+        g.ActiveTexture(kTexture0);
+        watchCells("draw", color, colorCells);
+        color.valid |= colorCells;
+        color.dirty |= colorCells;
+        targetRecount(color);
+        if (depth)
+        {
+            depth->valid |= depthCells;
+            if (depthWritten)
+                depth->dirty |= depthCells;
+            targetRecount(*depth);
+        }
+        // PS2X_GS_TARGETS_DEBUG=1: write every batch back and reload targets from GS memory on
+        // the next draw (tells stale cells apart from drawing differences).
+        static const bool writeThrough = []
+        {
+            const char *value = std::getenv("PS2X_GS_TARGETS_DEBUG");
+            return value && *value == '1';
+        }();
+        if (writeThrough)
+        {
+            syncAllTargets();
+            invalidateAllTargets();
+        }
+        ++tgStats.batches;
+        tgStats.prims += primCount;
+        stats.batches += 1u;
+        stats.prims += primCount;
+        return true;
+    }
+
+    void reportTargets()
+    {
+        static const bool enabled = []
+        {
+            const char *value = std::getenv("PS2X_GS_TARGETS_LOG");
+            return value && *value == '1';
+        }();
+        if (!enabled || !hwTargets)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - tgStats.window < std::chrono::seconds(5))
+            return;
+        const TargetStats &t = tgStats;
+        std::fprintf(stderr,
+                     "[gs-targets] %llu batches %llu prims drawn, %llu batches %llu prims computed (format %llu depth %llu date %llu mask %llu blend %llu wrap %llu pabe %llu alias %llu compiling %llu), %zu targets, %llu cells loaded %llu stored, %llu passes\n",
+                     static_cast<unsigned long long>(t.batches), static_cast<unsigned long long>(t.prims),
+                     static_cast<unsigned long long>(t.fallbackBatches), static_cast<unsigned long long>(t.fallbackPrims),
+                     static_cast<unsigned long long>(t.reasons[1]), static_cast<unsigned long long>(t.reasons[2]),
+                     static_cast<unsigned long long>(t.reasons[3]), static_cast<unsigned long long>(t.reasons[4]),
+                     static_cast<unsigned long long>(t.reasons[5]), static_cast<unsigned long long>(t.reasons[6]),
+                     static_cast<unsigned long long>(t.reasons[7]), static_cast<unsigned long long>(t.reasons[8]),
+                     static_cast<unsigned long long>(t.reasons[9]), targets.size(), static_cast<unsigned long long>(t.loadedCells),
+                     static_cast<unsigned long long>(t.storedCells), static_cast<unsigned long long>(t.passes));
+        std::fprintf(stderr, "[gs-targets] CPU %.2f ms per present\n", t.cpuMs / static_cast<double>(std::max<uint64_t>(t.presents, 1u)));
+        std::fprintf(stderr, "[gs-targets] exact blending: %llu draws (date %llu mask %llu blend %llu wrap %llu pabe %llu runs)\n",
+                     static_cast<unsigned long long>(t.exactDraws), static_cast<unsigned long long>(t.exactReasons[3]),
+                     static_cast<unsigned long long>(t.exactReasons[4]), static_cast<unsigned long long>(t.exactReasons[5]),
+                     static_cast<unsigned long long>(t.exactReasons[6]), static_cast<unsigned long long>(t.exactReasons[7]));
+        std::fflush(stderr);
+        tgStats = {};
+        tgStats.window = now;
     }
 
     bool ensure()
@@ -1364,6 +2230,7 @@ struct GSGpuBackend::Impl
     void uploadHostVram()
     {
         clutKeyValid = false;
+        invalidateAllTargets();
         if (!hostVram)
             return;
         gl().BindBuffer(kShaderStorageBuffer, vramBuffer);
@@ -1372,6 +2239,8 @@ struct GSGpuBackend::Impl
 
     void downloadVram(uint8_t *out, size_t size)
     {
+        if (hwTargets)
+            syncAllTargets();
         barrier();
         gl().BindBuffer(kShaderStorageBuffer, vramBuffer);
         gl().GetBufferSubData(kShaderStorageBuffer, 0, static_cast<GLsizeiptr>(std::min<size_t>(size, GSSwizzle::kMemorySize)), out);
@@ -1442,6 +2311,14 @@ struct GSGpuBackend::Impl
 
     void executeTransfers()
     {
+        if (hwTargets && (!copyPairs.empty() || !uploadWords.empty()))
+        {
+            std::bitset<kPages> touchedPages = pendingWritePages;
+            for (uint32_t pair : copyPairs)
+                touchedPages.set((pair & 0xFFFFu) % kPages);
+            syncTargetPages(touchedPages);
+            invalidateTargetPages(pendingWritePages);
+        }
         if (!copyPairs.empty())
         {
             uploadData(copyPairs.data(), copyPairs.size() * sizeof(uint32_t));
@@ -1545,8 +2422,22 @@ struct GSGpuBackend::Impl
         const Api &g = gl();
         if (epoch != 0u)
             bindUpload(9u, pageMapBuffer, pageMaps.data(), static_cast<size_t>(epoch) * kPages * sizeof(uint32_t));
+        if (hwTargets)
+            syncTargetPages(readPages | batchClutPages);
         dispatchClutOps();
         bool drawn = false;
+        if (primCount != 0u && hwTargets && !hwEnabled)
+        {
+            const auto drawStart = std::chrono::steady_clock::now();
+            drawn = drawTargets();
+            tgStats.cpuMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - drawStart).count();
+            if (!drawn)
+            {
+                ++tgStats.fallbackBatches;
+                tgStats.fallbackPrims += primCount;
+                syncTargetPages(writePages);
+            }
+        }
         if (primCount != 0u && hwEnabled)
         {
             drainCompiledVariants();
@@ -1730,6 +2621,8 @@ struct GSGpuBackend::Impl
             stats.batches += 1u;
             stats.tiles += touched.size();
             stats.prims += primCount;
+            if (hwTargets)
+                invalidateTargetPages(writePages);
         }
         resetBatch();
     }
@@ -2274,6 +3167,15 @@ struct GSGpuBackend::Impl
             return;
         }
         const GSBitBltBuf &b = transfer.bitbltbuf;
+        if (hwTargets)
+        {
+            syncAllTargets();
+            std::bitset<kPages> destination;
+            markPages(destination, b.dpsm, b.dbp, std::max<uint32_t>(b.dbw, 1u), static_cast<int>(transfer.trxpos.dsax),
+                      static_cast<int>(transfer.trxpos.dsay), static_cast<int>(transfer.trxpos.dsax + rrw) - 1,
+                      static_cast<int>(transfer.trxpos.dsay + rrh) - 1);
+            invalidateTargetPages(destination);
+        }
         copyRegion(b.spsm, b.sbp, std::max<uint32_t>(b.sbw, 1u), transfer.trxpos.ssax, transfer.trxpos.ssay, rrw, rrh, transfer.trxpos.dir);
         clutKeyValid = false;
         gl().UseProgram(copyWrite.id);
@@ -2296,6 +3198,8 @@ struct GSGpuBackend::Impl
         const uint32_t bpp = static_cast<uint32_t>(GSMem::BitsPerPixel(static_cast<GSMem::PixelStorageMode>(b.spsm)));
         if (total != 0u)
         {
+            if (hwTargets)
+                syncAllTargets();
             copyRegion(b.spsm, b.sbp, std::max<uint32_t>(b.sbw, 1u), transfer.trxpos.ssax, transfer.trxpos.ssay, rrw, rrh, 0u);
             scratch.resize(total);
             readData(scratch.data(), static_cast<size_t>(total) * 4u);
@@ -2955,6 +3859,16 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     if (!d.ensure())
         return result;
     d.flushBatch();
+    if (d.hwTargets)
+    {
+        const auto syncStart = std::chrono::steady_clock::now();
+        d.syncAllTargets();
+        d.tgStats.cpuMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - syncStart).count();
+        ++d.tgStats.presents;
+        d.reportTargets();
+        ++d.tgFrame;
+        d.tgFrameBatch = 0u;
+    }
     const bool shared = d.context.Shared() && GSSharedPresent::Active();
     const std::array<uint64_t, 7> crtc = {request.pmode, request.smode2, request.dispfb1, request.display1,
                                          request.dispfb2, request.display2, request.bgcolor};
@@ -3161,6 +4075,14 @@ bool GSGpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
     const uint32_t y1 = std::max<uint32_t>(y0, context.scissor.y1);
     const Api &gl = d.gl();
     d.clutKeyValid = false;
+    if (d.hwTargets)
+    {
+        std::bitset<kPages> cleared;
+        markPages(cleared, psm, context.frame.fbp << 5u, std::max<uint32_t>(context.frame.fbw, 1u), static_cast<int>(x0), static_cast<int>(y0),
+                  static_cast<int>(x1), static_cast<int>(y1));
+        d.syncTargetPages(cleared);
+        d.invalidateTargetPages(cleared);
+    }
     gl.UseProgram(d.clear.id);
     gl.Uniform4ui(d.clear.loc[0], context.frame.fbp << 5u, std::max<uint32_t>(context.frame.fbw, 1u) | (static_cast<uint32_t>(psm) << 16u), mask, source);
     gl.Uniform4ui(d.clear.loc[1], x0, y0, x1, y1);
@@ -3187,6 +4109,8 @@ uint32_t GSGpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32
     if (!d.ensure())
         return 0u;
     d.flushBatch();
+    if (d.hwTargets)
+        d.syncAllTargets();
     d.reserveData(16u);
     const Api &gl = d.gl();
     d.clutKeyValid = false;
@@ -3208,6 +4132,13 @@ void GSGpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t 
     d.flushBatch();
     const Api &gl = d.gl();
     d.clutKeyValid = false;
+    if (d.hwTargets)
+    {
+        std::bitset<kPages> poked;
+        markPages(poked, psm, base, std::max<uint32_t>(bw, 1u), static_cast<int>(x), static_cast<int>(y), static_cast<int>(x), static_cast<int>(y));
+        d.syncTargetPages(poked);
+        d.invalidateTargetPages(poked);
+    }
     gl.UseProgram(d.poke.id);
     gl.Uniform4ui(d.poke.loc[0], psm, base, bw, (x & 0xFFFFu) | (y << 16u));
     gl.Uniform4ui(d.poke.loc[1], value, 1u, 0u, 0u);
