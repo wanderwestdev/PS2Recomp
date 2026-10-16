@@ -2397,31 +2397,14 @@ struct GSGpuBackend::Impl
         GSTriangleRaster tri;
         if (!gsTriangleSetup(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, ctx.xyoffset.ofx, ctx.xyoffset.ofy, tri, fastTriangleSetup))
             return;
-        // At internal resolution the samples left of and above the first native sample position
-        // can be covered too, so the box starts one pixel earlier. Triangles at least 5 pixels long
-        // in one direction also reach a quarter pixel past their edges there, to close the hairline
-        // joints between pieces of the scene (edgeSlack in the shaders), so their box ends a pixel
-        // later too. The joints are mostly long thin triangles; small ones (fur, grass, distant
-        // detail) skip it, where it only cost time (shrine at 2x: cracks 558 -> 115 pixels per
-        // frame, Agro title scene ~40 fps either way; with every triangle: 147 and ~30 fps).
+        // At internal resolution a native pixel's samples sit at x + i/S from its corner, so the
+        // pixel left of (and above) the first native sample inside the triangle can have covered
+        // samples too: the box starts one pixel earlier there.
         const int hiMargin = hiActive ? 1 : 0;
-        // PS2X_GS_BAND_MIN=<pixels>: the size from which triangles get the band (experiments).
-        static const int bandMin = []
-        {
-            const char *value = std::getenv("PS2X_GS_BAND_MIN");
-            return value ? std::atoi(value) : 4;
-        }();
-        const bool band = hiActive && std::max(tri.maxX - tri.minX, tri.maxY - tri.minY) >= bandMin;
-        // The native box ends at the last native sample inside the triangle, but a centred
-        // high-resolution grid puts the next pixel's first sample 1/(2S) past it on the right and
-        // bottom too (2x: +3/4). Every triangle needs the extra pixel on all four sides, not only
-        // band ones: without it small triangles (faces, hair, detail) lost a sliver along their
-        // right and bottom edges, which showed as cracks inside a single mesh.
-        const int edgeMargin = std::max(hiMargin, band ? 1 : 0);
         const int minX = std::max(tri.minX - hiMargin, static_cast<int>(ctx.scissor.x0));
-        const int maxX = std::min(tri.maxX + edgeMargin, static_cast<int>(ctx.scissor.x1));
+        const int maxX = std::min(tri.maxX, static_cast<int>(ctx.scissor.x1));
         const int minY = std::max(tri.minY - hiMargin, static_cast<int>(ctx.scissor.y0));
-        const int maxY = std::min(tri.maxY + edgeMargin, static_cast<int>(ctx.scissor.y1));
+        const int maxY = std::min(tri.maxY, static_cast<int>(ctx.scissor.y1));
         if (minX > maxX || minY > maxY)
             return;
 
@@ -2466,7 +2449,7 @@ struct GSGpuBackend::Impl
         p[34] = fbits(static_cast<float>(v0.z - zBase));
         p[35] = fbits(static_cast<float>(v1.z - v0.z));
         p[36] = fbits(static_cast<float>(v2.z - v0.z));
-        p[37] = band ? 1u : 0u;  // edge band at internal resolution
+        p[37] = 0u;
         binTriangle(primCount - 1u, tri, minX, minY, maxX, maxY);
     }
 
