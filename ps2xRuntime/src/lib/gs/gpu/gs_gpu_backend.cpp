@@ -144,7 +144,7 @@ namespace
     struct Program
     {
         GLuint id = 0;
-        GLint loc[4] = {-1, -1, -1, -1};
+        GLint loc[6] = {-1, -1, -1, -1, -1, -1};
     };
 
     struct CrtcCircuit
@@ -317,6 +317,8 @@ struct GSGpuBackend::Impl
     // cell (one GS page of the target's format). A cell is valid when the texture holds what GS
     // memory holds, dirty when the texture is newer.
     static constexpr uint32_t kTargetSize = 2048u;
+    // Targets hold GS lines 0-1023 (SotC draws within 512 x 448); a batch past that is computed.
+    static constexpr uint32_t kTargetHeight = 1024u;
     static constexpr uint32_t kCellColumns = 32u;
     static constexpr uint32_t kCells = 2048u;
     struct Target
@@ -334,6 +336,7 @@ struct GSGpuBackend::Impl
     };
     std::vector<std::unique_ptr<Target>> targets;
     bool hwTargets = false;
+    uint32_t tgScale = 1u; // PS2X_GS_TARGETS_SCALE
     std::string tgFragmentBody;
     GLuint tgFramebuffer = 0u;
     Program tgProgram;
@@ -350,6 +353,7 @@ struct GSGpuBackend::Impl
         uint32_t last;
         uint32_t state;
         bool exact;
+        Target *source;
     };
     std::vector<TargetRun> tgRuns;
     std::vector<std::pair<uint32_t, uint32_t>> tgGroups;
@@ -1341,7 +1345,9 @@ struct GSGpuBackend::Impl
 
     bool setupTargets(const std::string &prefix)
     {
-        if (!compile(tgStore, prefix, GSGpuShaders::kTargetStore, {"uStore"}))
+        if (const char *value = std::getenv("PS2X_GS_TARGETS_SCALE"))
+            tgScale = std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u, 6u);
+        if (!compile(tgStore, prefix, GSGpuShaders::kTargetStore, {"uStore", "uStoreScale"}))
             return false;
         const std::string version = "#version 460 core\n";
         const GLuint vertex = compileStage(kVertexShader, version + GSGpuShaders::kTargetLoadVertex);
@@ -1362,6 +1368,7 @@ struct GSGpuBackend::Impl
             return false;
         }
         tgLoad.loc[0] = gl().GetUniformLocation(tgLoad.id, "uLoad");
+        tgLoad.loc[1] = gl().GetUniformLocation(tgLoad.id, "uLoadScale");
 
         // One shader for every state, like the compute rasterizer: specialized variants take 6-20 s
         // each to compile on the AMD driver and stall the GS thread while they do.
@@ -1414,7 +1421,7 @@ struct GSGpuBackend::Impl
 
     uint32_t targetRows(const Target &t) const
     {
-        return kTargetSize / targetCellHeight(t);
+        return kTargetHeight / targetCellHeight(t);
     }
 
     void targetCellPages(const Target &t, uint32_t cell, std::bitset<kPages> &out) const
@@ -1489,6 +1496,7 @@ struct GSGpuBackend::Impl
         g.ActiveTexture(kTexture0);
         g.BindTexture(kTexture2D, t.texture);
         g.Uniform4ui(tgStore.loc[0], t.psm, t.base, t.bw, t.depth ? 1u : 0u);
+        g.Uniform4ui(tgStore.loc[1], tgScale, 0u, 0u, 0u);
         const GLuint profStore = profBegin();
         g.DispatchCompute(static_cast<GLuint>(tgRects.size() / 2u), 1u, 1u);
         profEnd(9u, profStore);
@@ -1513,7 +1521,7 @@ struct GSGpuBackend::Impl
         g.BindFramebuffer(kFramebuffer, tgFramebuffer);
         g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, t.depth ? 0u : t.texture, 0);
         g.FramebufferTexture2D(kFramebuffer, kDepthAttachment, kTexture2D, t.depth ? t.texture : 0u, 0);
-        g.Viewport(0, 0, kTargetSize, kTargetSize);
+        g.Viewport(0, 0, static_cast<GLsizei>(kTargetSize * tgScale), static_cast<GLsizei>(kTargetSize * tgScale));
         g.Disable(kBlend);
         g.ColorMask(1, 1, 1, 1);
         if (t.depth)
@@ -1527,6 +1535,7 @@ struct GSGpuBackend::Impl
         g.BindVertexArray(hwVertexArray);
         g.UseProgram(tgLoad.id);
         g.Uniform4ui(tgLoad.loc[0], t.psm, t.base, t.bw, t.depth ? 1u : 0u);
+        g.Uniform4ui(tgLoad.loc[1], tgScale, 0u, 0u, 0u);
         const GLuint profLoad = profBegin();
         g.DrawArrays(kTriangles, 0, static_cast<GLsizei>(tgRects.size() / 2u * 6u));
         profEnd(8u, profLoad);
@@ -1620,7 +1629,8 @@ struct GSGpuBackend::Impl
         const Api &g = gl();
         g.GenTextures(1, &t->texture);
         g.BindTexture(kTexture2D, t->texture);
-        g.TexStorage2D(kTexture2D, 1, depth ? kDepthComponent32F : kRgba8, kTargetSize, kTargetSize);
+        g.TexStorage2D(kTexture2D, 1, depth ? kDepthComponent32F : kRgba8, static_cast<GLsizei>(t->bw * 64u * tgScale),
+                       static_cast<GLsizei>(kTargetHeight * tgScale));
         g.TexParameteri(kTexture2D, kTextureMinFilter, kNearest);
         g.TexParameteri(kTexture2D, kTextureMagFilter, kNearest);
         g.BindTexture(kTexture2D, 0u);
@@ -1885,9 +1895,10 @@ struct GSGpuBackend::Impl
         const uint32_t sx = s[SScissorX];
         const uint32_t sy = s[SScissorY];
         g.Enable(kScissorTest);
-        g.Scissor(static_cast<GLint>(sx & 0xFFFFu), static_cast<GLint>(sy & 0xFFFFu),
-                  static_cast<GLsizei>(std::max<int>(static_cast<int>(sx >> 16u) - static_cast<int>(sx & 0xFFFFu) + 1, 0)),
-                  static_cast<GLsizei>(std::max<int>(static_cast<int>(sy >> 16u) - static_cast<int>(sy & 0xFFFFu) + 1, 0)));
+        const int scale = static_cast<int>(tgScale);
+        g.Scissor(static_cast<GLint>(sx & 0xFFFFu) * scale, static_cast<GLint>(sy & 0xFFFFu) * scale,
+                  static_cast<GLsizei>(std::max<int>(static_cast<int>(sx >> 16u) - static_cast<int>(sx & 0xFFFFu) + 1, 0) * scale),
+                  static_cast<GLsizei>(std::max<int>(static_cast<int>(sy >> 16u) - static_cast<int>(sy & 0xFFFFu) + 1, 0) * scale));
         const uint32_t ztst = (test >> 17u) & 3u;
         if (!haveDepth || (ztst == 1u && !writeDepth))
             g.Disable(kDepthTest);
@@ -1907,6 +1918,63 @@ struct GSGpuBackend::Impl
         }
         else
             g.Disable(kBlend);
+    }
+
+    // The render target a primitive samples, when it can read the target's texture directly
+    // (PCSX2's LookupSource): a 32- or 24-bit colour target at the texture's base and width,
+    // without mipmaps or region clamping, and not the target being drawn. Otherwise the texture
+    // comes from GS memory at scale 1.
+    Target *sourceTarget(const uint32_t *s, uint32_t colorBase, uint32_t depthBase) const
+    {
+        if ((s[SFlags] & FTme) == 0u || (s[STpsm] != 0u && s[STpsm] != 1u))
+            return nullptr;
+        // Mipmapped sampling only when it never leaves level 0: LOD = K for FST or LCM, and
+        // K <= 0 (SotC reads its scene that way, MXL 2 with a negative K).
+        if (s[SMip] != 0u)
+        {
+            const int k = static_cast<int32_t>(s[SMip] << 4u) >> 20;
+            if (!((s[SFlags] & FFst) != 0u || (s[SMip] & 1u) != 0u) || k > 0)
+                return nullptr;
+        }
+        // A primitive queued before an upload into its texture pages samples the older copy
+        // (copyOnWrite, remapped through pageMaps); only GS memory has it.
+        if (s[SEpoch] != epoch)
+        {
+            std::bitset<kPages> pages;
+            markPages(pages, s[STpsm], s[STbp0], std::max<uint32_t>(s[STbw], 1u), 0, 0, static_cast<int>(s[STexSize] & 0xFFFFu) - 1,
+                      static_cast<int>(s[STexSize] >> 16u) - 1);
+            for (uint32_t page = 0; page < kPages; ++page)
+                if (pages.test(page) && pageMaps[static_cast<size_t>(s[SEpoch]) * kPages + page] != page)
+                    return nullptr;
+        }
+        const uint32_t clampMode = s[SClampLo];
+        if ((clampMode & 3u) >= 2u || ((clampMode >> 2u) & 3u) >= 2u)
+            return nullptr;
+        for (const std::unique_ptr<Target> &t : targets)
+            if (!t->depth && t->base != colorBase && t->base != depthBase && t->base == s[STbp0] &&
+                t->bw == std::max<uint32_t>(s[STbw], 1u) && (t->psm == 0u || t->psm == 1u))
+            {
+                // Only a picture the target holds: some sampled cell still valid in its texture
+                // (SotC samples its 448-line scene as a 512 x 512 texture; the cells past line
+                // 448 are loaded). When every cell is gone, the memory has been reused (an
+                // uploaded texture) and GS memory is the texture.
+                const std::bitset<kCells> cells = targetCells(*t, 0, 0, static_cast<int>(s[STexSize] & 0xFFFFu) - 1,
+                                                              static_cast<int>(s[STexSize] >> 16u) - 1);
+                if ((cells & t->valid).any())
+                    return t.get();
+            }
+        return nullptr;
+    }
+
+    // The colour target a display circuit shows, if any (the most recently drawn one).
+    const Target *displayTarget(uint32_t base, uint32_t bw) const
+    {
+        const Target *best = nullptr;
+        for (const std::unique_ptr<Target> &t : targets)
+            if (!t->depth && t->base == base && t->bw == std::clamp<uint32_t>(bw, 1u, kCellColumns) && (t->psm == 0u || t->psm == 1u) &&
+                (!best || t->used > best->used))
+                best = t.get();
+        return best;
     }
 
     // Draws the batch into render targets. False leaves it to the compute rasterizer.
@@ -1960,6 +2028,8 @@ struct GSGpuBackend::Impl
         bool depthWritten = false;
         tgRuns.clear();
         uint32_t runState = UINT32_MAX;
+        uint32_t sourceState = UINT32_MAX;
+        Target *source = nullptr;
         bool exact = false;
         uint32_t checkedState = UINT32_MAX;
         for (uint32_t prim = 0u; prim < primCount; ++prim)
@@ -1997,9 +2067,17 @@ struct GSGpuBackend::Impl
                 if (exact)
                     ++tgStats.exactReasons[why];
             }
+            // PS2X_GS_TARGETS_NOSOURCE=1: textures always from GS memory (debugging).
+            static const bool noSource = std::getenv("PS2X_GS_TARGETS_NOSOURCE") != nullptr;
+            static const bool sourceAtOne = std::getenv("PS2X_GS_TARGETS_SOURCE1") != nullptr;
+            if (stateIndex != sourceState)
+            {
+                sourceState = stateIndex;
+                source = (tgScale > 1u || sourceAtOne) && !noSource ? sourceTarget(s, s[SFbp], s[SZbp]) : nullptr;
+            }
             // A run shares the fixed-function state (depth test, blending, write masks) and the
             // blending mode.
-            if (prim != 0u && exact == tgRuns.back().exact)
+            if (prim != 0u && exact == tgRuns.back().exact && source == tgRuns.back().source)
             {
                 if (stateIndex == runState)
                     continue;
@@ -2014,7 +2092,7 @@ struct GSGpuBackend::Impl
             }
             if (!tgRuns.empty())
                 tgRuns.back().last = prim;
-            tgRuns.push_back({&tgProgram, prim, primCount, stateIndex, exact});
+            tgRuns.push_back({&tgProgram, prim, primCount, stateIndex, exact, source});
             runState = stateIndex;
         }
         if (refusal != 0u)
@@ -2022,6 +2100,27 @@ struct GSGpuBackend::Impl
             ++tgStats.reasons[refusal];
             return false;
         }
+        if (dump && tgFrame % 30u == 0u)
+            for (const TargetRun &run : tgRuns)
+            {
+                const uint32_t *r = states.data() + static_cast<size_t>(run.state) * kStateWords;
+                if (run.source || (r[SFlags] & FTme) == 0u)
+                    continue;
+                for (const std::unique_ptr<Target> &t : targets)
+                    if (t->base == r[STbp0])
+                        std::fprintf(stderr, "[gs-targets]   missed source run %u-%u fbp %x: tex %x tbw %u tpsm %x size %ux%u clamp %x mip %x epoch %u/%u, target bw %u psm %x%s valid %zu\n",
+                                     run.first, run.last, r[SFbp] >> 5u, r[STbp0], r[STbw], r[STpsm], r[STexSize] & 0xFFFFu, r[STexSize] >> 16u,
+                                     r[SClampLo], r[SMip], r[SEpoch], epoch, t->bw, t->psm, t->depth ? " depth" : "", t->valid.count());
+            }
+        if (dump && tgFrame % 30u == 0u)
+            for (const TargetRun &run : tgRuns)
+                if (run.source)
+                {
+                    const uint32_t *r = states.data() + static_cast<size_t>(run.state) * kStateWords;
+                    std::fprintf(stderr, "[gs-targets]   source run %u-%u fbp %x fbw %u: tex %x tbw %u tpsm %x size %ux%u clamp %x from target %x bw %u psm %x valid %zu\n",
+                                 run.first, run.last, r[SFbp] >> 5u, r[SFbw], r[STbp0], r[STbw], r[STpsm], r[STexSize] & 0xFFFFu, r[STexSize] >> 16u,
+                                 r[SClampLo], run.source->base, run.source->bw, run.source->psm, run.source->valid.count());
+                }
         if (dump && tgFrame % 30u == 0u)
             for (const TargetRun &run : tgRuns)
                 if (run.exact)
@@ -2034,6 +2133,17 @@ struct GSGpuBackend::Impl
                                  targetExact(r, prims.data() + static_cast<size_t>(run.first) * kPrimWords));
                 }
         const uint32_t *s0 = states.data() + static_cast<size_t>(prims[0] >> 8u) * kStateWords;
+        // The targets' textures hold GS lines 0-1023 and the buffer's own width.
+        if (x0 < 0 || y0 < 0 || x1 >= static_cast<int>(std::clamp<uint32_t>(s0[SFbw], 1u, kCellColumns) * 64u) ||
+            y1 >= static_cast<int>(kTargetHeight))
+        {
+            ++tgStats.reasons[1u];
+            return false;
+        }
+        // Sources stay out of the eviction below.
+        for (const TargetRun &run : tgRuns)
+            if (run.source)
+                run.source->used = ++tgClock;
         Target &color = findTarget(s0[SFbp], s0[SFbw], s0[SFpsm], false);
         Target *depth = depthUsed ? &findTarget(s0[SZbp], s0[SFbw], s0[SZpsm], true) : nullptr;
         const std::bitset<kCells> colorCells = targetCells(color, x0, y0, x1, y1);
@@ -2070,6 +2180,16 @@ struct GSGpuBackend::Impl
         loadTargetCells(color, colorCells & ~color.valid);
         if (depth)
             loadTargetCells(*depth, depthCells & ~depth->valid);
+        // A source's sampled area must be in its texture (GS memory may be newer there).
+        for (const TargetRun &run : tgRuns)
+            if (run.source)
+            {
+                const uint32_t *r = states.data() + static_cast<size_t>(run.state) * kStateWords;
+                const std::bitset<kCells> cells = targetCells(*run.source, 0, 0, static_cast<int>(r[STexSize] & 0xFFFFu) - 1,
+                                                              static_cast<int>(r[STexSize] >> 16u) - 1);
+                loadTargetCells(*run.source, cells & ~run.source->valid);
+                targetRecount(*run.source);
+            }
 
         const Api &g = gl();
         bindUpload(3u, primBuffer, prims.data(), prims.size() * sizeof(uint32_t));
@@ -2077,7 +2197,7 @@ struct GSGpuBackend::Impl
         g.BindFramebuffer(kFramebuffer, tgFramebuffer);
         g.FramebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, color.texture, 0);
         g.FramebufferTexture2D(kFramebuffer, kDepthAttachment, kTexture2D, depth ? depth->texture : 0u, 0);
-        g.Viewport(0, 0, kTargetSize, kTargetSize);
+        g.Viewport(0, 0, static_cast<GLsizei>(kTargetSize * tgScale), static_cast<GLsizei>(kTargetSize * tgScale));
         g.BindVertexArray(hwVertexArray);
         g.ActiveTexture(kTexture0 + 1u);
         g.BindTexture(kTexture2D, color.texture);
@@ -2098,7 +2218,10 @@ struct GSGpuBackend::Impl
                 applyTargetState(s, pass, depth != nullptr, run.exact);
                 g.UseProgram(run.program->id);
                 g.Uniform4ui(run.program->loc[0], epoch, 0u, 0u, 0u);
-                g.Uniform4ui(run.program->loc[1], hwConservative ? 1u : 0u, 0u, 0u, 0u);
+                g.Uniform4ui(run.program->loc[1], 0u, tgScale, run.source ? 1u : 0u, 0u);
+                g.ActiveTexture(kTexture0 + 2u);
+                g.BindTexture(kTexture2D, run.source ? run.source->texture : 0u);
+                g.ActiveTexture(kTexture0);
                 // PS2X_GS_TARGETS_NOTEX=1 skips texture sampling (profiling only).
                 static const bool noTexture = std::getenv("PS2X_GS_TARGETS_NOTEX") != nullptr;
                 static const bool flat = std::getenv("PS2X_GS_TARGETS_FLAT") != nullptr;
@@ -2264,7 +2387,7 @@ struct GSGpuBackend::Impl
                         compile(copyWrite, prefix, GSGpuShaders::kCopyWrite, {"uDst", "uSize"}) &&
                         compile(clear, prefix, GSGpuShaders::kClear, {"uFrame", "uRect"}) &&
                         compile(poke, prefix, GSGpuShaders::kPoke, {"uArgs", "uArgs2"}) &&
-                        compile(present, prefix, GSGpuShaders::kPresent, {"uOut", "uC1", "uC2", "uMode"});
+                        compile(present, prefix, GSGpuShaders::kPresent, {"uOut", "uC1", "uC2", "uMode", "uScale"});
         if (!ok)
         {
             failed = true;
@@ -3982,9 +4105,33 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     }
     const uint32_t nativeWidth = std::min<uint32_t>(kMaxPresentationWidth, static_cast<uint32_t>((x1 - x0 + hstep - 1) / hstep));
     const uint32_t nativeHeight = std::min<uint32_t>(kMaxPresentationHeight, static_cast<uint32_t>((y1 - y0 + vstep - 1) / vstep));
+    // Upscaled render targets on screen (PS2X_GS_TARGETS_SCALE): a circuit that shows a colour
+    // target whose displayed cells are all in its texture reads that texture at its scale.
+    std::array<GLuint, 2> circuitTextures{};
+    uint32_t outScale = 1u;
+    if (d.hwTargets && d.tgScale > 1u && nativeWidth * d.tgScale <= 4096u && nativeHeight * d.tgScale <= 4096u)
+        for (size_t i = 0; i < 2u; ++i)
+        {
+            const CrtcCircuit &c = circuits[i];
+            if (!c.enabled || (c.psm & 0xFu) > 1u)
+                continue;
+            if (const auto *t = d.displayTarget(c.fbp << 5u, c.fbw))
+            {
+                const int w = (c.dw + c.hdiv - 1) / c.hdiv;
+                const int h = (c.dh + c.vdiv - 1) / c.vdiv;
+                const auto cells = d.targetCells(*t, static_cast<int>(c.dbx), static_cast<int>(c.dby), static_cast<int>(c.dbx) + w - 1,
+                                                 static_cast<int>(c.dby) + h - 1);
+                if (static_cast<int>(c.dbx) + w <= static_cast<int>(t->bw * 64u) && static_cast<int>(c.dby) + h <= static_cast<int>(Impl::kTargetHeight) &&
+                    (cells & ~t->valid).none())
+                {
+                    circuitTextures[i] = t->texture;
+                    outScale = d.tgScale;
+                }
+            }
+        }
     const Program &presentProgram = d.present;
-    const uint32_t width = nativeWidth;
-    const uint32_t height = nativeHeight;
+    const uint32_t width = nativeWidth * outScale;
+    const uint32_t height = nativeHeight * outScale;
     result.width = width;
     result.height = height;
     auto pack = [](const CrtcCircuit &c, std::array<uint32_t, 12> &out)
@@ -4003,6 +4150,15 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     gl.Uniform1uiv(presentProgram.loc[1], 12, c1.data());
     gl.Uniform1uiv(presentProgram.loc[2], 12, c2.data());
     gl.Uniform4ui(presentProgram.loc[3], static_cast<uint32_t>(request.bgcolor & 0xFFFFFFu), (slbg ? 1u : 0u) | (mmod ? 2u : 0u), alp, 0u);
+    gl.Uniform4ui(presentProgram.loc[4], outScale, circuitTextures[0] ? 1u : 0u, circuitTextures[1] ? 1u : 0u, 0u);
+    if (d.hwTargets)
+        for (uint32_t i = 0; i < 2u; ++i)
+        {
+            gl.ActiveTexture(kTexture0 + 3u + i);
+            gl.BindTexture(kTexture2D, circuitTextures[i]);
+        }
+    if (d.hwTargets)
+        gl.ActiveTexture(kTexture0);
     const GLuint profPresent = d.profBegin();
     gl.DispatchCompute((width + 15u) / 16u, (height + 15u) / 16u, 1u);
     ++d.presentStats.composites;
