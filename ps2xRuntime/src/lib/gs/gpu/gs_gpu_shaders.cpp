@@ -1342,6 +1342,13 @@ uniform uvec4 uOut;
 uniform uint uC1[12];
 uniform uint uC2[12];
 uniform uvec4 uMode;
+// uScale.x: output scale; uScale.y / .z = 1 when circuit 1 / 2 shows a render target, bound as
+// uC1Tex / uC2Tex at that scale (PS2X_GS_TARGETS).
+uniform uvec4 uScale;
+layout(binding = 3) uniform sampler2D uC1Tex;
+layout(binding = 4) uniform sampler2D uC2Tex;
+int gSubX = 0;
+int gSubY = 0;
 
 uint displayToRgba(uint psm, uint raw)
 {
@@ -1367,10 +1374,16 @@ bool covers(uint c[12], int rx, int ry)
     return c[0] != 0u && rx >= int(c[6]) && rx < int(c[6]) + int(c[8]) && ry >= int(c[7]) && ry < int(c[7]) + int(c[9]);
 }
 
-uint readCircuit(uint c[12], int rx, int ry, float frx, float fry)
+uint readCircuit(uint c[12], int rx, int ry, float frx, float fry, uint which)
 {
     uint bx = (uint((rx - int(c[6])) / int(c[10])) + c[4]) & 0x7FFu;
     uint by = (uint((ry - int(c[7])) / int(c[11])) + c[5]) & 0x7FFu;
+    if ((which == 1u ? uScale.y : uScale.z) != 0u)
+    {
+        ivec2 at = ivec2(int(bx) * int(uScale.x) + gSubX, int(by) * int(uScale.x) + gSubY);
+        uvec4 t = uvec4((which == 1u ? texelFetch(uC1Tex, at, 0) : texelFetch(uC2Tex, at, 0)) * 255.0 + 0.5);
+        return displayToRgba(c[3], t.r | (t.g << 8u) | (t.b << 16u) | (t.a << 24u));
+    }
     return displayToRgba(c[3], readPixel(c[3], c[1] * 32u, c[2], bx, by));
 }
 
@@ -1399,14 +1412,14 @@ uint composeAt(int rx, int ry, float frx, float fry)
         uint alp = uMode.z;
         if (in2 && !slbg)
         {
-            uint color = readCircuit(c2, rx, ry, frx, fry);
+            uint color = readCircuit(c2, rx, ry, frx, fry, 2u);
             r = color & 0xFFu;
             g = (color >> 8u) & 0xFFu;
             b = (color >> 16u) & 0xFFu;
         }
         if (in1)
         {
-            uint color = readCircuit(c1, rx, ry, frx, fry);
+            uint color = readCircuit(c1, rx, ry, frx, fry, 1u);
             uint factor = mmod ? alp : min(255u, (color >> 24u) * 2u);
             r = blendChannel(color & 0xFFu, r, factor);
             g = blendChannel((color >> 8u) & 0xFFu, g, factor);
@@ -1430,8 +1443,11 @@ void main()
     int hstep = int(uOut.w & 0xFFFFu);
     int vstep = int(uOut.w >> 16u);
     uint outPixel;
-    int ry = y0 + int(oy) * vstep + vstep / 2;
-    int rx = x0 + int(ox) * hstep + hstep / 2;
+    int scale = int(max(uScale.x, 1u));
+    gSubX = int(ox) % scale;
+    gSubY = int(oy) % scale;
+    int ry = y0 + int(oy) / scale * vstep + vstep / 2;
+    int rx = x0 + int(ox) / scale * hstep + hstep / 2;
     outPixel = composeAt(rx, ry, float(rx), float(ry));
     data[oy * width + ox] = outPixel;
 }
@@ -1539,7 +1555,76 @@ layout(location = 0, index = 1) out vec4 oFactor;
 // uTarget.y = 1: exact GS blending in the shader against uDest, the frame target itself; the
 // backend draws such runs so that no pixel is covered twice between texture barriers.
 layout(binding = 1) uniform sampler2D uDest;
+// uHw.y: the target scale. uHw.z = 1: the texture is a render target, bound as uSource at that
+// scale (PCSX2's LookupSource), so post-processing reads the upscaled picture.
+layout(binding = 2) uniform sampler2D uSource;
 uniform uvec4 uTarget;
+uniform uvec4 uHw;
+
+uint sourceTexel(ivec2 at, int w, int h, uint clampMode)
+{
+    at.x = (clampMode & 3u) == 0u ? int(uint(at.x) % uint(w)) : clamp(at.x, 0, w - 1);
+    at.y = ((clampMode >> 2u) & 3u) == 0u ? int(uint(at.y) % uint(h)) : clamp(at.y, 0, h - 1);
+    uvec4 c = uvec4(texelFetch(uSource, at, 0) * 255.0 + 0.5);
+    return c.r | (c.g << 8u) | (c.b << 16u) | (c.a << 24u);
+}
+
+// Level 0 of a render-target texture at the target's scale: nearest or the GS bilinear, on the
+// scaled texel grid.
+uint sampleSource(uint s, float texUf, float texVf, bool linear)
+{
+    float scale = float(uHw.y);
+    uint size = st(s, S_TEXSIZE);
+    int w = int(size & 0xFFFFu) * int(uHw.y);
+    int h = int(size >> 16u) * int(uHw.y);
+    uint clampMode = st(s, S_CLAMP_LO);
+    uint raw;
+    if (!linear)
+        raw = sourceTexel(ivec2(floor(texUf * scale), floor(texVf * scale)), w, h, clampMode);
+    else
+    {
+        float su = texUf * scale - 0.5;
+        float sv = texVf * scale - 0.5;
+        int u0 = int(floor(su));
+        int v0 = int(floor(sv));
+        float fx = su - float(u0);
+        float fy = sv - float(v0);
+        uint c00 = sourceTexel(ivec2(u0, v0), w, h, clampMode);
+        uint c10 = sourceTexel(ivec2(u0 + 1, v0), w, h, clampMode);
+        uint c01 = sourceTexel(ivec2(u0, v0 + 1), w, h, clampMode);
+        uint c11 = sourceTexel(ivec2(u0 + 1, v0 + 1), w, h, clampMode);
+        uint r = lerpChannel(c00 & 0xFFu, c10 & 0xFFu, c01 & 0xFFu, c11 & 0xFFu, fx, fy);
+        uint g = lerpChannel((c00 >> 8u) & 0xFFu, (c10 >> 8u) & 0xFFu, (c01 >> 8u) & 0xFFu, (c11 >> 8u) & 0xFFu, fx, fy);
+        uint b = lerpChannel((c00 >> 16u) & 0xFFu, (c10 >> 16u) & 0xFFu, (c01 >> 16u) & 0xFFu, (c11 >> 16u) & 0xFFu, fx, fy);
+        uint a = lerpChannel(c00 >> 24u, c10 >> 24u, c01 >> 24u, c11 >> 24u, fx, fy);
+        raw = r | (g << 8u) | (b << 16u) | (a << 24u);
+    }
+    uint psm = st(s, S_TPSM);
+    return applyTexa(s, psm, psm == 1u ? raw & 0x00FFFFFFu : raw);
+}
+
+uint targetSample(uint s, float ss, float tt, float q, uint u, uint v)
+{
+    if (uHw.z == 0u)
+        return sampleTexture(s, ss, tt, q, u, v);
+    uint size = st(s, S_TEXSIZE);
+    uint flags = st(s, S_FLAGS);
+    float texUf;
+    float texVf;
+    if ((flags & F_FST) != 0u)
+    {
+        texUf = float(u) / 16.0;
+        texVf = float(v) / 16.0;
+    }
+    else
+    {
+        float invQ = 1.0 / fabsQ(q);
+        texUf = ss * invQ * float(size & 0xFFFFu);
+        texVf = tt * invQ * float(size >> 16u);
+    }
+    uint mip = st(s, S_MIP);
+    return sampleSource(s, texUf, texVf, mip != 0u ? ((mip >> 5u) & 1u) != 0u : (flags & F_LINEAR) != 0u);
+}
 
 uint targetBlendExact(uint s, uint flags, int r, int g, int b, int a, uint fbrgba)
 {
@@ -1629,9 +1714,9 @@ void main()
         {
             uint texel;
             if ((flags & F_FST) != 0u)
-                texel = sampleTexture(s, 0.0, 0.0, 1.0, uint(int(vUv.x)) & 0xFFFFu, uint(int(vUv.y)) & 0xFFFFu);
+                texel = targetSample(s, 0.0, 0.0, 1.0, uint(int(vUv.x)) & 0xFFFFu, uint(int(vUv.y)) & 0xFFFFu);
             else
-                texel = sampleTexture(s, vStq.x, vStq.y, vStq.z, 0u, 0u);
+                texel = targetSample(s, vStq.x, vStq.y, vStq.z, 0u, 0u);
             c = combineTexture(s, c, texel);
         }
     }
@@ -1644,12 +1729,12 @@ void main()
         {
             uint texel;
             if ((flags & F_FST) != 0u)
-                texel = sampleTexture(s, 0.0, 0.0, 1.0, uint(clamp(int(vUv.x * 16.0 + 0.5), 0, 0xFFFF)),
-                                      uint(clamp(int(vUv.y * 16.0 + 0.5), 0, 0xFFFF)));
+                texel = targetSample(s, 0.0, 0.0, 1.0, uint(clamp(int(vUv.x * 16.0 + 0.5), 0, 0xFFFF)),
+                                     uint(clamp(int(vUv.y * 16.0 + 0.5), 0, 0xFFFF)));
             else
             {
                 uint size = st(s, S_TEXSIZE);
-                texel = sampleTexture(s, vUv.x / float(size & 0xFFFFu), vUv.y / float(size >> 16u), 1.0, 0u, 0u);
+                texel = targetSample(s, vUv.x / float(size & 0xFFFFu), vUv.y / float(size >> 16u), 1.0, 0u, 0u);
             }
             c = combineTexture(s, c, texel);
         }
@@ -1660,10 +1745,6 @@ void main()
         c = unpackColor(pw(p, 4u));
         fog = pw(p, 5u);
     }
-    uint sx = st(s, S_SCISSOR_X);
-    uint sy = st(s, S_SCISSOR_Y);
-    if (x < int(sx & 0xFFFFu) || x > int(sx >> 16u) || y < int(sy & 0xFFFFu) || y > int(sy >> 16u))
-        discard;
     uint r = c.r;
     uint g = c.g;
     uint b = c.b;
@@ -1719,9 +1800,13 @@ noperspective out vec2 vUv;
 noperspective out float vFog;
 noperspective out float vDz;
 
+uniform uvec4 uHw;
+
 uint pw(uint p, uint i) { return prims[p * 40u + i]; }
 float pf(uint p, uint i) { return uintBitsToFloat(prims[p * 40u + i]); }
 
+// GL position at scale 1; the viewport is 2048 x scale on each side, so the same NDC lands on
+// the scaled target.
 void emit(vec2 at)
 {
     gl_Position = vec4(at.x / 1024.0 - 1.0, at.y / 1024.0 - 1.0, 0.0, 1.0);
@@ -1811,12 +1896,14 @@ void main()
     // uLoad: psm, base, buffer width, 1 for a depth target.
     const char *const kTargetLoadFragment = R"GLSL(
 uniform uvec4 uLoad;
+uniform uvec4 uLoadScale;
 layout(location = 0) out vec4 oColor;
 
+// Each GS pixel fills its scale x scale block of the target.
 void main()
 {
-    uint x = uint(gl_FragCoord.x);
-    uint y = uint(gl_FragCoord.y);
+    uint x = uint(gl_FragCoord.x) / uLoadScale.x;
+    uint y = uint(gl_FragCoord.y) / uLoadScale.x;
     uint v = readPixel(uLoad.x, uLoad.y, uLoad.z, x, y);
     if (uLoad.w != 0u)
     {
@@ -1839,7 +1926,9 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(std430, binding = 7) readonly buffer DataBuffer { uint data[]; };
 layout(binding = 0) uniform sampler2D uTex;
 uniform uvec4 uStore;
+uniform uvec4 uStoreScale;
 
+// GS memory gets the sample at the centre of each pixel's block.
 void main()
 {
     uint lo = data[gl_WorkGroupID.x * 2u];
@@ -1847,7 +1936,7 @@ void main()
     for (uint y = (lo >> 16u) + gl_LocalInvocationID.y; y < (hi >> 16u); y += 16u)
         for (uint x = (lo & 0xFFFFu) + gl_LocalInvocationID.x; x < (hi & 0xFFFFu); x += 16u)
         {
-            vec4 t = texelFetch(uTex, ivec2(x, y), 0);
+            vec4 t = texelFetch(uTex, ivec2(x * uStoreScale.x + uStoreScale.x / 2u, y * uStoreScale.x + uStoreScale.x / 2u), 0);
             uint v;
             if (uStore.w != 0u)
                 v = uint(clamp(t.r * 16777216.0 + 0.5, 0.0, 4294967295.0));
