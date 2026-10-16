@@ -2236,7 +2236,18 @@ struct GSGpuBackend::Impl
                 const uint32_t *r = states.data() + static_cast<size_t>(run.state) * kStateWords;
                 const std::bitset<kCells> cells = targetCells(*run.source, 0, 0, static_cast<int>(r[STexSize] & 0xFFFFu) - 1,
                                                               static_cast<int>(r[STexSize] >> 16u) - 1);
-                loadTargetCells(*run.source, cells & ~run.source->valid);
+                const std::bitset<kCells> missing = cells & ~run.source->valid;
+                if (missing.any())
+                {
+                    // Another target can hold newer data for these pages (SotC keeps buffers of
+                    // several widths at 0x2A00): GS memory gets it first.
+                    std::bitset<kPages> pages;
+                    for (uint32_t cell = 0; cell < kCells; ++cell)
+                        if (missing.test(cell))
+                            targetCellPages(*run.source, cell, pages);
+                    syncTargetPages(pages, run.source);
+                }
+                loadTargetCells(*run.source, missing);
                 targetRecount(*run.source);
             }
 
