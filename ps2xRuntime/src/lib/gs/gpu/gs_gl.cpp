@@ -479,6 +479,20 @@ namespace GSGL
             if (!a.MaxShaderCompilerThreads)
                 load(a.MaxShaderCompilerThreads, "glMaxShaderCompilerThreadsKHR", parallelMissing);
             a.graphics = graphicsMissing.empty();
+            std::string targetsMissing;
+            load(a.TexStorage2D, "glTexStorage2D", targetsMissing);
+            load(a.FramebufferTexture2D, "glFramebufferTexture2D", targetsMissing);
+            load(a.CheckFramebufferStatus, "glCheckFramebufferStatus", targetsMissing);
+            load(a.BlendFuncSeparate, "glBlendFuncSeparate", targetsMissing);
+            load(a.BlendEquationSeparate, "glBlendEquationSeparate", targetsMissing);
+            load(a.BlendColor, "glBlendColor", targetsMissing);
+            load(a.DepthFunc, "glDepthFunc", targetsMissing);
+            load(a.DepthMask, "glDepthMask", targetsMissing);
+            load(a.ColorMask, "glColorMask", targetsMissing);
+            load(a.TextureBarrier, "glTextureBarrier", targetsMissing);
+            load(a.ActiveTexture, "glActiveTexture", targetsMissing);
+            load(a.Uniform1i, "glUniform1i", targetsMissing);
+            a.targets = a.graphics && targetsMissing.empty();
         }
         if (!missing.empty())
         {

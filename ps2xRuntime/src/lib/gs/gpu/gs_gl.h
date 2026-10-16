@@ -73,6 +73,29 @@ namespace GSGL
     constexpr GLenum kTextureWrapT = 0x2803;
     constexpr GLint kLinear = 0x2601;
     constexpr GLint kClampToEdge = 0x812F;
+    constexpr GLint kNearest = 0x2600;
+    constexpr GLenum kDepthComponent32F = 0x8CAC;
+    constexpr GLenum kColorAttachment0 = 0x8CE0;
+    constexpr GLenum kDepthAttachment = 0x8D00;
+    constexpr GLenum kFramebufferComplete = 0x8CD5;
+    constexpr GLenum kTexture0 = 0x84C0;
+    constexpr GLenum kBlend = 0x0BE2;
+    constexpr GLenum kDepthTest = 0x0B71;
+    constexpr GLenum kFuncAdd = 0x8006;
+    constexpr GLenum kFuncSubtract = 0x800A;
+    constexpr GLenum kFuncReverseSubtract = 0x800B;
+    constexpr GLenum kZero = 0;
+    constexpr GLenum kOne = 1;
+    constexpr GLenum kDstAlpha = 0x0304;
+    constexpr GLenum kOneMinusDstAlpha = 0x0305;
+    constexpr GLenum kConstantAlpha = 0x8003;
+    constexpr GLenum kOneMinusConstantAlpha = 0x8004;
+    constexpr GLenum kSrc1Alpha = 0x8589;
+    constexpr GLenum kOneMinusSrc1Alpha = 0x88FB;
+    constexpr GLenum kNever = 0x0200;
+    constexpr GLenum kGreater = 0x0204;
+    constexpr GLenum kGequal = 0x0206;
+    constexpr GLenum kAlways = 0x0207;
 
     struct Api
     {
@@ -142,7 +165,21 @@ namespace GSGL
         void (*Enable)(GLenum) = nullptr;
         void (*Disable)(GLenum) = nullptr;
         void (*MaxShaderCompilerThreads)(GLuint) = nullptr;
+        // Render targets (PS2X_GS_TARGETS).
+        void (*TexStorage2D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei) = nullptr;
+        void (*FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint) = nullptr;
+        GLenum (*CheckFramebufferStatus)(GLenum) = nullptr;
+        void (*BlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum) = nullptr;
+        void (*BlendEquationSeparate)(GLenum, GLenum) = nullptr;
+        void (*BlendColor)(float, float, float, float) = nullptr;
+        void (*DepthFunc)(GLenum) = nullptr;
+        void (*DepthMask)(GLboolean) = nullptr;
+        void (*ColorMask)(GLboolean, GLboolean, GLboolean, GLboolean) = nullptr;
+        void (*TextureBarrier)() = nullptr;
+        void (*ActiveTexture)(GLenum) = nullptr;
+        void (*Uniform1i)(GLint, GLint) = nullptr;
         bool graphics = false;
+        bool targets = false;
     };
 
     class Context
