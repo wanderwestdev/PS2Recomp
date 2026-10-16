@@ -2867,9 +2867,6 @@ void main()
             ps2x::savestate::requestQuickSave();
         if (IsKeyPressed(KEY_F9))
             ps2x::savestate::requestQuickLoad();
-        // F8: internal resolution native, 2x, 3x.
-        if (IsKeyPressed(KEY_F8))
-            GSGpuBackend::RequestInternalScale(GSGpuBackend::InternalScale() % 3u + 1u);
 
         if (WindowShouldClose())
         {

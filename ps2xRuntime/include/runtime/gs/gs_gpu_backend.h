@@ -53,10 +53,6 @@ public:
     const Stats &GetStats() const { return m_stats; }
 
     static void SetAsyncPresentDefault(bool enabled);
-    // Internal resolution, 1 (native) to 4 times in each direction. A request from any thread takes
-    // effect on the GS thread at the next presented frame; InternalScale reports the latest request.
-    static void RequestInternalScale(uint32_t scale);
-    static uint32_t InternalScale();
 
     // A textured quad (two triangles with FST UVs) whose UVs cover exactly [u0, u1] x [v0, v1]
     // of the texture at tbp0 is drawn as these pieces instead: each piece is a UV rectangle of
