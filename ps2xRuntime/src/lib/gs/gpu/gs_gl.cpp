@@ -493,6 +493,7 @@ namespace GSGL
             load(a.ActiveTexture, "glActiveTexture", targetsMissing);
             load(a.Uniform1i, "glUniform1i", targetsMissing);
             load(a.Scissor, "glScissor", targetsMissing);
+            load(a.ClipControl, "glClipControl", targetsMissing);
             a.targets = a.graphics && targetsMissing.empty();
         }
         if (!missing.empty())

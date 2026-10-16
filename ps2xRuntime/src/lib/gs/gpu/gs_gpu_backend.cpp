@@ -339,7 +339,7 @@ struct GSGpuBackend::Impl
     uint32_t tgScale = 1u; // PS2X_GS_TARGETS_SCALE
     std::string tgFragmentBody;
     GLuint tgFramebuffer = 0u;
-    Program tgProgram;
+    Program tgPrograms[3];
     Program tgLoad;
     Program tgStore;
     uint64_t tgClock = 0u;
@@ -1370,40 +1370,50 @@ struct GSGpuBackend::Impl
         tgLoad.loc[0] = gl().GetUniformLocation(tgLoad.id, "uLoad");
         tgLoad.loc[1] = gl().GetUniformLocation(tgLoad.id, "uLoadScale");
 
-        // One shader for every state, like the compute rasterizer: specialized variants take 6-20 s
-        // each to compile on the AMD driver and stall the GS thread while they do.
+        // Three variants, compiled once and cached: untextured, textured without mipmaps, and
+        // everything. One uber-shader carries the texture and mipmap paths' registers into every
+        // pixel (a flat-colour sky cost 4 ms at 3x); per-state specialization took 6-20 s per
+        // variant to compile on the AMD driver and stalled the GS thread.
+        const char *const kVariants[3] = {"#define TG_TEXTURE false\n#define TG_NOMIP 1\n", "#define TG_TEXTURE true\n#define TG_NOMIP 1\n",
+                                          "#define TG_TEXTURE true\n"};
         const std::string drawVertex = version + GSGpuShaders::kTargetVertex;
-        const std::string drawFragment = version + "#define HW_TYPE(h) ((h) & 0xFFu)\n" + tgFragmentBody;
-        const std::string cacheKey = std::string(reinterpret_cast<const char *>(gl().GetString(kRenderer))) + "\n" +
-                                     reinterpret_cast<const char *>(gl().GetString(kVersion)) + "\n" + drawVertex + "\n" + drawFragment;
-        const std::filesystem::path cachePath = hardwareCachePath(cacheKey);
-        const auto started = std::chrono::steady_clock::now();
-        GLuint program = loadHardwareBinary(cachePath, cacheKey);
-        if (!program)
+        for (size_t variant = 0; variant < 3u; ++variant)
         {
-            const GLuint v = compileStage(kVertexShader, drawVertex);
-            const GLuint f = compileStage(kFragmentShader, drawFragment);
-            if (!v || !f)
-                return false;
-            program = gl().CreateProgram();
-            gl().ProgramParameteri(program, kProgramBinaryRetrievableHint, 1);
-            gl().AttachShader(program, v);
-            gl().AttachShader(program, f);
-            gl().LinkProgram(program);
-            gl().DeleteShader(v);
-            gl().DeleteShader(f);
-            gl().GetProgramiv(program, kLinkStatus, &ok);
-            if (!ok)
+            const std::string drawFragment = version + kVariants[variant] + "#define HW_TYPE(h) ((h) & 0xFFu)\n" + tgFragmentBody;
+            const std::string cacheKey = std::string(reinterpret_cast<const char *>(gl().GetString(kRenderer))) + "\n" +
+                                         reinterpret_cast<const char *>(gl().GetString(kVersion)) + "\n" + drawVertex + "\n" + drawFragment;
+            const std::filesystem::path cachePath = hardwareCachePath(cacheKey);
+            const auto started = std::chrono::steady_clock::now();
+            GLuint program = loadHardwareBinary(cachePath, cacheKey);
+            if (!program)
             {
-                std::fprintf(stderr, "[gs-gpu] render target program failed to link\n");
-                return false;
+                const GLuint v = compileStage(kVertexShader, drawVertex);
+                const GLuint f = compileStage(kFragmentShader, drawFragment);
+                if (!v || !f)
+                    return false;
+                program = gl().CreateProgram();
+                gl().ProgramParameteri(program, kProgramBinaryRetrievableHint, 1);
+                gl().AttachShader(program, v);
+                gl().AttachShader(program, f);
+                gl().LinkProgram(program);
+                gl().DeleteShader(v);
+                gl().DeleteShader(f);
+                gl().GetProgramiv(program, kLinkStatus, &ok);
+                if (!ok)
+                {
+                    std::fprintf(stderr, "[gs-gpu] render target program failed to link\n");
+                    return false;
+                }
+                storeHardwareBinary(cachePath, cacheKey, program);
             }
-            storeHardwareBinary(cachePath, cacheKey, program);
+            finishVariant(tgPrograms[variant], program);
+            std::fprintf(stderr, "[gs-gpu] render target shader %zu ready in %.0f ms\n", variant,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
         }
-        finishVariant(tgProgram, program);
-        std::fprintf(stderr, "[gs-gpu] render target shader ready in %.0f ms\n",
-                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
         gl().GenFramebuffers(1, &tgFramebuffer);
+        // Depth from the vertex shader in [0, 1] (kTargetVertex); clamped rather than clipped.
+        gl().ClipControl(kLowerLeft, kZeroToOne);
+        gl().Enable(kDepthClamp);
         hwTargets = true;
         return true;
     }
@@ -2030,6 +2040,7 @@ struct GSGpuBackend::Impl
         uint32_t runState = UINT32_MAX;
         uint32_t sourceState = UINT32_MAX;
         Target *source = nullptr;
+        bool memoryTexture = false;
         bool exact = false;
         uint32_t checkedState = UINT32_MAX;
         for (uint32_t prim = 0u; prim < primCount; ++prim)
@@ -2074,10 +2085,12 @@ struct GSGpuBackend::Impl
             {
                 sourceState = stateIndex;
                 source = (tgScale > 1u || sourceAtOne) && !noSource ? sourceTarget(s, s[SFbp], s[SZbp]) : nullptr;
+                memoryTexture = memoryTexture || ((s[SFlags] & FTme) != 0u && !source);
             }
             // A run shares the fixed-function state (depth test, blending, write masks) and the
             // blending mode.
-            if (prim != 0u && exact == tgRuns.back().exact && source == tgRuns.back().source)
+            const Program *program = &tgPrograms[(s[SFlags] & FTme) == 0u ? 0 : 2];
+            if (prim != 0u && exact == tgRuns.back().exact && source == tgRuns.back().source && program == tgRuns.back().program)
             {
                 if (stateIndex == runState)
                     continue;
@@ -2092,7 +2105,7 @@ struct GSGpuBackend::Impl
             }
             if (!tgRuns.empty())
                 tgRuns.back().last = prim;
-            tgRuns.push_back({&tgProgram, prim, primCount, stateIndex, exact, source});
+            tgRuns.push_back({program, prim, primCount, stateIndex, exact, source});
             runState = stateIndex;
         }
         if (refusal != 0u)
@@ -2167,6 +2180,10 @@ struct GSGpuBackend::Impl
                 return false;
             }
         }
+        // Textures read from GS memory must be current there. readPages covers every texture of
+        // the batch; when all of them are render targets read as sources, nothing is written back.
+        if (memoryTexture)
+            syncTargetPages(readPages);
         // Every other copy of these pages, the other one of this pair included, goes back to GS
         // memory before the batch and is reloaded after it.
         syncTargetPages(colorPages, &color);
@@ -2611,8 +2628,10 @@ struct GSGpuBackend::Impl
         const Api &g = gl();
         if (epoch != 0u)
             bindUpload(9u, pageMapBuffer, pageMaps.data(), static_cast<size_t>(epoch) * kPages * sizeof(uint32_t));
+        // CLUTs always come from GS memory; textures are synced by the path that draws (render
+        // targets read as sources need no write-back).
         if (hwTargets)
-            syncTargetPages(readPages | batchClutPages);
+            syncTargetPages(batchClutPages);
         dispatchClutOps();
         bool drawn = false;
         if (primCount != 0u && hwTargets && !hwEnabled)
@@ -2624,7 +2643,7 @@ struct GSGpuBackend::Impl
             {
                 ++tgStats.fallbackBatches;
                 tgStats.fallbackPrims += primCount;
-                syncTargetPages(writePages);
+                syncTargetPages(writePages | readPages);
             }
         }
         if (primCount != 0u && hwEnabled)
@@ -4050,9 +4069,6 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
     d.flushBatch();
     if (d.hwTargets)
     {
-        const auto syncStart = std::chrono::steady_clock::now();
-        d.syncAllTargets();
-        d.tgStats.cpuMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - syncStart).count();
         ++d.tgStats.presents;
         d.reportTargets();
         ++d.tgFrame;
@@ -4128,6 +4144,18 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
                     outScale = d.tgScale;
                 }
             }
+        }
+    // Circuits read from GS memory need it current; the targets are not written back otherwise.
+    if (d.hwTargets)
+        for (size_t i = 0; i < 2u; ++i)
+        {
+            const CrtcCircuit &c = circuits[i];
+            if (!c.enabled || circuitTextures[i])
+                continue;
+            std::bitset<kPages> shown;
+            markPages(shown, c.psm, c.fbp << 5u, c.fbw, static_cast<int>(c.dbx), static_cast<int>(c.dby),
+                      static_cast<int>(c.dbx) + (c.dw + c.hdiv - 1) / c.hdiv - 1, static_cast<int>(c.dby) + (c.dh + c.vdiv - 1) / c.vdiv - 1);
+            d.syncTargetPages(shown);
         }
     const Program &presentProgram = d.present;
     const uint32_t width = nativeWidth * outScale;

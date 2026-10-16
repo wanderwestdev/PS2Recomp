@@ -666,6 +666,9 @@ uint sampleTexture(uint s, float ss, float tt, float q, uint u, uint v)
         texVf = tt * invQ * texH;
     }
     uint mip = st(s, S_MIP);
+#ifdef TG_NOMIP
+    mip = 0u; // render-target variant for states without mipmapping
+#endif
     if (mip == 0u)
         return sampleLevel0(s, texUf, texVf, (flags & F_LINEAR) != 0u);
     uint mxl = (mip >> 2u) & 7u;
@@ -1680,7 +1683,6 @@ void main()
     // The rasterizer decides coverage; the attributes arrive interpolated (kTargetVertex).
     if (uTarget.w != 0u)
     {
-        gl_FragDepth = 0.5;
         oColor = vec4(0.5);
         oFactor = vec4(1.0);
         return;
@@ -1710,7 +1712,7 @@ void main()
         c = (flags & F_IIP) != 0u ? uvec4(clampU8(int(vColor.r)), clampU8(int(vColor.g)), clampU8(int(vColor.b)), clampU8(int(vColor.a)))
                                   : unpackColor(vColorFlat);
         fog = clampU8(int(vFog));
-        if ((flags & F_TME) != 0u && uTarget.z == 0u)
+        if (TG_TEXTURE && (flags & F_TME) != 0u && uTarget.z == 0u)
         {
             uint texel;
             if ((flags & F_FST) != 0u)
@@ -1725,7 +1727,7 @@ void main()
         z = pw(p, 13u);
         c = unpackColor(pw(p, 14u));
         fog = pw(p, 15u);
-        if ((flags & F_TME) != 0u && uTarget.z == 0u)
+        if (TG_TEXTURE && (flags & F_TME) != 0u && uTarget.z == 0u)
         {
             uint texel;
             if ((flags & F_FST) != 0u)
@@ -1759,8 +1761,6 @@ void main()
     }
     if (passesAlphaTest(st(s, S_TEST), a) == (uTarget.x != 0u))
         discard;
-    uint zpsmExact = st(s, S_ZPSM) & 0xFu;
-    uint zmaxExact = zpsmExact == 1u ? 0xFFFFFFu : (zpsmExact == 0u ? 0xFFFFFFFFu : 0xFFFFu);
     if (uTarget.y != 0u)
     {
         uvec4 d = uvec4(texelFetch(uDest, ivec2(x, y), 0) * 255.0 + 0.5);
@@ -1768,7 +1768,6 @@ void main()
         if (!passesDestinationAlphaTest(st(s, S_TEST), st(s, S_FPSM), fbrgba))
             discard;
         uint pixel = targetBlendExact(s, flags, int(r), int(g), int(b), int(a), fbrgba);
-        gl_FragDepth = float(min(z, zmaxExact)) * (1.0 / 16777216.0);
         oColor = vec4(float(pixel & 0xFFu), float((pixel >> 8u) & 0xFFu), float((pixel >> 16u) & 0xFFu), float(pixel >> 24u)) / 255.0;
         oFactor = vec4(1.0);
         return;
@@ -1778,9 +1777,6 @@ void main()
         factor = 1.0;
     if ((st(s, S_FBA) & 1u) != 0u && st(s, S_FPSM) != 1u)
         a |= 0x80u;
-    uint zpsm = st(s, S_ZPSM) & 0xFu;
-    uint zmax = zpsm == 1u ? 0xFFFFFFu : (zpsm == 0u ? 0xFFFFFFFFu : 0xFFFFu);
-    gl_FragDepth = float(min(z, zmax)) * (1.0 / 16777216.0);
     oColor = vec4(float(r), float(g), float(b), float(a & 0xFFu)) / 255.0;
     oFactor = vec4(factor);
 }
@@ -1792,6 +1788,7 @@ void main()
     // interpolated linearly in screen space, as the GS does.
     const char *const kTargetVertex = R"GLSL(
 layout(std430, binding = 3) readonly buffer PrimBuffer { uint prims[]; };
+layout(std430, binding = 4) readonly buffer StateBuffer { uint states[]; };
 flat out uint vPrim;
 noperspective out vec4 vColor;
 flat out uint vColorFlat;
@@ -1807,9 +1804,21 @@ float pf(uint p, uint i) { return uintBitsToFloat(prims[p * 40u + i]); }
 
 // GL position at scale 1; the viewport is 2048 x scale on each side, so the same NDC lands on
 // the scaled target.
+// Depth goes through the rasterizer (glClipControl zero-to-one, depth clamp on), not
+// gl_FragDepth, so hidden pixels are rejected before they are shaded: z / 2^24, clamped to
+// the depth format's maximum (Z24 or Z16; Z32 targets are not used).
+float gDepth = 0.0;
+
 void emit(vec2 at)
 {
-    gl_Position = vec4(at.x / 1024.0 - 1.0, at.y / 1024.0 - 1.0, 0.0, 1.0);
+    gl_Position = vec4(at.x / 1024.0 - 1.0, at.y / 1024.0 - 1.0, gDepth, 1.0);
+}
+
+float depthOf(uint p, float z)
+{
+    uint zpsm = states[(pw(p, 0u) >> 8u) * 32u + 5u] & 0xFu;
+    float zmax = zpsm == 1u ? 16777215.0 : 65535.0;
+    return clamp(z, 0.0, zmax) * (1.0 / 16777216.0);
 }
 
 void main()
@@ -1836,6 +1845,7 @@ void main()
         vUv = vec2(float(uv & 0xFFFFu), float(uv >> 16u));
         vFog = float((pw(p, 32u) >> (i * 8u)) & 0xFFu);
         vDz = pf(p, 34u) + (i == 1u ? pf(p, 35u) : (i == 2u ? pf(p, 36u) : 0.0));
+        gDepth = depthOf(p, float(pw(p, 33u)) + vDz);
         emit(vec2(float(int(pw(p, 3u + i * 2u))), float(int(pw(p, 4u + i * 2u)))) / 16.0 + 0.5);
         return;
     }
@@ -1862,6 +1872,7 @@ void main()
     bool right = c == 1u || c == 3u || c == 4u;
     bool bottom = c == 2u || c == 4u || c == 5u;
     vec2 at = vec2(right ? x1 : x0, bottom ? y1 : y0);
+    gDepth = depthOf(p, float(pw(p, type == 0u ? 3u : 13u)));
     if (type == 1u)
     {
         // The sprite's texture coordinate is linear in the GS position (drawSprite): evaluate it
