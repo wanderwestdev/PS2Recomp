@@ -1564,12 +1564,16 @@ layout(binding = 2) uniform sampler2D uSource;
 uniform uvec4 uTarget;
 uniform uvec4 uHw;
 
-uint sourceTexel(ivec2 at, int w, int h, uint clampMode)
+// One texel of the source, its alpha expanded through TEXA as the GS does per texel (before
+// filtering: a 24-bit texel's alpha depends on whether its RGB is black when AEM is set).
+uint sourceTexel(uint s, ivec2 at, int w, int h, uint clampMode)
 {
-    at.x = (clampMode & 3u) == 0u ? int(uint(at.x) % uint(w)) : clamp(at.x, 0, w - 1);
-    at.y = ((clampMode >> 2u) & 3u) == 0u ? int(uint(at.y) % uint(h)) : clamp(at.y, 0, h - 1);
+    at.x = (clampMode & 3u) == 0u ? int(uint(at.x + w * 64) % uint(w)) : clamp(at.x, 0, w - 1);
+    at.y = ((clampMode >> 2u) & 3u) == 0u ? int(uint(at.y + h * 64) % uint(h)) : clamp(at.y, 0, h - 1);
     uvec4 c = uvec4(texelFetch(uSource, at, 0) * 255.0 + 0.5);
-    return c.r | (c.g << 8u) | (c.b << 16u) | (c.a << 24u);
+    uint raw = c.r | (c.g << 8u) | (c.b << 16u) | (c.a << 24u);
+    uint psm = st(s, S_TPSM);
+    return applyTexa(s, psm, psm == 1u ? raw & 0x00FFFFFFu : raw);
 }
 
 // Level 0 of a render-target texture at the target's scale: nearest or the GS bilinear, on the
@@ -1583,7 +1587,7 @@ uint sampleSource(uint s, float texUf, float texVf, bool linear)
     uint clampMode = st(s, S_CLAMP_LO);
     uint raw;
     if (!linear)
-        raw = sourceTexel(ivec2(floor(texUf * scale), floor(texVf * scale)), w, h, clampMode);
+        raw = sourceTexel(s, ivec2(floor(texUf * scale), floor(texVf * scale)), w, h, clampMode);
     else
     {
         float su = texUf * scale - 0.5;
@@ -1592,18 +1596,17 @@ uint sampleSource(uint s, float texUf, float texVf, bool linear)
         int v0 = int(floor(sv));
         float fx = su - float(u0);
         float fy = sv - float(v0);
-        uint c00 = sourceTexel(ivec2(u0, v0), w, h, clampMode);
-        uint c10 = sourceTexel(ivec2(u0 + 1, v0), w, h, clampMode);
-        uint c01 = sourceTexel(ivec2(u0, v0 + 1), w, h, clampMode);
-        uint c11 = sourceTexel(ivec2(u0 + 1, v0 + 1), w, h, clampMode);
+        uint c00 = sourceTexel(s, ivec2(u0, v0), w, h, clampMode);
+        uint c10 = sourceTexel(s, ivec2(u0 + 1, v0), w, h, clampMode);
+        uint c01 = sourceTexel(s, ivec2(u0, v0 + 1), w, h, clampMode);
+        uint c11 = sourceTexel(s, ivec2(u0 + 1, v0 + 1), w, h, clampMode);
         uint r = lerpChannel(c00 & 0xFFu, c10 & 0xFFu, c01 & 0xFFu, c11 & 0xFFu, fx, fy);
         uint g = lerpChannel((c00 >> 8u) & 0xFFu, (c10 >> 8u) & 0xFFu, (c01 >> 8u) & 0xFFu, (c11 >> 8u) & 0xFFu, fx, fy);
         uint b = lerpChannel((c00 >> 16u) & 0xFFu, (c10 >> 16u) & 0xFFu, (c01 >> 16u) & 0xFFu, (c11 >> 16u) & 0xFFu, fx, fy);
         uint a = lerpChannel(c00 >> 24u, c10 >> 24u, c01 >> 24u, c11 >> 24u, fx, fy);
         raw = r | (g << 8u) | (b << 16u) | (a << 24u);
     }
-    uint psm = st(s, S_TPSM);
-    return applyTexa(s, psm, psm == 1u ? raw & 0x00FFFFFFu : raw);
+    return raw;
 }
 
 uint targetSample(uint s, float ss, float tt, float q, uint u, uint v)
