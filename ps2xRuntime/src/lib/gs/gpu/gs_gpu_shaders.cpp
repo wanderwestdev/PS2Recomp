@@ -1593,6 +1593,13 @@ void main()
     int x = int(gl_FragCoord.x);
     int y = int(gl_FragCoord.y);
     // The rasterizer decides coverage; the attributes arrive interpolated (kTargetVertex).
+    if (uTarget.w != 0u)
+    {
+        gl_FragDepth = 0.5;
+        oColor = vec4(0.5);
+        oFactor = vec4(1.0);
+        return;
+    }
     uint p = vPrim;
     uint header = pw(p, 0u);
     uint s = header >> 8u;
@@ -1618,7 +1625,7 @@ void main()
         c = (flags & F_IIP) != 0u ? uvec4(clampU8(int(vColor.r)), clampU8(int(vColor.g)), clampU8(int(vColor.b)), clampU8(int(vColor.a)))
                                   : unpackColor(vColorFlat);
         fog = clampU8(int(vFog));
-        if ((flags & F_TME) != 0u)
+        if ((flags & F_TME) != 0u && uTarget.z == 0u)
         {
             uint texel;
             if ((flags & F_FST) != 0u)
@@ -1633,7 +1640,7 @@ void main()
         z = pw(p, 13u);
         c = unpackColor(pw(p, 14u));
         fog = pw(p, 15u);
-        if ((flags & F_TME) != 0u)
+        if ((flags & F_TME) != 0u && uTarget.z == 0u)
         {
             uint texel;
             if ((flags & F_FST) != 0u)

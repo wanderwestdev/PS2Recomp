@@ -1725,7 +1725,39 @@ struct GSGpuBackend::Impl
     // PS2X_GS_TARGETS_EXACT: 0 only what fixed-function can't express, 1 (default) also sprites
     // blended by source alpha, which SotC's glare passes push above 0x80 (a factor above one,
     // clamped by fixed-function blending), 2 also triangles blended by source alpha.
-    uint32_t targetExact(const uint32_t *s, uint32_t type) const
+    // The largest source alpha a primitive can blend with: its vertex alpha, combined with the
+    // texture's when TCC is on (TEXA bounds 16- and 24-bit texels; 32-bit and CLUT texels can
+    // reach 0xFF).
+    uint32_t sourceAlphaMax(const uint32_t *s, const uint32_t *p) const
+    {
+        const uint32_t type = p[0] & 0xFFu;
+        uint32_t va = type == PrimPoint ? p[4] >> 24u : type == PrimSprite ? p[14] >> 24u : std::max({p[17] >> 24u, p[18] >> 24u, p[19] >> 24u});
+        if ((s[SFlags] & FTme) == 0u || (s[STexMode] & 0xFFu) == 0u)
+            return va;
+        const uint32_t tpsm = s[STpsm];
+        const uint32_t cpsm = (s[STexMode] >> 16u) & 0xFFu;
+        const uint32_t ta0 = s[STexa] & 0xFFu;
+        const uint32_t ta1 = (s[STexa] >> 16u) & 0xFFu;
+        const bool indexed = tpsm == 0x13u || tpsm == 0x14u || tpsm == 0x1Bu || tpsm == 0x24u || tpsm == 0x2Cu;
+        const uint32_t format = indexed ? cpsm : tpsm;
+        const uint32_t texMax = format == 0x01u ? ta0 : (format == 0x02u || format == 0x0Au) ? std::max(ta0, ta1) : 0xFFu;
+        switch ((s[STexMode] >> 8u) & 0xFFu)
+        {
+        case 0u:
+            return (texMax * va) >> 7u;
+        case 2u:
+            return std::min(texMax + va, 0xFFu);
+        default:
+            return texMax;
+        }
+    }
+
+    // Whether a primitive needs the shader to blend against the target (exact GS blending)
+    // instead of the fixed-function blender. 0 when fixed-function is right, else the stats index.
+    // PS2X_GS_TARGETS_EXACT: 0 only what fixed-function can't express, 1 (default) also sprites
+    // and points whose source alpha can pass 0x80 (a blend factor above one, which fixed-function
+    // blending clamps; SotC's glare passes do it), 2 also triangles.
+    uint32_t targetExact(const uint32_t *s, const uint32_t *p) const
     {
         static const uint32_t policy = []
         {
@@ -1733,9 +1765,13 @@ struct GSGpuBackend::Impl
             return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 1u;
         }();
         const uint32_t fpsm = s[SFpsm];
-        if (((s[STest] >> 14u) & 1u) != 0u && fpsm == 0u)
-            return 3u;
+        const uint32_t test = s[STest];
         const uint32_t mask = s[SFbmsk] | (fpsm == 1u ? 0xFF000000u : 0u);
+        // No colour written: ATST NEVER with AFAIL KEEP or ZB_ONLY, or everything masked.
+        if (((test & 0xFu) == 1u && (((test >> 12u) & 3u) == 0u || ((test >> 12u) & 3u) == 2u)) || mask == 0xFFFFFFFFu)
+            return 0u;
+        if (((test >> 14u) & 1u) != 0u && fpsm == 0u)
+            return 3u;
         for (uint32_t byte = 0; byte < 4u; ++byte)
         {
             const uint32_t m = (mask >> (byte * 8u)) & 0xFFu;
@@ -1757,8 +1793,24 @@ struct GSGpuBackend::Impl
         const uint32_t c = (s[SAlpha] >> 4u) & 3u;
         if (c == 2u && (s[SAlphaFix] & 0xFFu) > 0x80u)
             return 5u;
-        if (c == 0u && (policy >= 2u || (policy >= 1u && type != PrimTriangle)))
+        if (c == 0u && (policy >= 2u || (policy >= 1u && (p[0] & 0xFFu) != PrimTriangle)) && sourceAlphaMax(s, p) > 0x80u)
             return 5u;
+        // Fixed-function blending rounds where the GS truncates. Post-processing passes blend the
+        // same pixels over and over with large sprites (SotC's glare blur: 13 passes over 64 x 64),
+        // and the rounding adds up into a visibly stronger glow; those few sprites blend exactly.
+        // Particles are small and many, and stay fixed-function.
+        if (policy >= 1u && (p[0] & 0xFFu) == PrimSprite)
+        {
+            const uint32_t w = (p[1] >> 16u) - (p[1] & 0xFFFFu) + 1u;
+            const uint32_t h = (p[2] >> 16u) - (p[2] & 0xFFFFu) + 1u;
+            if (policy == 3u || w * h >= 4096u)
+                return 5u;
+            // A sprite that samples an earlier render target is post-processing too.
+            if ((s[SFlags] & FTme) != 0u)
+                for (const std::unique_ptr<Target> &t : targets)
+                    if (!t->depth && t->base == s[STbp0])
+                        return 5u;
+        }
         return 0u;
     }
 
@@ -1828,6 +1880,14 @@ struct GSGpuBackend::Impl
         const uint32_t mask = exact ? 0u : s[SFbmsk];
         g.ColorMask(writeRgb && (mask & 0xFFu) == 0u, writeRgb && (mask & 0xFF00u) == 0u, writeRgb && (mask & 0xFF0000u) == 0u,
                     writeAlpha && (mask & 0xFF000000u) == 0u);
+        // The GS scissor as the GPU's: a triangle reaching past it would otherwise be shaded
+        // over the whole 2048 x 2048 target and discarded pixel by pixel.
+        const uint32_t sx = s[SScissorX];
+        const uint32_t sy = s[SScissorY];
+        g.Enable(kScissorTest);
+        g.Scissor(static_cast<GLint>(sx & 0xFFFFu), static_cast<GLint>(sy & 0xFFFFu),
+                  static_cast<GLsizei>(std::max<int>(static_cast<int>(sx >> 16u) - static_cast<int>(sx & 0xFFFFu) + 1, 0)),
+                  static_cast<GLsizei>(std::max<int>(static_cast<int>(sy >> 16u) - static_cast<int>(sy & 0xFFFFu) + 1, 0)));
         const uint32_t ztst = (test >> 17u) & 3u;
         if (!haveDepth || (ztst == 1u && !writeDepth))
             g.Disable(kDepthTest);
@@ -1900,8 +1960,6 @@ struct GSGpuBackend::Impl
         bool depthWritten = false;
         tgRuns.clear();
         uint32_t runState = UINT32_MAX;
-        uint32_t exactState = UINT32_MAX;
-        uint32_t exactType = UINT32_MAX;
         bool exact = false;
         uint32_t checkedState = UINT32_MAX;
         for (uint32_t prim = 0u; prim < primCount; ++prim)
@@ -1933,12 +1991,8 @@ struct GSGpuBackend::Impl
                 y0 = std::min(y0, static_cast<int>(p[2] & 0xFFFFu));
                 y1 = std::max(y1, static_cast<int>(p[2] >> 16u));
             }
-            const uint32_t type = p[0] & 0xFFu;
-            if (stateIndex != exactState || type != exactType)
             {
-                exactState = stateIndex;
-                exactType = type;
-                const uint32_t why = targetExact(s, type);
+                const uint32_t why = targetExact(s, p);
                 exact = why != 0u;
                 if (exact)
                     ++tgStats.exactReasons[why];
@@ -1950,8 +2004,10 @@ struct GSGpuBackend::Impl
                 if (stateIndex == runState)
                     continue;
                 const uint32_t *r = states.data() + static_cast<size_t>(runState) * kStateWords;
-                bool same = true;
-                for (uint32_t word : {SFlags, SAlpha, SAlphaFix, STest, SZmask, SFbmsk, SFpsm})
+                // Only what the fixed-function stages see: the shader reads the rest per primitive.
+                bool same = (r[SFlags] & (FAbe | FPabe | FWrap)) == (s[SFlags] & (FAbe | FPabe | FWrap)) &&
+                            (r[STest] & ~0xFF0u) == (s[STest] & ~0xFF0u);
+                for (uint32_t word : {SAlpha, SAlphaFix, SZmask, SFbmsk, SFpsm, SScissorX, SScissorY})
                     same = same && r[word] == s[word];
                 if (same)
                     continue;
@@ -1975,7 +2031,7 @@ struct GSGpuBackend::Impl
                     std::fprintf(stderr, "[gs-targets]   exact run %u-%u (%zu draws) type %u flags %x alpha %x fix %x test %x fbmsk %x fpsm %x texmode %x why %u\n",
                                  run.first, run.last, tgGroups.size(), prims[static_cast<size_t>(run.first) * kPrimWords] & 0xFFu, r[SFlags], r[SAlpha],
                                  r[SAlphaFix], r[STest], r[SFbmsk], r[SFpsm], r[STexMode],
-                                 targetExact(r, prims[static_cast<size_t>(run.first) * kPrimWords] & 0xFFu));
+                                 targetExact(r, prims.data() + static_cast<size_t>(run.first) * kPrimWords));
                 }
         const uint32_t *s0 = states.data() + static_cast<size_t>(prims[0] >> 8u) * kStateWords;
         Target &color = findTarget(s0[SFbp], s0[SFbw], s0[SFpsm], false);
@@ -2043,7 +2099,10 @@ struct GSGpuBackend::Impl
                 g.UseProgram(run.program->id);
                 g.Uniform4ui(run.program->loc[0], epoch, 0u, 0u, 0u);
                 g.Uniform4ui(run.program->loc[1], hwConservative ? 1u : 0u, 0u, 0u, 0u);
-                g.Uniform4ui(run.program->loc[2], pass, run.exact ? 1u : 0u, 0u, 0u);
+                // PS2X_GS_TARGETS_NOTEX=1 skips texture sampling (profiling only).
+                static const bool noTexture = std::getenv("PS2X_GS_TARGETS_NOTEX") != nullptr;
+                static const bool flat = std::getenv("PS2X_GS_TARGETS_FLAT") != nullptr;
+                g.Uniform4ui(run.program->loc[2], pass, run.exact ? 1u : 0u, noTexture ? 1u : 0u, flat ? 1u : 0u);
                 if (!run.exact)
                 {
                     g.DrawArrays(kTriangles, static_cast<GLint>(run.first * 6u), static_cast<GLsizei>((run.last - run.first) * 6u));
@@ -2061,9 +2120,16 @@ struct GSGpuBackend::Impl
                 }
                 ++tgStats.passes;
             }
+        {
+            uint32_t exactRuns = 0u;
+            for (const TargetRun &run : tgRuns)
+                exactRuns += run.exact ? 1u : 0u;
+            prof.nextInfo = {primCount, static_cast<uint32_t>(tgRuns.size()), exactRuns, 0u, s0[SFbp] >> 5u, s0[SFpsm], s0[SZbp] >> 5u, s0[SFlags]};
+        }
         profEnd(0u, profRaster);
         g.Disable(kBlend);
         g.Disable(kDepthTest);
+        g.Disable(kScissorTest);
         g.ColorMask(1, 1, 1, 1);
         g.DepthMask(1);
         g.BindFramebuffer(kFramebuffer, 0u);
