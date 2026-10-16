@@ -758,8 +758,11 @@ uint sampleLevel0(uint s, float texUf, float texVf, bool linear)
         precise float hv = texVf * float(SS);
         if (!linear)
             return samplePointHi(s, int(floor(hu)), int(floor(hv)));
-        precise float hsu = hu - 0.5;
-        precise float hsv = hv - 0.5;
+        // Bilinear steps back half a native texel, as the GS does, not half a sample: a copy with
+        // texel-centre coordinates then lands exactly on its source sample, as it does natively,
+        // instead of averaging two neighbouring samples half a pixel off.
+        precise float hsu = hu - 0.5 * float(SS);
+        precise float hsv = hv - 0.5 * float(SS);
         int hu0 = int(floor(hsu));
         int hv0 = int(floor(hsv));
         precise float hfx = hsu - float(hu0);
@@ -1075,6 +1078,23 @@ void drawSprite(uint p, uint s, int x, int y)
     precise float tx = (PIX_X - ox) * scaleX;
     precise float texUf = u0f + (u1f - u0f) * tx;
     uint texel;
+#ifdef HIRES
+    // Copies of a high-resolution render target (the scene into the glow, blur and composite
+    // passes) pick the texel the native draw picks, then the sample by how far this sample is from
+    // the pixel's native position. Copies use texel-centre coordinates (+1/2 texel); the plain
+    // floor(u * SS) turned that half texel into a one-sample shift, so the layers the game blends
+    // together sat half a pixel apart and light showed along every edge (the "cracks").
+    if (textureIsRendered(s) && (flags & F_LINEAR) == 0u)
+    {
+        precise float un = u0f + (u1f - u0f) * (float(x) - ox) * scaleX;
+        precise float vn = v0f + (v1f - v0f) * (float(y) - oy) * scaleY;
+        precise float hu = float(SS) * (texUf - fract(un));
+        precise float hv = float(SS) * (texVf - fract(vn));
+        texel = samplePointHi(s, int(floor(hu + 0.001)), int(floor(hv + 0.001)));
+        writePixel(s, x, y, z, combineTexture(s, color, texel), fog);
+        return;
+    }
+#endif
     if ((flags & F_FST) != 0u)
     {
         uint su = uint(clamp(int(texUf * 16.0 + 0.5), 0, 0xFFFF));
@@ -1753,30 +1773,10 @@ uint blendChannel(uint src, uint dst, uint factor)
     return clampU8(int(dst) + ((delta * int(factor)) / 255));
 }
 
-void main()
+// The two read circuits merged at display position (rx, ry); frx, fry is the continuous position
+// (internal resolution picks the sample under it).
+uint composeAt(int rx, int ry, float frx, float fry)
 {
-    uint ox = gl_GlobalInvocationID.x;
-    uint oy = gl_GlobalInvocationID.y;
-    uint width = uOut.x;
-    uint height = uOut.y;
-    if (ox >= width || oy >= height)
-        return;
-    int x0 = int(uOut.z & 0xFFFFu);
-    int y0 = int(uOut.z >> 16u);
-    int hstep = int(uOut.w & 0xFFFFu);
-    int vstep = int(uOut.w >> 16u);
-#ifdef HIRES
-    // uOut holds the high-resolution size; each output pixel covers 1/SS of a native one.
-    float frx = float(x0) + (float(ox) + 0.5) * float(hstep) / float(SS);
-    float fry = float(y0) + (float(oy) + 0.5) * float(vstep) / float(SS);
-    int rx = int(floor(frx));
-    int ry = int(floor(fry));
-#else
-    int ry = y0 + int(oy) * vstep + vstep / 2;
-    int rx = x0 + int(ox) * hstep + hstep / 2;
-    float frx = float(rx);
-    float fry = float(ry);
-#endif
     uint c1[12] = uC1;
     uint c2[12] = uC2;
     bool in1 = covers(c1, rx, ry);
@@ -1808,6 +1808,54 @@ void main()
         }
         outPixel = r | (g << 8u) | (b << 16u) | 0xFF000000u;
     }
+    return outPixel;
+}
+
+void main()
+{
+    uint ox = gl_GlobalInvocationID.x;
+    uint oy = gl_GlobalInvocationID.y;
+    uint width = uOut.x;
+    uint height = uOut.y;
+    if (ox >= width || oy >= height)
+        return;
+    int x0 = int(uOut.z & 0xFFFFu);
+    int y0 = int(uOut.z >> 16u);
+    int hstep = int(uOut.w & 0xFFFFu);
+    int vstep = int(uOut.w >> 16u);
+    uint outPixel;
+#ifdef HIRES
+    if (uMode.w != 0u)
+    {
+        // Anti-aliasing at native size (uMode.w = 1, PS2X_GS_HI_RESOLVE): uOut holds the native
+        // size and each output pixel is the average of its SS x SS samples, the paraLLEl-GS
+        // default. A sample that falls in a crack only lightens the pixel a little.
+        uint sr = 0u, sg = 0u, sb = 0u;
+        for (uint sy = 0u; sy < SS; ++sy)
+            for (uint sx = 0u; sx < SS; ++sx)
+            {
+                float frx = float(x0) + (float(ox) + (float(sx) + 0.5) / float(SS)) * float(hstep);
+                float fry = float(y0) + (float(oy) + (float(sy) + 0.5) / float(SS)) * float(vstep);
+                uint c = composeAt(int(floor(frx)), int(floor(fry)), frx, fry);
+                sr += c & 0xFFu;
+                sg += (c >> 8u) & 0xFFu;
+                sb += (c >> 16u) & 0xFFu;
+            }
+        uint n = SS * SS;
+        outPixel = ((sr + n / 2u) / n) | (((sg + n / 2u) / n) << 8u) | (((sb + n / 2u) / n) << 16u) | 0xFF000000u;
+    }
+    else
+    {
+        // uOut holds the high-resolution size; each output pixel covers 1/SS of a native one.
+        float frx = float(x0) + (float(ox) + 0.5) * float(hstep) / float(SS);
+        float fry = float(y0) + (float(oy) + 0.5) * float(vstep) / float(SS);
+        outPixel = composeAt(int(floor(frx)), int(floor(fry)), frx, fry);
+    }
+#else
+    int ry = y0 + int(oy) * vstep + vstep / 2;
+    int rx = x0 + int(ox) * hstep + hstep / 2;
+    outPixel = composeAt(rx, ry, float(rx), float(ry));
+#endif
     data[oy * width + ox] = outPixel;
 }
 )GLSL";

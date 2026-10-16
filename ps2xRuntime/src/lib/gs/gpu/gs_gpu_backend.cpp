@@ -2412,11 +2412,16 @@ struct GSGpuBackend::Impl
             return value ? std::atoi(value) : 4;
         }();
         const bool band = hiActive && std::max(tri.maxX - tri.minX, tri.maxY - tri.minY) >= bandMin;
-        const int bandMargin = band ? 1 : 0;
+        // The native box ends at the last native sample inside the triangle, but a centred
+        // high-resolution grid puts the next pixel's first sample 1/(2S) past it on the right and
+        // bottom too (2x: +3/4). Every triangle needs the extra pixel on all four sides, not only
+        // band ones: without it small triangles (faces, hair, detail) lost a sliver along their
+        // right and bottom edges, which showed as cracks inside a single mesh.
+        const int edgeMargin = std::max(hiMargin, band ? 1 : 0);
         const int minX = std::max(tri.minX - hiMargin, static_cast<int>(ctx.scissor.x0));
-        const int maxX = std::min(tri.maxX + bandMargin, static_cast<int>(ctx.scissor.x1));
+        const int maxX = std::min(tri.maxX + edgeMargin, static_cast<int>(ctx.scissor.x1));
         const int minY = std::max(tri.minY - hiMargin, static_cast<int>(ctx.scissor.y0));
-        const int maxY = std::min(tri.maxY + bandMargin, static_cast<int>(ctx.scissor.y1));
+        const int maxY = std::min(tri.maxY + edgeMargin, static_cast<int>(ctx.scissor.y1));
         if (minX > maxX || minY > maxY)
             return;
 
@@ -3403,9 +3408,18 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
                            nativeHeight * d.hiScale <= kMaxPresentationHeight;
     if (hiPresent && d.hiStale.any())
         d.replicatePages(d.hiStale);
+    // PS2X_GS_HI_RESOLVE=1: anti-aliasing instead of a larger picture. The samples are averaged
+    // back to the native size (the paraLLEl-GS default; cracks that touch a few samples only lighten
+    // an edge a little).
+    static const bool hiResolve = []
+    {
+        const char *value = std::getenv("PS2X_GS_HI_RESOLVE");
+        return value && *value == '1';
+    }();
+    const bool resolve = hiPresent && hiResolve;
     const Program &presentProgram = hiPresent ? d.presentHi : d.present;
-    const uint32_t width = hiPresent ? nativeWidth * d.hiScale : nativeWidth;
-    const uint32_t height = hiPresent ? nativeHeight * d.hiScale : nativeHeight;
+    const uint32_t width = hiPresent && !resolve ? nativeWidth * d.hiScale : nativeWidth;
+    const uint32_t height = hiPresent && !resolve ? nativeHeight * d.hiScale : nativeHeight;
     result.width = width;
     result.height = height;
     auto pack = [](const CrtcCircuit &c, std::array<uint32_t, 12> &out)
@@ -3423,7 +3437,8 @@ PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
                   static_cast<uint32_t>(hstep) | (static_cast<uint32_t>(vstep) << 16u));
     gl.Uniform1uiv(presentProgram.loc[1], 12, c1.data());
     gl.Uniform1uiv(presentProgram.loc[2], 12, c2.data());
-    gl.Uniform4ui(presentProgram.loc[3], static_cast<uint32_t>(request.bgcolor & 0xFFFFFFu), (slbg ? 1u : 0u) | (mmod ? 2u : 0u), alp, 0u);
+    gl.Uniform4ui(presentProgram.loc[3], static_cast<uint32_t>(request.bgcolor & 0xFFFFFFu), (slbg ? 1u : 0u) | (mmod ? 2u : 0u), alp,
+                  resolve ? 1u : 0u);
     const GLuint profPresent = d.profBegin();
     gl.DispatchCompute((width + 15u) / 16u, (height + 15u) / 16u, 1u);
     ++d.presentStats.composites;
