@@ -81,6 +81,7 @@ namespace GSGL
     constexpr GLenum kTexture0 = 0x84C0;
     constexpr GLenum kBlend = 0x0BE2;
     constexpr GLenum kDepthTest = 0x0B71;
+    constexpr GLenum kScissorTest = 0x0C11;
     constexpr GLenum kFuncAdd = 0x8006;
     constexpr GLenum kFuncSubtract = 0x800A;
     constexpr GLenum kFuncReverseSubtract = 0x800B;
@@ -178,6 +179,7 @@ namespace GSGL
         void (*TextureBarrier)() = nullptr;
         void (*ActiveTexture)(GLenum) = nullptr;
         void (*Uniform1i)(GLint, GLint) = nullptr;
+        void (*Scissor)(GLint, GLint, GLsizei, GLsizei) = nullptr;
         bool graphics = false;
         bool targets = false;
     };
